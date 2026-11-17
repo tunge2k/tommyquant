@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import sys
+import time
 
 # DoH 兜底: NAS 路由器可能劫持 UDP 53, 系统 DNS 失败时走阿里 DoH
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -2626,6 +2627,7 @@ elif page == "backtest":
 
     if run_btn:
         with st.spinner("🔄 运行回测..."):
+            _t_bt = time.perf_counter()
             if _use_strategy_class:
                 _uni = list(_ss.get("mc_universe_list") or [])
                 _mc = MarketCapStrategy(
@@ -2660,7 +2662,13 @@ elif page == "backtest":
                     limit_up_pct=limit_up_pct,
                     start_date=backtest_start, end_date=backtest_end,
                     cost_params=get_cost_params())
-        st.success(f"✅ 回测完成! {result['performance'].get('trades_count', 0)} 笔交易")
+        _elapsed = time.perf_counter() - _t_bt
+        _n_tr = result["performance"].get("trades_count", 0)
+        if _elapsed >= 60:
+            _t_str = f"{int(_elapsed // 60)} 分 {_elapsed % 60:.0f} 秒"
+        else:
+            _t_str = f"{_elapsed:.1f} 秒"
+        st.success(f"✅ 回测完成! {_n_tr} 笔交易 · 回测计算耗时 {_t_str}")
         if _use_strategy_class:
             st.session_state["_mc_result"] = result
         try:
