@@ -28,6 +28,7 @@ from backtest_engine import (
 )
 import data_store
 import news_fetcher
+import perf_report
 
 try:
     import fast_backtest as fastbt
@@ -2668,8 +2669,8 @@ elif page == "backtest":
         else:
             m, _bm = _benchmark_align(curve)
             e = _bench_extra(m)
-            tab_perf, tab_trade, tab_hold = st.tabs(
-                ["📈 策略绩效", "📋 交易明细", "📅 持仓明细"])
+            tab_perf, tab_trade, tab_hold, tab_report = st.tabs(
+                ["📈 策略绩效", "📋 交易明细", "📅 持仓明细", "📑 研究报告"])
             with tab_perf:
                 c_left, c_right = st.columns([2.3, 1])
                 with c_left:
@@ -2723,6 +2724,37 @@ elif page == "backtest":
                     st.dataframe(holds_df, use_container_width=True,
                                  hide_index=True, height=500)
                     st.caption(f"共 {len(holds_df)} 条持仓快照 · 按日期倒序排列")
+            with tab_report:
+                if not perf_report.available():
+                    st.info("未安装 QuantStats，需重建镜像后可用："
+                            "`docker compose up -d --build`")
+                else:
+                    st.caption("QuantStats tearsheet：收益/风险指标、月度收益热力图、"
+                               "滚动夏普、回撤区间、VaR 等完整绩效画像。")
+                    _sig = (f"{pd.Timestamp(curve['date'].iloc[0]):%Y%m%d}_"
+                            f"{pd.Timestamp(curve['date'].iloc[-1]):%Y%m%d}_"
+                            f"{len(curve)}_{float(curve['value'].iloc[-1]):.0f}")
+                    _out = os.path.join("cache", "reports",
+                                        f"report_{_sig.replace('.', '')}.html")
+                    _rp_key = "_report_path"
+                    if st.button("📄 生成绩效报告", type="primary", key="gen_report"):
+                        with st.spinner("生成中，约 5–15 秒..."):
+                            _ok, _msg = perf_report.build_tearsheet(m, _out)
+                        st.session_state[_rp_key] = _out if _ok else None
+                        st.session_state["_report_err"] = None if _ok else _msg
+                        st.rerun()
+                    if st.session_state.get("_report_err"):
+                        st.warning(st.session_state["_report_err"])
+                    _rp = st.session_state.get(_rp_key)
+                    if _rp and os.path.exists(_rp):
+                        with open(_rp, "rb") as _f:
+                            _html = _f.read()
+                        st.download_button("⬇️ 下载 HTML 报告", _html,
+                                           file_name=os.path.basename(_rp),
+                                           mime="text/html",
+                                           key="dl_report")
+                        import streamlit.components.v1 as _comp2
+                        _comp2.html(_html.decode("utf-8"), height=2600, scrolling=True)
     else:
         st.info("👈 选好策略、点 ⚙️ 设置调参数，然后点 🚀 开始回测")
 

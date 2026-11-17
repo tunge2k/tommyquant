@@ -84,9 +84,17 @@
 
 补三条校验（撮合前）：涨停不买、跌停不卖、当日无 K 线（停牌）不成交。现有 `limit_up_pct` 只覆盖了买入侧的涨停，且没有停牌判断。不补这三条，任何回测的收益都会系统性偏高。
 
-### P1-3 借用 QuantStats 出绩效报告
+### P1-3 借用 QuantStats 出绩效报告（v1.1.0 已完成）
 
-作为可选依赖：装了就用 `quantstats` 生成 HTML tearsheet，没装就回退现有 20 项指标。好处是口径可对外解释，也方便和别人的结果对比。
+回测结果页新增「📑 研究报告」标签：点「生成绩效报告」即调用 QuantStats 生成 HTML tearsheet（约 765 KB），内嵌预览并提供下载。
+
+实施要点：
+
+- **必须用 lumi 分支**：官方 `quantstats 0.0.64` 锁定 `numpy<2.0`，而 Python 3.13 没有 numpy 1.x 的预编译包（会退回源码编译并失败）。改用 `quantstats-lumi==1.1.6`，它支持 numpy 2.x，模块名为 `quantstats_lumi`。代码里两个模块名都尝试，官方包可用时优先。
+- **无头渲染**：容器内无显示设备，导入前强制 `matplotlib.use("Agg")`。
+- **降级策略**：`perf_report.available()` 为 False 时界面提示重建镜像，不影响其他标签。
+- **字体告警可忽略**：QuantStats 样式指定 Arial，容器内没有该字体，回退 DejaVu Sans，只输出 `findfont` 提示，图表正常。
+- 依赖会带来 matplotlib / scipy / seaborn / yfinance，镜像体积增加约 250 MB，首次构建耗时约 2 分钟。
 
 ---
 

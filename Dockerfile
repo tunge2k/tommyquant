@@ -25,6 +25,7 @@ COPY data_store.py .
 COPY data_manager.py .
 COPY news_fetcher.py .
 COPY update_worker.py .
+COPY perf_report.py .
 COPY doh_patch.py .
 COPY entrypoint.sh .
 COPY .streamlit ./.streamlit

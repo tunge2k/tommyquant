@@ -133,7 +133,7 @@
 |---|---|---|
 | P1-1 | 借用 Qlib Topk-Drop 调仓（已完成 2026-11-17） | 持仓只有跌出候选前 `top_n+buffer` 名才卖；对照回测：+2.20% → +27.05%（buffer=2）/ +65.24%（buffer=4），夏普 0.14 → 0.39 / 0.69，成交笔数 1262 → 333 / 265。详见 06 文档 |
 | P1-2 | 补 A 股不可成交规则 | 涨停不买、跌停不卖、停牌不成交三条校验在撮合前生效，并有对照回测 |
-| P1-3 | 借用 QuantStats 出绩效报告 | 可选依赖；装了就出 HTML tearsheet，没装回退现有 20 项指标 |
+| P1-3 | 借用 QuantStats 出绩效报告 | **已完成（v1.1.0）**：`quantstats-lumi==1.1.6` 生成 HTML tearsheet，未安装时降级 |
 | P1-4 | 拆分 `streamlit_app.py` | 页面渲染、图表组件、导航分别成模块；单文件 < 800 行；行为不变 |
 | P1-5 | i18n 全覆盖 | 设置页、数据页、帮助页无硬编码中文；`?lang=en` 页面无中文残留 |
 | P1-6 | 处理作者页 | 接入导航并做安全隔离，或删除该分支（二选一，不留死代码） |
@@ -215,4 +215,7 @@
 | 2026-11-17 | 完整终点（2026-11-16）重跑首次回测：期末 1,022,035（+2.20%）、CAGR 0.56%、最大回撤 -39.56%、Sharpe 0.14、600 笔交易、日均换手 3.66% → 策略净收益被调仓行为磨平 | `strategy_run`、`_bt_run.py` 运行日志 |
 | 2026-11-17 | P1-1 完成：新增 `rebalance_mode`（默认 `topk_drop`）与 `rank_buffer`，界面可选调仓方式；MA30 改为一次性预计算（`build_ma30_cache`/`ma30_slope_up`，与逐日 resample 口径逐日对齐）；对照回测 +2.20% → +27.05%（b2）/ +65.24%（b4），成交笔数 1262 → 333 / 265 | `backtest_engine.py`、`streamlit_app.py`、`docs/06`、`tests/`（20 项） |
 | 2026-11-17 | 修复成本核算：合并加仓时 `entry_cost_total` 误把买入本金计入成本，导致多笔加仓的持仓卖出时本金被当成本扣除（旧报告「成本 1356 万」即此 bug）。改为只累计费用，并补回归用例 | `Portfolio.apply_fill`、`tests/` |
+| 2026-11-17 | P1-3 完成：回测页新增「📑 研究报告」标签，用 QuantStats 生成 HTML tearsheet（765 KB，内嵌预览 + 下载）。官方包锁 numpy<2 无法在 Python 3.13 安装，改用 `quantstats-lumi==1.1.6`；未安装时界面降级提示 | `perf_report.py`、`requirements.txt`、`Dockerfile`、`streamlit_app.py`、`docs/06` |
+| 2026-11-17 | 建立 git 版本管理（P0-4 完成）：公开仓库 `tunge2k/tommyquant`，`git_release.py` 一条命令完成提交/打标签/推送；NAS 凭据外置到本地 `nas_conf.py`（P0-3 完成），文档内网 IP 改为 `<NAS_IP>` | `.gitignore`、`git_release.py`、`deploy_update.py`、`docs/05` |
+| 2026-11-17 | 界面收敛：导航改为一层平铺 8 项（去掉「量化策略」父级与「⋯ 更多」折叠，「投资组合」更名「模拟交易」，「资讯」更名「财经资讯」）；回测设置改为工具栏 + 弹窗；去掉渐变背景与毛玻璃；修复首页展开项与侧边栏图标重复 | `streamlit_app.py` |
 | 2026-11-17 | 建立文档体系（本目录） | 本文件 |
