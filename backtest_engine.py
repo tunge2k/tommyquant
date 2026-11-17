@@ -553,6 +553,34 @@ def ma30_slope_up(cache: dict, code: str, date, lookback: int = None) -> bool | 
     return bool(cur > past)
 
 
+_STATIC_META_CACHE = {}
+
+
+def static_meta(feat: dict) -> dict:
+    """每只标的的静态属性: (六位代码, 上市首日)
+
+    逐日全市场过滤时, 原实现每次都执行 feat[code]["date"].iloc[0] 取上市日,
+    单次约 40 µs, 5000 只 × 900 天约占过滤耗时的 44%。这里按 feat 缓存一次。
+    """
+    if not feat:
+        return {}
+    key = id(feat)
+    hit = _STATIC_META_CACHE.get(key)
+    if hit is not None and hit[0] is feat:
+        return hit[1]
+    meta = {}
+    for code, df in feat.items():
+        pure = code[2:] if code.startswith(("sh", "sz")) else code
+        try:
+            first = df["date"].iloc[0]
+        except Exception:
+            continue
+        meta[code] = (pure, first)
+    _STATIC_META_CACHE.clear()          # 只留最新一份, 避免内存堆积
+    _STATIC_META_CACHE[key] = (feat, meta)
+    return meta
+
+
 def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
                                 cap_min: float = 15.0, cap_max: float = 200.0,
                                 min_listed_years: float = 3.0,
@@ -583,9 +611,14 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
         exclude_no_dividend = False
     sel_year = pd.Timestamp(date).year if date is not None else None
 
+    meta = static_meta(feat)
+    date_ts = pd.Timestamp(date) if date is not None else None
+
     candidates = []
     for code, row in snap.items():
-        pure = code[2:] if code.startswith(("sh", "sz")) else code
+        pure, first_date = meta.get(code, (None, None))
+        if pure is None:
+            pure = code[2:] if code.startswith(("sh", "sz")) else code
         # 排除创业板 30 和科创板 688
         if pure.startswith(("30", "688")):
             continue
@@ -593,17 +626,13 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
         mc = row.get("cap_yi", np.nan)
         if np.isnan(mc) or mc <= 0 or mc < cap_min or mc > cap_max:
             continue
-        # 上市年限: 通过 feat 中该股票的历史长度估算
-        if feat and code in feat:
-            first_date = feat[code]["date"].iloc[0]
-            if date is not None:
-                years = (pd.Timestamp(date) - first_date).days / 365.25
-                if years < min_listed_years:
-                    continue
-            else:
-                # 没传 date 时, 用 feat 长度估算 (约250天/年)
-                if len(feat[code]) < int(min_listed_years * 250):
-                    continue
+        # 上市年限: 通过 feat 中该股票的首根K线估算
+        if first_date is not None and date_ts is not None:
+            if (date_ts - first_date).days / 365.25 < min_listed_years:
+                continue
+        elif feat and code in feat:
+            if len(feat[code]) < int(min_listed_years * 250):
+                continue
         # 不良标的剔除
         # (a) 财务类: ST/现金流背离/营业外盈利 — 有财务数据时生效
         if any_fund_filter:
