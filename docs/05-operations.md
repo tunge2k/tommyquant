@@ -203,7 +203,7 @@ docker exec -w /app tommyquant python update_worker.py --once
 
 ## 9. 安全注意事项
 
-1. **明文凭据**：`deploy_update.py`、`deploy_to_nas.py`、`push_run.py` 中硬编码了 NAS 账号密码。必须尽快外置（01 的 P0-3），并轮换密码。
+1. **明文凭据**：已外置（01 的 P0-3 已完成）。NAS 地址与密码写在本地 `nas_conf.py`，该文件已在 `.gitignore` 中；部署脚本优先读 `nas_conf`，缺失时回退环境变量 `NAS_HOST / NAS_PORT / NAS_USER / NAS_PASSWORD`。克隆项目后需自行创建 `nas_conf.py`。
 2. **无鉴权**：Streamlit 没有登录机制，端口不要暴露到公网；只允许内网访问，必要时加反向代理与 Basic Auth。
 3. **SSH 暴露**：限制 NAS SSH 来源 IP，优先使用密钥登录。
 4. **用户代码执行**：`author` 页使用 `exec` 执行任意代码，当前不可达；启用前必须做隔离或删除（P1-3）。
@@ -213,14 +213,45 @@ docker exec -w /app tommyquant python update_worker.py --once
 
 ## 10. 升级与回滚
 
-当前没有版本控制，升级依赖文件覆盖，回滚能力弱（03 的 TD-05）。
+已启用 git 版本管理（P0-4 完成），远端仓库 `tunge2k/tommyquant`，用 tag 标记每个发布版本。
 
-建议流程：
+### 10.1 版本号约定
+
+`MAJOR.MINOR.PATCH`，语义按「对回测结果的影响」判断：
+
+| 位 | 递增条件 | 例子 |
+|---|---|---|
+| MAJOR | 回测口径/数据结构不兼容，历史结果全部失效 | 引入涨跌停不可成交模型 |
+| MINOR | 新增策略、新增功能页、调仓规则变化 | Topk-Drop 调仓上线 |
+| PATCH | UI 调整、Bug 修复、文档更新 | 导航扁平化、原因中文化 |
+
+### 10.2 发布流程
+
+```bash
+git add -A
+git commit -m "feat: 一句话说明改动"
+git tag -a v1.2.0 -m "v1.2.0 简述"
+git push origin main --tags
+```
+
+随后部署到 NAS：
+
+```bash
+py -3.13 deploy_update.py
+```
+
+### 10.3 回滚
+
+```bash
+git checkout v1.1.0          # 回到指定版本的源码
+py -3.13 deploy_update.py    # 重新部署该版本
+```
+
+涉及回测语义的改动回滚后，需确认 `bt_cache_key` 版本号与代码一致，避免新旧结果混用。
+
+### 10.4 部署前检查
 
 1. 升级前备份 `data/stock.db`；
-2. 记录本次改动的文件与缓存版本；
-3. 部署后跑 `deploy_update.py --check`；
-4. 若异常，恢复数据库备份 + 回退对应源码文件 + 重建容器；
-5. 涉及回测语义的改动，确认 `v14` 已升级，避免新旧结果混用。
-
-长期方案：初始化 git，每次发布打 tag，部署脚本按 tag 拉取。
+2. 确认 `nas_conf.py` 存在（未被误删、未被提交）；
+3. 部署后访问 `/_stcore/health` 确认 `ok`；
+4. 跑一次全量回测，核对区间与数据指纹。
