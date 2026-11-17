@@ -227,6 +227,14 @@ docker exec -w /app tommyquant python update_worker.py --once
 
 ### 10.2 发布流程
 
+推荐用封装脚本（自动完成 add / commit / tag / push）：
+
+```bash
+py -3.13 git_release.py 1.2.0 "新增涨跌停不可成交建模"
+```
+
+等价的手工命令：
+
 ```bash
 git add -A
 git commit -m "feat: 一句话说明改动"
