@@ -2505,17 +2505,24 @@ elif page == "backtest":
                             use_container_width=True, key="bt_run")
 
     # ---------- 设置弹窗 (st.dialog: 原生 modal, 点确定关闭) ----------
+    # 弹窗内会重新赋值同名变量, 因此先把当前值存到 _cur_* 里当默认值,
+    # 否则 value=_cur_initial 这类引用会命中未赋值的本地变量 (UnboundLocalError)
+    _cur_initial = initial_capital
+    _cur_top_n = top_n
+    _cur_hold = hold_days
+    _cur_lup = limit_up_pct
+
     @st.dialog("⚙️ 回测设置", width="large")
     def _bt_settings_dialog():
         st.markdown("**回测参数**")
         _c_p1, _c_p2 = st.columns(2)
         initial_capital = _c_p1.number_input(
-            "初始资金(万)", 10, 10000, initial_capital // 10000, 10,
+            "初始资金(万)", 10, 10000, _cur_initial // 10000, 10,
             format="%d", key="di_initial") * 10000
         if strategy_choice != "市值策略":
-            top_n = _c_p2.slider("持仓数", 1, 30, top_n, key="di_topn")
-            hold_days = _c_p1.slider("持有天数", 1, 30, hold_days, key="di_hold")
-            limit_up_pct = _c_p2.slider("涨停阈值(%)", 5.0, 15.0, limit_up_pct, 0.1,
+            top_n = _c_p2.slider("持仓数", 1, 30, _cur_top_n, key="di_topn")
+            hold_days = _c_p1.slider("持有天数", 1, 30, _cur_hold, key="di_hold")
+            limit_up_pct = _c_p2.slider("涨停阈值(%)", 5.0, 15.0, _cur_lup, 0.1,
                                         key="di_limitup")
         else:
             _mc_uni2 = list(st.session_state.get("mc_universe_list") or [])
