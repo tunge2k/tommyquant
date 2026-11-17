@@ -1146,11 +1146,11 @@ with st.sidebar:
     # 数据状态
     try:
         _stats = data_store.db_stats()
-        st.caption(f"📈 {t('data_status')}")
+        st.caption(t('data_status'))
         st.caption(f"{_stats['symbols']} {t('zhi')}  ·  {_stats['bars']:,} bars")
         st.caption(f"{_stats['first_date']} ~ {_stats['last_date']}")
     except Exception:
-        st.caption(f"📈 {t('data_status')}")
+        st.caption(t('data_status'))
         st.caption("Worker loading..." if lang() == "en" else "Worker 自动补全中...")
 
 page = _new_key  # 供后续路由使用
@@ -2187,7 +2187,7 @@ if page == "home":
     st.divider()
 
     # ---- 新闻摘要 (默认折叠, 进「📰 资讯中心」看全部) ----
-    with st.expander(f"📰 {t('news_summary')}", expanded=False):
+    with st.expander(t('news_summary'), expanded=False):
         try:
             all_news = news_fetcher.get_recent_news(limit=10)
             _perr = news_fetcher.last_proxy_error()
@@ -2287,7 +2287,7 @@ if page == "home":
     st.divider()
 
     # ---- 策略绩效概览 (可展开, 数据来自缓存) ----
-    with st.expander(f"📊 {t('strat_perf')}", expanded=False):
+    with st.expander(t('strat_perf'), expanded=False):
         st.caption(f"{t('dash_range')}: {backtest_start.strftime('%Y-%m-%d')} ~ "
                    f"{backtest_end.strftime('%Y-%m-%d')}")
 
