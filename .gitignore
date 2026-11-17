@@ -1,6 +1,7 @@
 # ===== 私密配置 (绝不入库) =====
 nas_conf.py
 .env
+.gh_token
 .streamlit/secrets.toml
 
 # ===== 数据与缓存 (体积大、可再生) =====
