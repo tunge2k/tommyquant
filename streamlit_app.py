@@ -2514,76 +2514,79 @@ elif page == "backtest":
 
     @st.dialog("⚙️ 回测设置", width="large")
     def _bt_settings_dialog():
+        st.markdown("<style>"
+                    'div[data-testid="stDialog"] div[data-testid="stVerticalBlock"]{gap:.3rem}'
+                    'div[data-testid="stDialog"] hr{margin:.3rem 0}'
+                    "</style>", unsafe_allow_html=True)
         st.markdown("**回测参数**")
-        _c_p1, _c_p2 = st.columns(2)
-        initial_capital = _c_p1.number_input(
+        _r1 = st.columns(4)
+        initial_capital = _r1[0].number_input(
             "初始资金(万)", 10, 10000, _cur_initial // 10000, 10,
             format="%d", key="di_initial") * 10000
         if strategy_choice != "市值策略":
-            top_n = _c_p2.slider("持仓数", 1, 30, _cur_top_n, key="di_topn")
-            hold_days = _c_p1.slider("持有天数", 1, 30, _cur_hold, key="di_hold")
-            limit_up_pct = _c_p2.slider("涨停阈值(%)", 5.0, 15.0, _cur_lup, 0.1,
-                                        key="di_limitup")
+            top_n = _r1[1].slider("持仓数", 1, 30, _cur_top_n, key="di_topn")
+            hold_days = _r1[2].slider("持有天数", 1, 30, _cur_hold, key="di_hold")
+            limit_up_pct = _r1[3].slider("涨停阈值(%)", 5.0, 15.0, _cur_lup, 0.1,
+                                         key="di_limitup")
         else:
             _mc_uni2 = list(st.session_state.get("mc_universe_list") or [])
-            if _mc_uni2:
-                _c_p2.metric("持仓数（标的池决定）", len(_mc_uni2))
-            else:
-                _c_p2.metric("持仓数（选股决定）", "top_n")
-        _dr = _c_p1.date_input("回测起点", value=backtest_start, key="di_start")
-        _de = _c_p2.date_input("回测终点", value=backtest_end, key="di_end")
+            _r1[1].metric("持仓数", len(_mc_uni2) if _mc_uni2 else "按选股")
+        _r2 = st.columns([1, 1, 2])
+        _dr = _r2[0].date_input("回测起点", value=backtest_start, key="di_start")
+        _de = _r2[1].date_input("回测终点", value=backtest_end, key="di_end")
 
-        st.markdown("---")
+        st.divider()
         st.markdown("**策略参数**")
 
         if strategy_choice == "小市值轮动·戴维斯双击":
-            st.markdown("**选股条件**")
-            st.slider("市值上限(亿)", 10, 100, key="sd_cap_max")
-            st.slider("20日涨幅下限(%)", 2, 15, key="sd_ret20")
-            st.checkbox("MA20确认", key="sd_ma20")
-            st.checkbox("MA60确认", key="sd_ma60")
-            st.slider("换手率下限(%)", 1, 10, key="sd_turn_min")
-            st.slider("换手率上限(%)", 5, 40, key="sd_turn_max")
+            _a = st.columns(4)
+            _a[0].slider("市值上限(亿)", 10, 100, key="sd_cap_max")
+            _a[1].slider("20日涨幅下限(%)", 2, 15, key="sd_ret20")
+            _a[2].slider("换手率下限(%)", 1, 10, key="sd_turn_min")
+            _a[3].slider("换手率上限(%)", 5, 40, key="sd_turn_max")
+            _b = st.columns(4)
+            _b[0].checkbox("MA20 确认", key="sd_ma20")
+            _b[1].checkbox("MA60 确认", key="sd_ma60")
         elif strategy_choice == "动量+均线+小市值":
-            st.markdown("**选股条件**")
-            st.slider("20日涨幅下限(%)", 1, 20, key="ret_20_min")
-            st.slider("市值上限(亿)", 50, 500, key="cap_max")
-            st.checkbox("MA20以上", key="require_ma20")
+            _a = st.columns(4)
+            _a[0].slider("20日涨幅下限(%)", 1, 20, key="ret_20_min")
+            _a[1].slider("市值上限(亿)", 50, 500, key="cap_max")
+            _a[2].checkbox("MA20 以上", key="require_ma20")
         elif strategy_choice == "市值策略":
-            st.markdown("**标的池**")
             if "_mc_symbols" not in st.session_state:
                 _all = sorted(feat_data.keys())
                 _ETF_PRE = ("sz159", "sh51", "sh52", "sh56", "sh58")
                 _etf = [s for s in _all if any(s.startswith(p) for p in _ETF_PRE)]
                 _equity = [s for s in _all if s not in _etf]
                 st.session_state["_mc_symbols"] = _etf + _equity
-            _opts = st.session_state["_mc_symbols"]
             st.multiselect(
-                "从数据库已有行情的标的中选 (支持搜索)",
-                options=_opts, key="mc_universe_list",
-                placeholder="留空 → 按市值/财务条件全市场选股")
-            st.markdown("**选股条件**")
-            st.slider("市值下限(亿)", 5, 50, key="mc_cap_min")
-            st.slider("市值上限(亿)", 100, 500, key="mc_cap_max")
-            st.slider("上市年限(年)", 1.0, 10.0, key="mc_listed_yrs", step=0.5)
-            st.markdown("**不良标的剔除**")
-            st.checkbox("剔除 ST/*ST/退市风险", key="mc_ex_st")
-            st.checkbox("剔除现金流背离", key="mc_ex_ocf")
-            st.checkbox("剔除靠变卖资产等非正常经营盈利", key="mc_ex_nonop")
-            st.checkbox("剔除长期不分红", key="mc_ex_nodiv")
-            st.slider("分红回看年数", 1, 5, key="mc_div_years")
-            st.markdown("**换股条件**")
-            st.checkbox("MA30 拐头向下清仓（趋势止损）", key="mc_ma30_exit")
-            st.slider("周线 MA30 斜率判断回看(周)", 2, 15, key="mc_ma30_lookback")
-            st.markdown("**交易规则**")
+                "标的池（留空 = 全市场选股）",
+                options=st.session_state["_mc_symbols"], key="mc_universe_list",
+                placeholder="从库内已有行情的标的中选，支持搜索")
+            _a = st.columns(4)
+            _a[0].slider("市值下限(亿)", 5, 50, key="mc_cap_min")
+            _a[1].slider("市值上限(亿)", 100, 500, key="mc_cap_max")
+            _a[2].slider("上市年限(年)", 1.0, 10.0, key="mc_listed_yrs", step=0.5)
+            _a[3].slider("分红回看年数", 1, 5, key="mc_div_years")
+            _b = st.columns(4)
+            _b[0].checkbox("剔除 ST", key="mc_ex_st", help="ST / *ST / 退市整理")
+            _b[1].checkbox("现金流背离", key="mc_ex_ocf", help="EPS>0 但每股经营现金流<0")
+            _b[2].checkbox("营业外盈利", key="mc_ex_nonop", help="净利>0 但营业利润≤0")
+            _b[3].checkbox("长期不分红", key="mc_ex_nodiv", help="回看年内无现金分红")
+            _c = st.columns(4)
+            _c[0].checkbox("MA30 拐头清仓", key="mc_ma30_exit", help="趋势止损")
+            _c[1].slider("MA30 回看(周)", 2, 15, key="mc_ma30_lookback")
+            _c[2].slider("资金比例", 0.50, 1.00, key="mc_weight_frac", step=0.05,
+                         help="买入金额占总市值比例")
+            _c[3].slider("排名缓冲(名)", 0, 10, key="mc_rank_buffer",
+                         help="排名跌出 持仓数+缓冲 才换出")
             st.radio("调仓方式", options=["topk_drop", "deviation"],
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
                      key="mc_rebal_mode", horizontal=True)
-            st.slider("排名缓冲(名)", 0, 10, key="mc_rank_buffer")
-            st.slider("资金比例(买入占总市值)", 0.50, 1.00, key="mc_weight_frac", step=0.05)
-            st.slider("市值变化调仓阈值(%)", 0.01, 0.15, key="mc_cap_chg_th", step=0.01)
-            st.slider("持仓比例差再平衡阈值(%)", 0.02, 0.15, key="mc_rebal_th", step=0.01)
+            _d = st.columns(4)
+            _d[0].slider("市值变化阈值(%)", 0.01, 0.15, key="mc_cap_chg_th", step=0.01)
+            _d[1].slider("持仓偏离阈值(%)", 0.02, 0.15, key="mc_rebal_th", step=0.01)
 
         # 底部按钮行
         dlg_c1, dlg_c2, dlg_c3 = st.columns([1, 1, 1])
