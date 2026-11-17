@@ -1,0 +1,15 @@
+# Docker build 不需要这些
+__pycache__/
+*.pyc
+*.pyo
+deploy_libs/
+debug_backtest.py
+limit_up_backtest*.py
+backtest_report.txt
+*.tar.gz
+.git/
+.vscode/
+.trae/
+*.log
+.DS_Store
+cache/        # cache 会通过 volume 挂载，不进镜像

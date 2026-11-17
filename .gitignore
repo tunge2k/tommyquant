@@ -1,0 +1,36 @@
+# ===== 私密配置 (绝不入库) =====
+nas_conf.py
+.env
+.streamlit/secrets.toml
+
+# ===== 数据与缓存 (体积大、可再生) =====
+data/*.db
+data/*.db-journal
+data/*.pkl
+cache/
+*.log
+logs/
+
+# ===== 部署依赖包 (本地安装, 可重装) =====
+deploy_libs/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== 回测产物 =====
+backtest_report.txt
+*.xlsx
+*.csv
+!tests/fixtures/*.csv

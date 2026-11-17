@@ -1,0 +1,49 @@
+# ============================================================
+# 涨停猎手 Pro —— Docker Compose 一键部署
+#
+# 使用方法:
+#   1. 先安装 Docker Desktop (https://www.docker.com)
+#   2. 进入项目目录: cd d:\py_lezrn\stock_a\888
+#   3. 启动: docker compose up -d --build
+#   4. 打开浏览器: http://localhost:8501
+#   5. 停止: docker compose down
+#
+# 数据持久化:
+#   cache/ 目录挂在宿主机上，容器重建不丢数据
+# ============================================================
+
+services:
+  app:
+    build: .
+    container_name: tommyquant
+    image: tommyquant:latest
+    ports:
+      - "8501:8501"
+    volumes:
+      # SQLite 数据库持久化 (K线/策略运行/选股记录)
+      - ./data:/app/data
+      # CSV 缓存 (可选, 兼容旧数据)
+      - ./cache:/app/cache
+    restart: unless-stopped
+    # 显式指定公共 DNS, 绕过 NAS 可能坏掉的 DNS 解析
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+      - 8.8.8.8
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      # ---- 后台数据 Worker ----
+      - AUTO_DOWNLOAD_COUNT=0          # 0=全量自举(全部A股+ETF)
+      - CLOSE_HOUR=15                  # 盘后补全开始时间
+      - CLOSE_MINUTE=35
+      - RT_INTERVAL_SEC=60             # 交易时段实时快照间隔(秒)
+      - NEWS_INTERVAL_MIN=120          # 新闻抓取间隔(分钟)
+      - CHECK_INTERVAL=5               # 主循环间隔(秒)
+      - FUNDAMENTAL_WEEKDAY=4          # 每周几刷新财务(4=周五)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
