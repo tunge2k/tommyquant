@@ -44,6 +44,15 @@ class TestBoardLimits(unittest.TestCase):
         # 创业板 ST 仍为 20%
         self.assertAlmostEqual(pl.price_limit_pct("sz300001", "2026-01-05", is_st=True), 0.20)
 
+    def test_etf_detection(self):
+        self.assertTrue(pl.is_etf("sh510300"))
+        self.assertTrue(pl.is_etf("sh588000"))
+        self.assertTrue(pl.is_etf("sz159915"))
+        self.assertTrue(pl.is_etf("sz161725"))
+        self.assertFalse(pl.is_etf("sh600000"))
+        self.assertFalse(pl.is_etf("sz300750"))
+        self.assertFalse(pl.is_etf("sh688981"))
+
 
 class TestLimitPrice(unittest.TestCase):
     def test_round_cent(self):

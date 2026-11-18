@@ -26,6 +26,8 @@ PRICE_TOL = 0.0051
 _GEM_PREFIXES = ("300", "301", "302")
 _STAR_PREFIXES = ("688", "689")
 _BJ_PREFIXES = ("4", "8")
+# 场内基金: 深 15/16 (ETF/LOF), 沪 50/51/52/56/58 (LOF/ETF)
+_FUND_PREFIXES = ("15", "16", "50", "51", "52", "56", "58")
 
 
 def pure_code(code: str) -> str:
@@ -47,6 +49,11 @@ def board_of(code: str) -> str:
     if p.startswith(_STAR_PREFIXES):
         return "star"
     return "main"
+
+
+def is_etf(code: str) -> bool:
+    """场内基金 (ETF/LOF): 佣金与最低收费与股票不同, 涨跌停仍为 10%"""
+    return pure_code(code).startswith(_FUND_PREFIXES)
 
 
 def _to_date(value) -> date | None:

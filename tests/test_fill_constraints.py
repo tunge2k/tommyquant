@@ -156,5 +156,40 @@ class TestFastEngineParity(unittest.TestCase):
         self.assertEqual(str(result["trades"][0]["sell_date"])[:10], str(dates[3])[:10])
 
 
+class TestCostModel(unittest.TestCase):
+    """费率口径: 股票万1.154/1元起, ETF 万1/0.2元起, 印花税仅股票卖出"""
+
+    def setUp(self):
+        self.cm = be.CostModel()
+
+    def test_stock_commission(self):
+        # 10 万元买入: 100000 × 0.0001154 = 11.54
+        self.assertAlmostEqual(self.cm.commission_of("sh600000", 100000.0), 11.54)
+        # 小额按最低 1 元收
+        self.assertAlmostEqual(self.cm.commission_of("sh600000", 1000.0), 1.0)
+
+    def test_etf_commission(self):
+        # 10 万元 ETF: 100000 × 0.0001 = 10
+        self.assertAlmostEqual(self.cm.commission_of("sh510300", 100000.0), 10.0)
+        # 小额按最低 0.2 元收
+        self.assertAlmostEqual(self.cm.commission_of("sz159915", 1000.0), 0.2)
+
+    def test_stamp_tax_only_stock_sell(self):
+        cm = be.CostModel(slippage_rate=0.0)   # 剔除滑点, 只验印花税
+        _, _, stamp_buy, _, _, _ = cm.calc_fill("sh600000", "buy", 10000, 10.0)
+        _, _, stamp_sell, _, _, _ = cm.calc_fill("sh600000", "sell", 10000, 10.0)
+        _, _, stamp_etf, _, _, _ = cm.calc_fill("sh510300", "sell", 10000, 10.0)
+        self.assertEqual(stamp_buy, 0.0)
+        self.assertAlmostEqual(stamp_sell, 100000.0 * 0.0005)
+        self.assertEqual(stamp_etf, 0.0)
+
+    def test_params_override(self):
+        cm = be.CostModel(commission_rate=0.0002, commission_min=5.0,
+                          etf_commission_rate=0.00008, etf_commission_min=0.5)
+        self.assertAlmostEqual(cm.commission_of("sh600000", 100000.0), 20.0)
+        self.assertAlmostEqual(cm.commission_of("sh510300", 100000.0), 8.0)
+        self.assertAlmostEqual(cm.commission_of("sh510300", 1000.0), 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

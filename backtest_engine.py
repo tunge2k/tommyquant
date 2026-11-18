@@ -1113,33 +1113,46 @@ class FillEvent(_Event):
 class CostModel:
     """A 股真实交易成本模型
 
-    佣金: 万2.5, 双向, 最低5元
-    印花税: 0.1%, 仅卖出
+    佣金: 股票万1.154 (最低1元), 场内ETF/LOF 万1 (最低0.2元), 双向
+    印花税: 0.05%, 仅卖出
     过户费: 0.001%, 双向
     滑点: 0.1% (单边)
     冲击成本: 订单金额/当日成交额 > 5% 时触发
     """
 
-    COMMISSION_RATE = 0.00025
-    COMMISSION_MIN = 5.0
-    STAMP_TAX_RATE = 0.001      # 仅卖出
+    COMMISSION_RATE = 0.0001154     # 股票 万1.154
+    COMMISSION_MIN = 1.0
+    ETF_COMMISSION_RATE = 0.0001    # ETF/LOF 万1
+    ETF_COMMISSION_MIN = 0.2
+    STAMP_TAX_RATE = 0.0005         # 仅卖出
     TRANSFER_FEE_RATE = 0.00001
     SLIPPAGE_RATE = 0.001
     IMPACT_THRESHOLD = 0.05     # 占当日成交额 5%
 
     def __init__(self, commission_rate=None, commission_min=None,
+                 etf_commission_rate=None, etf_commission_min=None,
                  stamp_tax_rate=None, transfer_fee_rate=None,
                  slippage_rate=None):
         if commission_rate is not None:
             self.COMMISSION_RATE = float(commission_rate)
         if commission_min is not None:
             self.COMMISSION_MIN = float(commission_min)
+        if etf_commission_rate is not None:
+            self.ETF_COMMISSION_RATE = float(etf_commission_rate)
+        if etf_commission_min is not None:
+            self.ETF_COMMISSION_MIN = float(etf_commission_min)
         if stamp_tax_rate is not None:
             self.STAMP_TAX_RATE = float(stamp_tax_rate)
         if transfer_fee_rate is not None:
             self.TRANSFER_FEE_RATE = float(transfer_fee_rate)
         if slippage_rate is not None:
             self.SLIPPAGE_RATE = float(slippage_rate)
+
+    def commission_of(self, code, amount):
+        """佣金 (双边): 股票与场内基金费率/最低收费分开"""
+        if price_limits.is_etf(code):
+            return max(amount * self.ETF_COMMISSION_RATE, self.ETF_COMMISSION_MIN)
+        return max(amount * self.COMMISSION_RATE, self.COMMISSION_MIN)
 
     def calc_fill(self, code, direction, quantity, ref_price, day_amount=0.0):
         """计算成交价 + 各项成本
@@ -1156,11 +1169,12 @@ class CostModel:
         amount = fill_price * quantity
         slippage_cost = abs(fill_price - ref_price) * quantity
 
-        # 佣金 (双向, 最低5元)
-        commission = max(amount * self.COMMISSION_RATE, self.COMMISSION_MIN)
+        # 佣金 (双向, 股票最低1元 / ETF最低0.2元)
+        commission = self.commission_of(code, amount)
 
-        # 印花税 (仅卖出)
-        stamp_tax = amount * self.STAMP_TAX_RATE if direction == "sell" else 0.0
+        # 印花税 (仅卖出, ETF/LOF 免征)
+        stamp_tax = (amount * self.STAMP_TAX_RATE
+                     if direction == "sell" and not price_limits.is_etf(code) else 0.0)
 
         # 过户费 (双向)
         transfer_fee = amount * self.TRANSFER_FEE_RATE
@@ -1405,9 +1419,10 @@ class MarketCapStrategy(BaseStrategy):
       6. 标的池 (universe): 指定后跳过市值/财务选股, 只在该池内建仓/调仓
          (单标的验证用, 如 universe=["sz159509"] + top_n=1)
       7. 调仓方式 rebalance_mode:
-         - "deviation" (默认): 上条 4 的偏离度再平衡, 每日检查, 换手高
+         - "deviation": 上条 4 的偏离度再平衡, 每日检查, 换手高
          - "topk_drop" (借 Qlib Topk-Drop): 持仓跌出候选前 top_n+rank_buffer 名才换出,
            空槽位才补新标的; 不做偏离度再平衡, 显著降低换手与成本
+         - 指定标的池 (universe) 时没有排名概念, topk_drop 自动退化为偏离度再平衡
     """
 
     name = "市值策略"
@@ -1733,7 +1748,10 @@ class MarketCapStrategy(BaseStrategy):
         # 排除当日要卖出的
         held_codes = [c for c in held_codes if c not in sell_codes]
 
-        if self.rebalance_mode != "topk_drop" and held_codes and not rebalance_orders:
+        # 指定标的池时没有"排名"概念, topk_drop 退化为偏离度再平衡;
+        # 否则 universe + topk_drop 会既不换股也不调仓 (一路持有到 MA30 走弱)
+        _deviation_rebal = (self.rebalance_mode != "topk_drop") or bool(self.universe)
+        if _deviation_rebal and held_codes and not rebalance_orders:
             # 单只目标市值: 账户总市值 × 目标仓位 / 持仓数
             # 用 total_value 而非持仓总市值 → 现金与持仓的比例也保持不变
             target_each = total_value * self.weight_fraction / max(len(held_codes), 1)

@@ -220,3 +220,5 @@
 | 2026-11-17 | 界面收敛：导航改为一层平铺 8 项（去掉「量化策略」父级与「⋯ 更多」折叠，「投资组合」更名「模拟交易」，「资讯」更名「财经资讯」）；回测设置改为工具栏 + 弹窗；去掉渐变背景与毛玻璃；修复首页展开项与侧边栏图标重复 | `streamlit_app.py` |
 | 2026-11-17 | 建立文档体系（本目录） | 本文件 |
 | 2026-11-18 | 借鉴 tick-stock-panel（MIT）：新增 `price_limits.py` 板块感知涨跌停（10/20/30%，ST 与创业板改革日分段、按分取整）；两个引擎统一「涨停买不进、跌停/停牌卖出顺延」，新增 `fill_blocks` 拦截统计与界面开关；`limit_up` 因子改为板块口径；新增 `robust_backtest.py`（K 段稳健分、最小交易数门槛、主目标白名单、冠军一致性）与滚动样本外；回测页新增「参数稳健性检验」面板；缓存版本升至 `v15`，补 7 项测试 | `price_limits.py`、`robust_backtest.py`、`backtest_engine.py`、`fast_backtest.py`、`streamlit_app.py`、`tests/`、`docs/04`、`docs/06` |
+| 2026-11-18 | 交易成本按实盘费率调整：股票佣金 万1.154（最低 1 元）、ETF/LOF 万1（最低 0.2 元）分开计费，印花税默认改为 0.05%（2023-08-28 起）且 ETF/LOF 免征；新增 `price_limits.is_etf` 判定，设置页拆为股票/ETF/税费三栏 | `price_limits.py`、`backtest_engine.py`、`streamlit_app.py`、`docs/02`、`docs/04`、`tests/` |
+| 2026-11-18 | 修复「指定标的池 + topk_drop 完全不调仓」：universe 分支跳过排名换股、topk_drop 又跳过偏离度再平衡，单只 ETF 建仓后一路持有到 MA30 走弱（中间涨跌 50% 无一笔调仓）；改为 universe 下 topk_drop 退化为偏离度调仓；回测设置弹窗改草稿机制（确定才生效，关闭保留上次设置） | `backtest_engine.py`、`streamlit_app.py`、`docs/04`、`tests/` |

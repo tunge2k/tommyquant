@@ -400,6 +400,33 @@ class TopkDropTest(unittest.TestCase):
         self.assertIsNone(sig)
 
 
+class UniverseRebalanceTest(unittest.TestCase):
+    """指定标的池 + Topk-Drop: 没有排名概念, 仍须按偏离度调仓
+
+    2026-11-18 反馈: 单只 ETF 从 2023-08 建仓一直持有到 2025-02 MA30 走弱,
+    中间涨跌远超 4% 却没有任何调仓 —— universe 分支跳过了排名换股,
+    topk_drop 又跳过了偏离度再平衡, 两条路都不走。
+    """
+
+    def test_universe_topk_drop_still_rebalances(self):
+        strat = make_strategy(top_n=1, universe=["sz159509"], rank_buffer=2,
+                              rebalance_mode="topk_drop", ma30_exit=False,
+                              cap_change_threshold=0.04, rebalance_threshold=0.05)
+        bars = FakeBars({("sz159509", DATE): {"close": 1.10, "cap_yi": np.nan}})
+        pf = FakePortfolio(cash=0, positions={"sz159509": position(100000)},
+                           total_value=110000.0)
+        strat.portfolio = pf
+        strat.bars = bars
+        strat._target_weights = {"sz159509": 1.0}
+        strat._entry_prices = {"sz159509": 1.0}   # ETF 无市值 → 按价格算偏离: +10%
+
+        sig = strat.on_bar(MarketBarEvent(DATE, {"sz159509": {}}, bars))
+
+        self.assertIsNotNone(sig, "universe + topk_drop 不应完全放弃调仓")
+        self.assertEqual([o.direction for o in sig.rebalance_orders], ["sell"])
+        self.assertEqual(sig.rebalance_orders[0].code, "sz159509")
+
+
 class Ma30CacheTest(unittest.TestCase):
     """周线 MA30 预计算缓存: 与逐日 resample 口径一致, 数据不足时不做判断"""
 

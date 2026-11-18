@@ -1230,9 +1230,11 @@ def request_strategy_data(strategy_key: str, symbols: list, start, end) -> dict:
 def get_cost_params() -> dict:
     """从 app_settings 读取交易成本参数 (佣金/印花税/过户费/滑点)"""
     return {
-        "commission_rate": float(data_store.get_setting("cost_commission_rate", 0.00025)),
-        "commission_min": float(data_store.get_setting("cost_commission_min", 5.0)),
-        "stamp_tax_rate": float(data_store.get_setting("cost_stamp_tax_rate", 0.001)),
+        "commission_rate": float(data_store.get_setting("cost_commission_rate", 0.0001154)),
+        "commission_min": float(data_store.get_setting("cost_commission_min", 1.0)),
+        "etf_commission_rate": float(data_store.get_setting("cost_etf_commission_rate", 0.0001)),
+        "etf_commission_min": float(data_store.get_setting("cost_etf_commission_min", 0.2)),
+        "stamp_tax_rate": float(data_store.get_setting("cost_stamp_tax_rate", 0.0005)),
         "transfer_fee_rate": float(data_store.get_setting("cost_transfer_fee_rate", 0.00001)),
         "slippage_rate": float(data_store.get_setting("cost_slippage_rate", 0.001)),
     }
@@ -1251,7 +1253,9 @@ def _cost_str() -> str:
     """成本/撮合参数的指纹串, 参与缓存键"""
     cp = get_cost_params()
     lr = get_limit_rules()
-    return (f"{cp['commission_rate']}|{cp['commission_min']}|{cp['stamp_tax_rate']}"
+    return (f"{cp['commission_rate']}|{cp['commission_min']}"
+            f"|{cp['etf_commission_rate']}|{cp['etf_commission_min']}"
+            f"|{cp['stamp_tax_rate']}"
             f"|{cp['transfer_fee_rate']}|{cp['slippage_rate']}"
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
@@ -2666,6 +2670,7 @@ elif page == "backtest":
         "mc_ma30_lookback": 5, "mc_universe": "", "mc_ma30_exit": True,
         "mc_ex_st": True, "mc_ex_ocf": True, "mc_ex_nonop": True,
         "mc_ex_nodiv": True, "mc_div_years": 3,
+        "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_universe_list": [],
     }.items():
         st.session_state.setdefault(_k, _v)
 
@@ -2761,7 +2766,34 @@ elif page == "backtest":
     _cur_hold = hold_days
     _cur_lup = limit_up_pct
 
-    @st.dialog("⚙️ 回测设置", width="large")
+    # ---------- 参数草稿机制 ----------
+    # st.dialog 里的控件在弹窗关闭后会被 Streamlit 回收 (控件状态自动清理),
+    # 所以控件不能直接绑「已生效」键: 那样关闭弹窗参数就丢了。
+    # 约定: 控件一律用 di_ 前缀的草稿键, 生效值存在不带前缀的平键上,
+    # 只有点「确定」才把草稿回写; 关闭/取消保持上一次生效的设置。
+    _APPLY_KEYS = {
+        "小市值轮动·戴维斯双击": ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
+                                   "sd_turn_min", "sd_turn_max"),
+        "动量+均线+小市值": ("ret_20_min", "cap_max", "require_ma20"),
+        "市值策略": ("mc_universe_list", "mc_cap_min", "mc_cap_max", "mc_listed_yrs",
+                     "mc_div_years", "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop",
+                     "mc_ex_nodiv", "mc_ma30_exit", "mc_ma30_lookback",
+                     "mc_weight_frac", "mc_rank_buffer", "mc_rebal_mode",
+                     "mc_cap_chg_th", "mc_rebal_th"),
+    }
+
+    def _draft(key: str, default=None) -> str:
+        """返回草稿键; 草稿首次出现时用当前生效值初始化"""
+        dk = f"di_{key}"
+        if dk not in st.session_state:
+            st.session_state[dk] = st.session_state.get(key, default)
+        return dk
+
+    def _bt_settings_dismissed():
+        """弹窗被 Esc / 点外部关闭时清掉打开标记, 否则下一次任何交互都会把它重新弹出来"""
+        st.session_state["bt_open_settings"] = False
+
+    @st.dialog("⚙️ 回测设置", width="large", on_dismiss=_bt_settings_dismissed)
     def _bt_settings_dialog():
         st.markdown("<style>"
                     'div[data-testid="stDialog"] div[data-testid="stVerticalBlock"]{gap:.3rem}'
@@ -2786,21 +2818,22 @@ elif page == "backtest":
 
         st.divider()
         st.markdown("**策略参数**")
+        st.caption("改完点「确定」生效；直接关闭弹窗则保留上一次的设置。")
 
         if strategy_choice == "小市值轮动·戴维斯双击":
             _a = st.columns(4)
-            _a[0].slider("市值上限(亿)", 10, 100, key="sd_cap_max")
-            _a[1].slider("20日涨幅下限(%)", 2, 15, key="sd_ret20")
-            _a[2].slider("换手率下限(%)", 1, 10, key="sd_turn_min")
-            _a[3].slider("换手率上限(%)", 5, 40, key="sd_turn_max")
+            _a[0].slider("市值上限(亿)", 10, 100, key=_draft("sd_cap_max", 30))
+            _a[1].slider("20日涨幅下限(%)", 2, 15, key=_draft("sd_ret20", 5))
+            _a[2].slider("换手率下限(%)", 1, 10, key=_draft("sd_turn_min", 3))
+            _a[3].slider("换手率上限(%)", 5, 40, key=_draft("sd_turn_max", 20))
             _b = st.columns(4)
-            _b[0].checkbox("MA20 确认", key="sd_ma20")
-            _b[1].checkbox("MA60 确认", key="sd_ma60")
+            _b[0].checkbox("MA20 确认", key=_draft("sd_ma20", True))
+            _b[1].checkbox("MA60 确认", key=_draft("sd_ma60", True))
         elif strategy_choice == "动量+均线+小市值":
             _a = st.columns(4)
-            _a[0].slider("20日涨幅下限(%)", 1, 20, key="ret_20_min")
-            _a[1].slider("市值上限(亿)", 50, 500, key="cap_max")
-            _a[2].checkbox("MA20 以上", key="require_ma20")
+            _a[0].slider("20日涨幅下限(%)", 1, 20, key=_draft("ret_20_min", 5))
+            _a[1].slider("市值上限(亿)", 50, 500, key=_draft("cap_max", 200))
+            _a[2].checkbox("MA20 以上", key=_draft("require_ma20", True))
         elif strategy_choice == "市值策略":
             if "_mc_symbols" not in st.session_state:
                 _all = sorted(feat_data.keys())
@@ -2810,35 +2843,47 @@ elif page == "backtest":
                 st.session_state["_mc_symbols"] = _etf + _equity
             st.multiselect(
                 "标的池（留空 = 全市场选股）",
-                options=st.session_state["_mc_symbols"], key="mc_universe_list",
+                options=st.session_state["_mc_symbols"],
+                key=_draft("mc_universe_list", []),
                 placeholder="从库内已有行情的标的中选，支持搜索")
             _a = st.columns(4)
-            _a[0].slider("市值下限(亿)", 5, 50, key="mc_cap_min")
-            _a[1].slider("市值上限(亿)", 100, 500, key="mc_cap_max")
-            _a[2].slider("上市年限(年)", 1.0, 10.0, key="mc_listed_yrs", step=0.5)
-            _a[3].slider("分红回看年数", 1, 5, key="mc_div_years")
+            _a[0].slider("市值下限(亿)", 5, 50, key=_draft("mc_cap_min", 15))
+            _a[1].slider("市值上限(亿)", 100, 500, key=_draft("mc_cap_max", 200))
+            _a[2].slider("上市年限(年)", 1.0, 10.0, key=_draft("mc_listed_yrs", 3.0),
+                         step=0.5)
+            _a[3].slider("分红回看年数", 1, 5, key=_draft("mc_div_years", 3))
             _b = st.columns(4)
-            _b[0].checkbox("剔除 ST", key="mc_ex_st", help="ST / *ST / 退市整理")
-            _b[1].checkbox("现金流背离", key="mc_ex_ocf", help="EPS>0 但每股经营现金流<0")
-            _b[2].checkbox("营业外盈利", key="mc_ex_nonop", help="净利>0 但营业利润≤0")
-            _b[3].checkbox("长期不分红", key="mc_ex_nodiv", help="回看年内无现金分红")
+            _b[0].checkbox("剔除 ST", key=_draft("mc_ex_st", True), help="ST / *ST / 退市整理")
+            _b[1].checkbox("现金流背离", key=_draft("mc_ex_ocf", True),
+                           help="EPS>0 但每股经营现金流<0")
+            _b[2].checkbox("营业外盈利", key=_draft("mc_ex_nonop", True),
+                           help="净利>0 但营业利润≤0")
+            _b[3].checkbox("长期不分红", key=_draft("mc_ex_nodiv", True),
+                           help="回看年内无现金分红")
             _c = st.columns(4)
-            _c[0].checkbox("MA30 拐头清仓", key="mc_ma30_exit", help="趋势止损")
-            _c[1].slider("MA30 回看(周)", 2, 15, key="mc_ma30_lookback")
-            _c[2].slider("资金比例", 0.50, 1.00, key="mc_weight_frac", step=0.05,
-                         help="买入金额占总市值比例")
-            _c[3].slider("排名缓冲(名)", 0, 10, key="mc_rank_buffer",
+            _c[0].checkbox("MA30 拐头清仓", key=_draft("mc_ma30_exit", True), help="趋势止损")
+            _c[1].slider("MA30 回看(周)", 2, 15, key=_draft("mc_ma30_lookback", 5))
+            _c[2].slider("资金比例", 0.50, 1.00, key=_draft("mc_weight_frac", 0.75),
+                         step=0.05, help="买入金额占总市值比例")
+            _c[3].slider("排名缓冲(名)", 0, 10, key=_draft("mc_rank_buffer", 2),
                          help="排名跌出 持仓数+缓冲 才换出")
             st.radio("调仓方式", options=["topk_drop", "deviation"],
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
-                     key="mc_rebal_mode", horizontal=True)
+                     key=_draft("mc_rebal_mode", "topk_drop"), horizontal=True)
+            st.caption("指定标的池时没有排名概念，Topk-Drop 自动退化为偏离度调仓。")
             _d = st.columns(4)
-            _d[0].slider("市值变化阈值(%)", 0.01, 0.15, key="mc_cap_chg_th", step=0.01)
-            _d[1].slider("持仓偏离阈值(%)", 0.02, 0.15, key="mc_rebal_th", step=0.01)
+            _d[0].slider("市值变化阈值(%)", 0.01, 0.15, key=_draft("mc_cap_chg_th", 0.04),
+                         step=0.01)
+            _d[1].slider("持仓偏离阈值(%)", 0.02, 0.15, key=_draft("mc_rebal_th", 0.05),
+                         step=0.01)
 
         # 底部按钮行
         dlg_c1, dlg_c2, dlg_c3 = st.columns([1, 1, 1])
+        with dlg_c2:
+            if st.button("取消", use_container_width=True, key="bt_dlg_cancel"):
+                st.session_state["bt_open_settings"] = False
+                st.rerun()
         with dlg_c3:
             if st.button("✅ 确定", type="primary", use_container_width=True,
                          key="bt_dlg_ok"):
@@ -2849,6 +2894,10 @@ elif page == "backtest":
                     st.session_state["limit_up_pct"] = limit_up_pct
                 st.session_state["backtest_start"] = pd.Timestamp(_dr)
                 st.session_state["backtest_end"] = pd.Timestamp(_de)
+                for _pk in _APPLY_KEYS.get(strategy_choice, ()):
+                    _pv = f"di_{_pk}"
+                    if _pv in st.session_state:
+                        st.session_state[_pk] = st.session_state[_pv]
                 st.session_state["bt_open_settings"] = False
                 st.rerun()
 
@@ -3276,38 +3325,48 @@ elif page == "settings":
     st.caption("A 股真实交易成本模型, 所有策略回测统一使用。调整后缓存自动失效。")
 
     # 读取当前值
-    _cr = float(data_store.get_setting("cost_commission_rate", 0.00025))
-    _cmin = float(data_store.get_setting("cost_commission_min", 5.0))
-    _sr = float(data_store.get_setting("cost_stamp_tax_rate", 0.001))
+    _cr = float(data_store.get_setting("cost_commission_rate", 0.0001154))
+    _cmin = float(data_store.get_setting("cost_commission_min", 1.0))
+    _ecr = float(data_store.get_setting("cost_etf_commission_rate", 0.0001))
+    _ecmin = float(data_store.get_setting("cost_etf_commission_min", 0.2))
+    _sr = float(data_store.get_setting("cost_stamp_tax_rate", 0.0005))
     _tr = float(data_store.get_setting("cost_transfer_fee_rate", 0.00001))
     _sl = float(data_store.get_setting("cost_slippage_rate", 0.001))
 
-    _tc1, _tc2 = st.columns(2)
+    _tc1, _tc2, _tc3 = st.columns(3)
     with _tc1:
-        new_cr = st.number_input("佣金费率", value=_cr, min_value=0.0, max_value=0.01,
-                                  step=0.0001, format="%.5f",
-                                  help="默认 0.00025 (万2.5), 双向收取")
+        new_cr = st.number_input("股票佣金费率", value=_cr, min_value=0.0, max_value=0.01,
+                                  step=0.000001, format="%.6f",
+                                  help="默认 0.0001154 (万1.154), 双向收取")
+        new_cmin = st.number_input("股票佣金最低(元)", value=_cmin, min_value=0.0, max_value=50.0,
+                                    step=0.1, help="默认 1 元, 单笔佣金不足此值按此值收")
+    with _tc2:
+        new_ecr = st.number_input("ETF/LOF 佣金费率", value=_ecr, min_value=0.0, max_value=0.01,
+                                   step=0.00001, format="%.5f",
+                                   help="默认 0.0001 (万1), 双向收取")
+        new_ecmin = st.number_input("ETF/LOF 佣金最低(元)", value=_ecmin, min_value=0.0, max_value=10.0,
+                                     step=0.1, help="默认 0.2 元, 单笔佣金不足此值按此值收")
+    with _tc3:
         new_sr = st.number_input("印花税率", value=_sr, min_value=0.0, max_value=0.01,
-                                  step=0.0005, format="%.5f",
-                                  help="默认 0.001 (0.1%), 仅卖出时收取")
+                                  step=0.0001, format="%.5f",
+                                  help="默认 0.0005 (0.05%), 仅卖出; ETF/LOF 免征")
         new_tr = st.number_input("过户费率", value=_tr, min_value=0.0, max_value=0.001,
                                   step=0.00001, format="%.6f",
                                   help="默认 0.00001 (0.001%), 双向收取")
-    with _tc2:
-        new_cmin = st.number_input("佣金最低(元)", value=_cmin, min_value=0.0, max_value=50.0,
-                                    step=0.5, help="默认 5 元, 单笔佣金不足此值按此值收")
         new_sl = st.number_input("滑点率", value=_sl, min_value=0.0, max_value=0.05,
                                   step=0.0005, format="%.5f",
                                   help="默认 0.001 (0.1%), 单边滑点")
 
     # 保存 (任一变化)
     _cost_changed = any([
-        new_cr != _cr, new_cmin != _cmin, new_sr != _sr,
-        new_tr != _tr, new_sl != _sl,
+        new_cr != _cr, new_cmin != _cmin, new_ecr != _ecr, new_ecmin != _ecmin,
+        new_sr != _sr, new_tr != _tr, new_sl != _sl,
     ])
     if _cost_changed:
         data_store.set_setting("cost_commission_rate", new_cr)
         data_store.set_setting("cost_commission_min", new_cmin)
+        data_store.set_setting("cost_etf_commission_rate", new_ecr)
+        data_store.set_setting("cost_etf_commission_min", new_ecmin)
         data_store.set_setting("cost_stamp_tax_rate", new_sr)
         data_store.set_setting("cost_transfer_fee_rate", new_tr)
         data_store.set_setting("cost_slippage_rate", new_sl)
