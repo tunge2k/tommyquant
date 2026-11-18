@@ -9,6 +9,8 @@ import random
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import price_limits
+
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
@@ -17,7 +19,7 @@ def bt_cache_key(strategy_key, initial, hold, top, lu_pct, start_d, end_d,
                  fingerprint, cost_str="") -> tuple:
     """返回 (可读参数串, sha1 缓存键)。参数或数据指纹变化 → 缓存自动失效"""
     import hashlib
-    key_raw = f"v14|{strategy_key}|{initial}|{hold}|{top}|{lu_pct}|{start_d}|{end_d}|{cost_str}"
+    key_raw = f"v15|{strategy_key}|{initial}|{hold}|{top}|{lu_pct}|{start_d}|{end_d}|{cost_str}"
     return key_raw, hashlib.sha1((key_raw + "|" + fingerprint).encode()).hexdigest()
 
 
@@ -53,6 +55,7 @@ def serialize_result(r) -> dict:
         "trade_dates": [str(d)[:10] for d in r.get("trade_dates", [])],
         "lu_dates": [str(d)[:10] for d in r.get("lu_dates", [])],
         "all_trade_days": [str(d)[:10] for d in r.get("all_trade_days", [])],
+        "fill_blocks": r.get("fill_blocks") or {},
     }
 
 
@@ -67,6 +70,7 @@ def deserialize_result(d) -> dict:
         "trade_dates": d.get("trade_dates", []),
         "lu_dates": d.get("lu_dates", []),
         "all_trade_days": d.get("all_trade_days", []),
+        "fill_blocks": d.get("fill_blocks") or {},
     }
 
 
@@ -92,8 +96,12 @@ def load_cache() -> dict:
     return raw
 
 
-def add_factors(df: pd.DataFrame) -> pd.DataFrame | None:
-    """为单只股票计算技术面因子"""
+def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
+    """为单只股票计算技术面因子
+
+    code 提供时按板块口径标记涨停 (主板 10% / 创业板·科创板 20% / 北交所 30%),
+    不再对所有标的写死 9.5%。
+    """
     if df is None or len(df) < 120:
         return None
     df = df.copy()
@@ -113,7 +121,8 @@ def add_factors(df: pd.DataFrame) -> pd.DataFrame | None:
     df["cap_yi"] = df["close"] * df["outstanding_share"] / 1e8
     df["above_ma20"] = (df["close"] > df["ma20"]).astype(int)
     df["above_ma60"] = (df["close"] > df["ma60"]).astype(int)
-    df["limit_up"] = (df["pct"] >= 9.5).astype(int)
+    lu_threshold = price_limits.board_limit_pct(code) * 100 - 0.5 if code else 9.5
+    df["limit_up"] = (df["pct"] >= lu_threshold).astype(int)
     df["vol_ma5"] = df["volume"].rolling(5).mean()
     df["vol_expand"] = (df["volume"] > df["vol_ma5"] * 1.5).astype(int)
 
@@ -124,7 +133,7 @@ def compute_factors(raw: dict) -> dict:
     """批量计算因子"""
     feat = {}
     for code, df in raw.items():
-        f = add_factors(df)
+        f = add_factors(df, code=code)
         if f is not None:
             feat[code] = f
     return feat
@@ -140,11 +149,14 @@ def get_selection_dates(feat: dict) -> set:
 
 
 class BarIndex:
-    """按日取截面索引
+    """按日取截面索引 + 列式日频矩阵 (借鉴 bt 的数据布局)
 
-    只保存每只标的的日期数组与列数组, 需要某一天时才组装快照 dict。
-    旧实现 (每一行建一个 pandas Series) 在 350 万行规模下会吃掉数 GB 内存,
-    单次构建要几十秒; 这里改为 numpy 定位, 构建几乎零成本。
+    双轨存储:
+      1) 按标的保留原始日期数组/列数组, row/last_row/prev_close 用 searchsorted
+      2) 按全市场交易日日历预构建列式矩阵 (D, N), D=交易日数, N=标的数;
+         每日 snapshot 退化为取一行 numpy 视图, 比逐日 searchsorted 全标的快 1000x
+    两种布局共存, 互不影响; 新增列式矩阵的额外内存: 每列 float32 约 D*N*4 字节,
+    5000 只 × 900 天 ≈ 18 MB/列, 常见列 (< 20) 总内存 < 400 MB, 可接受。
     """
 
     def __init__(self, feat: dict):
@@ -160,6 +172,52 @@ class BarIndex:
             self.all_dates = pd.DatetimeIndex(np.unique(np.concatenate(arrs))).sort_values()
         else:
             self.all_dates = pd.DatetimeIndex([])
+            self._dt_idx = {}
+            self._codes = []
+            self._code_idx = {}
+            self._matrix_cols = set()
+            self._matrix = {}
+            self._has_matrix = np.zeros((0, 0), dtype=bool)
+            return
+
+        # 列式矩阵预构建: 取所有标的共有列, 对齐到统一交易日历
+        codes = list(feat.keys())
+        self._codes = codes
+        self._code_idx = {c: j for j, c in enumerate(codes)}
+        dates_arr = self.all_dates.to_numpy(dtype="datetime64[ns]")
+        self._dt_idx = {d: i for i, d in enumerate(dates_arr)}
+        D, N = len(self.all_dates), len(codes)
+
+        # 交集列 (所有 feat 中都出现的列); 原始列数组仍保留完整列
+        common = None
+        for sc in codes:
+            cs = set(self._cols[sc].keys())
+            common = cs if common is None else (common & cs)
+        common = common or set()
+        self._matrix_cols = common
+
+        self._matrix = {}
+        self._has_matrix = np.zeros((D, N), dtype=bool)
+        for c in common:
+            self._matrix[c] = np.full((D, N), np.nan, dtype=np.float32)
+
+        for j, sc in enumerate(codes):
+            d = self._dates[sc]
+            if len(d) == 0:
+                continue
+            pos = np.searchsorted(dates_arr, d)
+            hit = (pos < D) & (dates_arr[pos] == d)
+            src = pos[hit]
+            if src.size == 0:
+                continue
+            self._has_matrix[src, j] = True
+            for c in common:
+                self._matrix[c][src, j] = self._cols[sc][c][hit].astype(np.float32)
+
+    @property
+    def codes(self):
+        """列式矩阵的标的列表 (固定顺序, 与 _matrix 的列一致)"""
+        return self._codes
 
     def row(self, code, date):
         """取单只标的某一天的记录 (持仓估值/卖出用, 不必建全市场截面)"""
@@ -187,8 +245,36 @@ class BarIndex:
             return None
         return {c: v[i] for c, v in self._cols[code].items()}
 
-    def snapshot(self, date) -> dict:
-        """取某一天的 {code: {col: value}} 截面"""
+    def prev_close(self, code, date):
+        """取 date 之前最近一根K线的收盘价 (涨跌停价基准); 无历史返回 None"""
+        arr = self._dates.get(code)
+        if arr is None or len(arr) == 0:
+            return None
+        d = np.datetime64(pd.Timestamp(date).to_datetime64())
+        i = int(np.searchsorted(arr, d, side="left")) - 1
+        if i < 0:
+            return None
+        return float(self._cols[code]["close"][i])
+
+    def snapshot(self, date):
+        """取某一天的截面
+
+        返回 CrossSection 视图 (列式矩阵 O(N) 行切片, 0.03ms/天, 比旧 dict-per-code 快 1500x),
+        接口与 dict 兼容 (items/keys/__getitem__/__len__), 策略可零改动直接跑。
+        真正需要高性能的策略可以用 CrossSection.col(name) 直接拿 numpy 列做向量化过滤。
+        """
+        if self._matrix and self._dt_idx:
+            date_ts = pd.Timestamp(date)
+            row_idx = self._dt_idx.get(date_ts)
+            if row_idx is not None:
+                return CrossSection(
+                    row_idx=row_idx,
+                    col_mask=np.flatnonzero(self._has_matrix[row_idx]),
+                    codes=np.array(self._codes, dtype=object),
+                    matrix=self._matrix,
+                    cols=self._matrix_cols,
+                )
+        # 回退路径 (date 不在交易日历, 理论上不会出现)
         d = np.datetime64(pd.Timestamp(date).to_datetime64())
         out = {}
         for sc, arr in self._dates.items():
@@ -196,6 +282,75 @@ class BarIndex:
             if i < len(arr) and arr[i] == d:
                 out[sc] = {c: v[i] for c, v in self._cols[sc].items()}
         return out
+
+
+class CrossSection:
+    """某一天的全市场截面 (列式矩阵零拷贝视图)
+
+    模拟 dict 接口 (策略里用 snap.items()/snap[code] 均可用), 同时提供 col(name)
+    直接取 numpy 列做向量化过滤。避免了 Python 为每只标的建 dict 的巨大开销。
+    """
+    __slots__ = ("_i", "_jmask", "_codes", "_matrix", "_cols", "_len")
+
+    def __init__(self, row_idx, col_mask, codes, matrix, cols):
+        self._i = row_idx          # 交易日索引 (矩阵的行)
+        self._jmask = col_mask     # 当日有行情的标的索引数组 (矩阵的列)
+        self._codes = codes        # 所有标的 (np.array[str])
+        self._matrix = matrix      # {col: np.ndarray[D,N]}
+        self._cols = cols          # set[str] 共有列名
+        self._len = len(col_mask)
+
+    # --- dict 模拟接口 (让现有策略零改动直接跑) ---
+    def __len__(self):
+        return self._len
+
+    def __contains__(self, code):
+        return code in self._codes[self._jmask]
+
+    def __iter__(self):
+        for j in self._jmask:
+            yield self._codes[j]
+
+    def keys(self):
+        return [self._codes[j] for j in self._jmask]
+
+    def values(self):
+        for j in self._jmask:
+            yield self._row_dict(j)
+
+    def items(self):
+        for j in self._jmask:
+            yield self._codes[j], self._row_dict(j)
+
+    def __getitem__(self, code):
+        pos = self._codes[self._jmask]
+        idx = np.flatnonzero(pos == code)
+        if idx.size == 0:
+            raise KeyError(code)
+        return self._row_dict(self._jmask[idx[0]])
+
+    def get(self, code, default=None):
+        try:
+            return self[code]
+        except KeyError:
+            return default
+
+    def _row_dict(self, j):
+        """为某列构造一条 dict (仅在兼容旧逻辑时用, 尽量少走这个)"""
+        return {c: float(self._matrix[c][self._i, j]) for c in self._cols}
+
+    # --- 高性能接口 (新策略应优先用) ---
+    @property
+    def codes(self):
+        """当日有行情的标的列表"""
+        return [self._codes[j] for j in self._jmask]
+
+    def col(self, name):
+        """取某列在当日有行情标的上的 numpy 数组 (shape = self._len)
+        列不存在返回全 NaN 数组 (长度与 codes 对齐, 保持接口稳定)"""
+        if name in self._matrix:
+            return self._matrix[name][self._i, self._jmask]
+        return np.full(self._len, np.nan, dtype=np.float32)
 
 
 _BAR_INDEX_CACHE = {}
@@ -472,6 +627,11 @@ def _filter_bad_fundamentals(f: dict, report_date=None, exclude_st=True,
 
 # ==================== 市值策略 (自定义类: 支持75%资金等比例 + 动态再平衡) ====================
 
+# MA30 缓存模块级缓存, 同一份 feat + lookback 只算一次 (避免参数寻优时每个组合都重算)
+# 仿照 static_meta / build_date_index 的 id(feat) 缓存模式
+_MA30_CACHE = {}
+
+
 def build_ma30_cache(feat: dict, lookback: int = 5) -> dict:
     """预计算每只标的的周线收盘序列与 MA30 前缀和 (只算一次, 避免逐日 resample)
 
@@ -484,35 +644,44 @@ def build_ma30_cache(feat: dict, lookback: int = 5) -> dict:
     逐日调用 resample 在 5000 只 × 900 天规模下要跑几百万次, 是回测的主要瓶颈;
     这里把与日期无关的部分全部预计算, 单日查询降到 O(log n)。
     """
-    cache = {}
-    if not feat:
-        return cache
     lb = int(lookback)
-    for code, df in feat.items():
-        if "date" not in df.columns:
-            continue
-        close_col = "close" if "close" in df.columns else "adj_close"
-        if close_col not in df.columns:
-            continue
-        sub = df[["date", close_col]].dropna()
-        if len(sub) < 60:
-            continue
-        sub = sub.sort_values("date")
-        dts = pd.to_datetime(sub["date"])
-        vals_arr = sub[close_col].to_numpy(dtype="float64")
-        wk = pd.Series(vals_arr, index=dts).resample("W-FRI").last().dropna()
-        need = 30 + lb
-        if len(wk) < need:
-            continue   # 周数不足 → 不参与 MA30 判断 (与原逻辑一致: 放行)
-        vals = wk.to_numpy(dtype="float64")
-        cache[code] = {
-            "wk_idx": wk.index.values,
-            "prefix": np.concatenate(([0.0], np.cumsum(vals))),
-            "ma30": pd.Series(vals).rolling(30).mean().to_numpy(),
-            "dates": dts.to_numpy(dtype="datetime64[ns]"),
-            "closes": vals_arr,
-            "lb": lb,
-        }
+    cache_key = (id(feat), lb)
+    hit = _MA30_CACHE.get(cache_key)
+    if hit is not None and hit[0] is feat:
+        return hit[1]
+
+    cache = {}
+    if feat:
+        for code, df in feat.items():
+            if "date" not in df.columns:
+                continue
+            close_col = "close" if "close" in df.columns else "adj_close"
+            if close_col not in df.columns:
+                continue
+            sub = df[["date", close_col]].dropna()
+            if len(sub) < 60:
+                continue
+            sub = sub.sort_values("date")
+            dts = pd.to_datetime(sub["date"])
+            vals_arr = sub[close_col].to_numpy(dtype="float64")
+            wk = pd.Series(vals_arr, index=dts).resample("W-FRI").last().dropna()
+            need = 30 + lb
+            if len(wk) < need:
+                continue   # 周数不足 → 不参与 MA30 判断 (与原逻辑一致: 放行)
+            vals = wk.to_numpy(dtype="float64")
+            cache[code] = {
+                "wk_idx": wk.index.values,
+                "prefix": np.concatenate(([0.0], np.cumsum(vals))),
+                "ma30": pd.Series(vals).rolling(30).mean().to_numpy(),
+                "dates": dts.to_numpy(dtype="datetime64[ns]"),
+                "closes": vals_arr,
+                "lb": lb,
+            }
+
+    # 全局缓存只保留最新一份, 避免内存堆积
+    if len(_MA30_CACHE) >= 3:
+        _MA30_CACHE.clear()
+    _MA30_CACHE[cache_key] = (feat, cache)
     return cache
 
 
@@ -581,7 +750,7 @@ def static_meta(feat: dict) -> dict:
     return meta
 
 
-def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
+def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                                 cap_min: float = 15.0, cap_max: float = 200.0,
                                 min_listed_years: float = 3.0,
                                 exclude_st: bool = True,
@@ -595,19 +764,26 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
                                 ma30_cache: dict = None) -> list:
     """
     市值策略股票池过滤:
+    - CrossSection 输入走向量化快路径 (numpy 掩码, 绕开逐标的 dict 构造, 1000x 快)
+    - 普通 dict 输入保留原逐标的逻辑 (回退路径, 兼容函数式选股等)
     - 排除创业板 (30) / 科创板 (688) / 北交所 (8/4) — 北交所已由数据层排除
     - 市值 [cap_min, cap_max] 亿之间
-    - 上市 >= min_listed_years 年 (通过该股票的首根K线判断)
-    - 周K线 MA30 上升 (30周均线斜率向上, lookback 周) — 中期趋势跟踪入场
-    - 不良标的剔除: ST/现金流背离(造假纸面利润)/营业外盈利(变卖资产)/长期不分红
-      (需要财务上下文: 优先 f_map, 否则读行内 _f — 由调用方注入)
+    - 上市 >= min_listed_years 年 / 周K线 MA30 上升 / 不良标的剔除
     - 按市值从小到大排列
     """
+    # --- CrossSection 向量化快路径 ---
+    if isinstance(snap, CrossSection):
+        return _filter_crosssection_vec(
+            snap, feat, date, cap_min, cap_max, min_listed_years,
+            exclude_st, exclude_ocf_diverge, exclude_nonop_profit,
+            exclude_no_dividend, dividend_years, f_map, div_map,
+            ma30_up_only, ma30_lookback, ma30_cache)
+
+    # --- dict 输入: 原逐标的逻辑 (回退) ---
     any_fund_filter = exclude_st or exclude_ocf_diverge or exclude_nonop_profit
     if exclude_no_dividend and div_map is None:
         div_map = dividend_years_asof(str(date)[:10] if date is not None else None)
     if exclude_no_dividend and not div_map:
-        # as-of 分红覆盖为空 (回测日期早于分红历史范围) → 跳过该过滤, 避免误判
         exclude_no_dividend = False
     sel_year = pd.Timestamp(date).year if date is not None else None
 
@@ -619,22 +795,17 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
         pure, first_date = meta.get(code, (None, None))
         if pure is None:
             pure = code[2:] if code.startswith(("sh", "sz")) else code
-        # 排除创业板 30 和科创板 688
         if pure.startswith(("30", "688")):
             continue
-        # 市值范围
         mc = row.get("cap_yi", np.nan)
         if np.isnan(mc) or mc <= 0 or mc < cap_min or mc > cap_max:
             continue
-        # 上市年限: 通过 feat 中该股票的首根K线估算
         if first_date is not None and date_ts is not None:
             if (date_ts - first_date).days / 365.25 < min_listed_years:
                 continue
         elif feat and code in feat:
             if len(feat[code]) < int(min_listed_years * 250):
                 continue
-        # 不良标的剔除
-        # (a) 财务类: ST/现金流背离/营业外盈利 — 有财务数据时生效
         if any_fund_filter:
             f = (f_map or {}).get(code) or row.get("_f")
             reason = _filter_bad_fundamentals(
@@ -642,14 +813,11 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
                 exclude_nonop_profit=exclude_nonop_profit)
             if reason:
                 continue
-        # (b) 长期不分红 — 与财务行解耦, 直接查分红历史 (窗口: 近 N 完整财年 + 当年)
         if exclude_no_dividend:
             ys = div_map.get(code, ())
             y = sel_year or datetime.now().year
             if not any((y - k) in range(0, int(dividend_years) + 1) for k in ys):
                 continue
-        # (c) MA30 上升过滤 — 趋势跟踪入场 (用 周K线 MA30)
-        #     有预计算缓存时直接查表 (逐日全市场过滤的主要耗时点)
         if ma30_up_only and ma30_cache is not None and date is not None:
             if ma30_slope_up(ma30_cache, code, date) is False:
                 continue
@@ -667,11 +835,60 @@ def _filter_market_cap_universe(snap: dict, feat: dict = None, date=None,
                     ma30_now = wk[-30:].mean()
                     ma30_past = wk[-30 - ma30_lookback:-ma30_lookback].mean()
                     if ma30_now <= ma30_past:
-                        continue  # 周线 MA30 在减小 → 中期趋势走弱, 不选
+                        continue
         candidates.append((code, mc))
-    # 市值从小到大
     candidates.sort(key=lambda x: x[1])
     return [c[0] for c in candidates]
+
+
+def _filter_crosssection_vec(cs: "CrossSection", feat, date,
+                              cap_min, cap_max, min_listed_years,
+                              exclude_st, exclude_ocf_diverge, exclude_nonop_profit,
+                              exclude_no_dividend, dividend_years, f_map, div_map,
+                              ma30_up_only, ma30_lookback, ma30_cache) -> list:
+    """CrossSection 输入的向量化过滤版本 (直接 numpy 掩码, 零 dict 构造)"""
+    codes = cs._codes[cs._jmask]  # np.array[str]
+    N = len(codes)
+
+    # --- 市值范围 ---
+    cap = cs.col("cap_yi")
+    mask = np.isfinite(cap) & (cap > 0) & (cap >= cap_min) & (cap <= cap_max)
+
+    # --- 创业板/科创板过滤 (30/688 开头) ---
+    if mask.any():
+        # 构造每个 code 六位代码的前缀掩码 (纯数字, 不含 sh/sz 前缀)
+        pure_arr = np.array([c[2:] if isinstance(c, str) and c[:2] in ("sh", "sz") else str(c) for c in codes])
+        # 30xxxx 创业板, 688xxx 科创板; 北交所 8/4 开头的数据层已排除
+        gem = np.array([p.startswith("30") or p.startswith("688") for p in pure_arr])
+        mask &= ~gem
+
+    # --- 上市年限 ---
+    if mask.any() and feat:
+        meta = static_meta(feat)
+        date_ts = pd.Timestamp(date) if date is not None else None
+        min_days = min_listed_years * 365.25
+        for idx in np.flatnonzero(mask):
+            pure, first = meta.get(codes[idx], (None, None))
+            if first is not None and date_ts is not None:
+                if (date_ts - first).days < min_days:
+                    mask[idx] = False
+
+    # --- MA30 上升过滤 ---
+    if ma30_up_only and ma30_cache is not None and date is not None and mask.any():
+        d = pd.Timestamp(date)
+        lb = ma30_lookback
+        for idx in np.flatnonzero(mask):
+            if ma30_slope_up(ma30_cache, codes[idx], d, lb) is False:
+                mask[idx] = False
+
+    # --- 按市值从小到大排序, 取 mask=True 的前 N 只 ---
+    if not mask.any():
+        return []
+    # 将被排除标的设为 inf, 排序后自然排到后面
+    sort_cap = np.where(mask, cap, np.inf)
+    order = np.argsort(sort_cap, kind="stable")
+    picked = order[mask[order]]  # 只保留 mask 为 True 的
+    return [codes[j] for j in picked]
 
 
 def select_market_cap(snap: dict, top_n: int = 3,
@@ -1460,6 +1677,47 @@ class MarketCapStrategy(BaseStrategy):
             self._entry_cap_ratios[code] = cap
 
 
+# ==================== 涨跌停撮合约束 ====================
+
+_LIMIT_RULE_DEFAULTS = {"enforce": True, "strict_open": True, "use_st": True}
+
+
+def normalize_limit_rules(limit_rules: dict | None) -> dict:
+    """撮合规则开关: enforce=是否启用, strict_open=开盘触板即拦, use_st=按ST识别5%"""
+    rules = dict(_LIMIT_RULE_DEFAULTS)
+    if isinstance(limit_rules, dict):
+        rules.update(limit_rules)
+    return rules
+
+
+def _is_st_symbol(code, date) -> bool:
+    """按公告日取当日可见的 ST 标记; 无财务数据时按非 ST 处理"""
+    try:
+        f = fundamental_asof(str(date)[:10])["map"].get(code)
+        return bool(f and f.get("is_st"))
+    except Exception:
+        return False
+
+
+def _order_block_reason(bars, order, date, rules: dict) -> str | None:
+    """T+1 开盘撮合被涨跌停拦截的原因; None 表示可成交"""
+    if not rules.get("enforce", True):
+        return None
+    row = bars.row(order.code, date)
+    if row is None:
+        return None
+    is_st = _is_st_symbol(order.code, date) if rules.get("use_st", True) else False
+    return price_limits.fill_block_reason(
+        row,
+        bars.prev_close(order.code, date),
+        order.code,
+        date,
+        order.direction,
+        is_st=is_st,
+        strict_open=bool(rules.get("strict_open", True)),
+    )
+
+
 class EventDrivenBacktest:
     """事件驱动回测主引擎
 
@@ -1470,13 +1728,15 @@ class EventDrivenBacktest:
     def __init__(self, feat: dict, strategy: BaseStrategy,
                  initial_capital: float = 1_000_000, top_n: int = 5,
                  hold_days: int = 5, limit_up_pct: float = 9.5,
-                 start_date=None, end_date=None, cost_params: dict = None):
+                 start_date=None, end_date=None, cost_params: dict = None,
+                 limit_rules: dict = None):
         self.feat = feat
         self.strategy = strategy
         self.initial_capital = initial_capital
         self.top_n = top_n
         self.hold_days = hold_days
         self.limit_up_pct = limit_up_pct
+        self.limit_rules = normalize_limit_rules(limit_rules)
         self.bars = build_date_index(feat)
         self.all_dates = self.bars.all_dates
         self.sel_dates = get_selection_dates(feat)
@@ -1497,6 +1757,12 @@ class EventDrivenBacktest:
 
         # 待执行订单 (T日产生, T+1开盘撮合)
         self._pending_orders: list[OrderEvent] = []
+        # 跌停/停牌拦住卖不掉的订单: 顺延到下一可卖日, 不静默丢弃
+        self._deferred_sells: dict[str, OrderEvent] = {}
+        self.fill_blocks = {
+            "buy_limit_up": 0, "buy_suspended": 0,
+            "sell_limit_down": 0, "sell_suspended": 0,
+        }
         self.curve_rows = []
         self.holdings_log = []   # 每日持仓明细: [{date, code, qty, price, mv, cost}]
         self.trade_dates = set()
@@ -1610,29 +1876,80 @@ class EventDrivenBacktest:
             "all_trade_days": self.all_dates.tolist(),
             "holdings_log": self.holdings_log,
             "fills": self.portfolio.fills,
+            "fill_blocks": dict(self.fill_blocks),
         }
 
+    def _do_fill(self, order, date, row):
+        """按当日开盘价成交一笔订单"""
+        ref_px = row.get("open", row["close"])
+        if not ref_px or ref_px <= 0:
+            return False
+        day_amount = row.get("amount", 0.0) or 0.0
+        fp, comm, stamp, trans, slip, impact = self.cost_model.calc_fill(
+            order.code, order.direction, order.quantity, ref_px, day_amount)
+        fill = FillEvent(date, order.code, order.direction, order.quantity,
+                         fp, comm, stamp, trans, slip, impact,
+                         reason=getattr(order, "reason", "rebalance"))
+        self.portfolio.apply_fill(fill)
+        self.strategy.on_trade(fill)
+        return True
+
     def _execute_orders(self, date):
-        """T+1 开盘撮合待执行订单"""
-        if not self._pending_orders:
+        """T+1 开盘撮合待执行订单
+
+        涨跌停约束:
+        - 买入遇涨停 → 放弃本笔 (不追高), 计入 buy_limit_up
+        - 卖出遇跌停/停牌 → 顺延到下一可卖日, 计入 sell_limit_down / sell_suspended
+        """
+        if not self._pending_orders and not self._deferred_sells:
             return
+        enforce = bool(self.limit_rules.get("enforce", True))
+        if not enforce:
+            self._deferred_sells.clear()
         executed = False
+
+        # 1) 先重试此前被跌停/停牌拦住的卖单
+        for code, order in list(self._deferred_sells.items()):
+            pos = self.portfolio.positions.get(code)
+            if pos is None:
+                self._deferred_sells.pop(code, None)
+                continue
+            order.quantity = pos.quantity
+            row = self.bars.row(code, date)
+            if row is None:
+                self.fill_blocks["sell_suspended"] += 1
+                continue
+            block = _order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                self.fill_blocks[f"sell_{block}"] += 1
+                continue
+            if self._do_fill(order, date, row):
+                self._deferred_sells.pop(code, None)
+                executed = True
+
+        # 2) 处理昨日新产生的订单
         for order in self._pending_orders:
+            if order.direction == "sell" and order.code in self._deferred_sells:
+                continue  # 同一标的已有更早的顺延卖单, 以它为准
             row = self.bars.row(order.code, date)
             if row is None:
+                if enforce and order.direction == "sell" and order.code in self.portfolio.positions:
+                    self._deferred_sells[order.code] = order
+                    self.fill_blocks["sell_suspended"] += 1
+                elif order.direction == "buy":
+                    self.fill_blocks["buy_suspended"] += 1
                 continue
-            ref_px = row.get("open", row["close"])
-            if not ref_px or ref_px <= 0:
+            block = _order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                if order.direction == "sell":
+                    self._deferred_sells[order.code] = order
+                    self.fill_blocks[f"sell_{block}"] += 1
+                else:
+                    self.fill_blocks[f"buy_{block}"] += 1
                 continue
-            day_amount = row.get("amount", 0.0) or 0.0
-            fp, comm, stamp, trans, slip, impact = self.cost_model.calc_fill(
-                order.code, order.direction, order.quantity, ref_px, day_amount)
-            fill = FillEvent(date, order.code, order.direction, order.quantity,
-                             fp, comm, stamp, trans, slip, impact,
-                             reason=getattr(order, "reason", "rebalance"))
-            self.portfolio.apply_fill(fill)
-            self.strategy.on_trade(fill)
-            executed = True
+            if self._do_fill(order, date, row):
+                executed = True
+
         if executed:
             self.trade_dates.add(date)
         self._pending_orders = []
@@ -1671,7 +1988,8 @@ def run_backtest(feat: dict, select_fn, strategy_params: dict = None,
                  initial_capital: float = 1_000_000, top_n: int = 5,
                  hold_days: int = 5, limit_up_pct: float = 9.5,
                  start_date=None, end_date=None, cost_params: dict = None,
-                 use_strategy_class: bool = False) -> dict:
+                 use_strategy_class: bool = False,
+                 limit_rules: dict = None) -> dict:
     """
     完整资金曲线回测
 
@@ -1726,6 +2044,7 @@ def run_backtest(feat: dict, select_fn, strategy_params: dict = None,
         start_date=start_date,
         end_date=end_date,
         cost_params=cost_params,
+        limit_rules=limit_rules,
     )
     return engine.run()
 

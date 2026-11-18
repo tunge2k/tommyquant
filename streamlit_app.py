@@ -30,6 +30,7 @@ from backtest_engine import (
 import data_store
 import news_fetcher
 import perf_report
+import robust_backtest as rb
 
 try:
     import fast_backtest as fastbt
@@ -1237,10 +1238,22 @@ def get_cost_params() -> dict:
     }
 
 
+def get_limit_rules() -> dict:
+    """涨跌停撮合规则 (可在系统设置中关闭, 关闭后回到旧口径)"""
+    return {
+        "enforce": bool(int(data_store.get_setting("limit_fill_enforce", 1))),
+        "strict_open": bool(int(data_store.get_setting("limit_fill_strict_open", 1))),
+        "use_st": True,
+    }
+
+
 def _cost_str() -> str:
-    """成本参数的指纹串, 参与缓存键"""
+    """成本/撮合参数的指纹串, 参与缓存键"""
     cp = get_cost_params()
-    return f"{cp['commission_rate']}|{cp['commission_min']}|{cp['stamp_tax_rate']}|{cp['transfer_fee_rate']}|{cp['slippage_rate']}"
+    lr = get_limit_rules()
+    return (f"{cp['commission_rate']}|{cp['commission_min']}|{cp['stamp_tax_rate']}"
+            f"|{cp['transfer_fee_rate']}|{cp['slippage_rate']}"
+            f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
 def cached_backtest(strategy_key, _feat_data, initial, hold, top, lu_pct,
@@ -1266,6 +1279,7 @@ def cached_backtest(strategy_key, _feat_data, initial, hold, top, lu_pct,
         _feat_data, select_fn, strategy_params={"top_n": top},
         initial_capital=initial, hold_days=hold, limit_up_pct=lu_pct,
         start_date=start_d, end_date=end_d, cost_params=get_cost_params(),
+        limit_rules=get_limit_rules(),
     )
 
     # 回写 L2
@@ -2145,6 +2159,240 @@ def _chart_daily(m):
     st.plotly_chart(fig, use_container_width=True)
 
 
+# ==================== 参数稳健性 / 滚动样本外 ====================
+
+ROBUST_SCAN_PARAMS = {
+    "小市值轮动·戴维斯双击": [
+        ("cap_max", "市值上限(亿)", 10, 100, 1, int, "sd_cap_max"),
+        ("ret_20_min", "20日涨幅下限(%)", 2, 15, 0.5, float, "sd_ret20"),
+        ("turn_min", "换手率下限(%)", 1, 10, 0.5, float, "sd_turn_min"),
+        ("turn_max", "换手率上限(%)", 5, 40, 0.5, float, "sd_turn_max"),
+    ],
+    "动量+均线+小市值": [
+        ("ret_20_min", "20日涨幅下限(%)", 1, 20, 0.5, float, "ret_20_min"),
+        ("cap_max", "市值上限(亿)", 50, 500, 10, int, "cap_max"),
+    ],
+    "市值策略": [
+        ("cap_max", "市值上限(亿)", 100, 500, 10, int, "mc_cap_max"),
+        ("weight_fraction", "资金比例", 0.50, 1.00, 0.05, float, "mc_weight_frac"),
+        ("rank_buffer", "排名缓冲", 0, 10, 1, int, "mc_rank_buffer"),
+    ],
+}
+
+
+def _mc_strategy_from_state(ss, overrides: dict | None = None):
+    """按当前界面参数 + 扫描覆盖值重建市值策略"""
+    o = dict(overrides or {})
+    uni = list(ss.get("mc_universe_list") or [])
+    top = int(o.pop("top_n", 0)) or (len(uni) if uni else int(ss.get("top_n", 3)))
+    return MarketCapStrategy(
+        top_n=top, universe=uni or None,
+        cap_min=ss["mc_cap_min"], cap_max=o.get("cap_max", ss["mc_cap_max"]),
+        weight_fraction=o.get("weight_fraction", ss["mc_weight_frac"]),
+        cap_change_threshold=ss["mc_cap_chg_th"],
+        rebalance_threshold=ss["mc_rebal_th"],
+        min_listed_years=ss["mc_listed_yrs"],
+        exclude_st=ss["mc_ex_st"], exclude_ocf_diverge=ss["mc_ex_ocf"],
+        exclude_nonop_profit=ss["mc_ex_nonop"],
+        exclude_no_dividend=ss["mc_ex_nodiv"],
+        dividend_years=ss["mc_div_years"],
+        ma30_lookback=ss.get("mc_ma30_lookback", 5),
+        ma30_exit=ss.get("mc_ma30_exit", True),
+        rebalance_mode=ss.get("mc_rebal_mode", "topk_drop"),
+        rank_buffer=o.get("rank_buffer", ss.get("mc_rank_buffer", 2)),
+    )
+
+
+def _make_segment_runner(strategy_choice, feat_data, sp, ss, initial, hold, top,
+                         lu_pct, use_class):
+    cost, rules = get_cost_params(), get_limit_rules()
+
+    def run_one(params, start, end):
+        if use_class:
+            strat = _mc_strategy_from_state(ss, params)
+            return run_backtest(
+                feat_data, strat, strategy_params={},
+                initial_capital=initial, top_n=strat.n_slots, hold_days=hold,
+                limit_up_pct=lu_pct, start_date=start, end_date=end,
+                cost_params=cost, use_strategy_class=True, limit_rules=rules)
+        p = dict(sp)
+        p.update(params)
+        return run_backtest_auto(
+            feat_data, STRATEGIES[strategy_choice], strategy_params=p,
+            initial_capital=initial, hold_days=hold, top_n=top,
+            limit_up_pct=lu_pct, start_date=start, end_date=end,
+            cost_params=cost, limit_rules=rules)
+
+    return run_one
+
+
+def _scan_values(center, lo, hi, step, cast, n: int = 5):
+    """以当前值为中心生成 n 档 (约 ±30%), 并按上下界裁剪、去重"""
+    span = max(abs(float(center)) * 0.30, float(step) * 2)
+    raw = [center + span * x for x in np.linspace(-1.0, 1.0, int(n))]
+    vals, seen = [], set()
+    for v in raw:
+        v = min(max(float(v), float(lo)), float(hi))
+        v = round(round(v / step) * step, 4)
+        v = cast(v)
+        if v not in seen:
+            seen.add(v)
+            vals.append(v)
+    return sorted(vals)
+
+
+def _render_robust_panel(strategy_choice, feat_data, sp, ss, initial, hold, top,
+                         lu_pct, use_class, start_date, end_date):
+    cfg = ROBUST_SCAN_PARAMS.get(strategy_choice) or []
+    if not cfg:
+        return
+    st.markdown("**参数稳健性检验**")
+    st.caption("把回测区间等分为 K 段互不重叠的验证段，用 0.6×中位数 + 0.4×最差段选参；"
+               "滚动样本外则在训练窗选参、在紧随其后的测试窗验证。两者都比单段区间冠军更抗过拟合。")
+
+    c1, c2, c3, c4, c5 = st.columns([1.6, 1, 1, 1, 0.9])
+    labels = [f"{c[1]}（当前 {ss.get(c[6], '-')}）" for c in cfg]
+    if st.session_state.get("rb_param") not in labels:
+        st.session_state["rb_param"] = labels[0]
+    sel = c1.selectbox("扫描参数", labels, key="rb_param")
+    idx = labels.index(sel)
+    key, label, lo, hi, step, cast, sskey = cfg[idx]
+    n_vals = c5.selectbox("扫描档位", [3, 5, 7], index=1, key="rb_grid_n",
+                          help="档位越多结果越细，但回测次数线性增加")
+    k = c2.slider("验证段数 K", 2, 6, 3, key="rb_k",
+                  help="K 越大越严格，但每段交易日变少；区间过短会自动降 K")
+    min_trades = c3.number_input("最小交易数", 5, 300, 30, 5, key="rb_min_trades",
+                                 help="全部验证段累计交易数不足则直接判为不合格")
+    objective = c4.selectbox("主目标", ["calmar", "sharpe", "sortino",
+                                     "total_return", "max_drawdown"],
+                             key="rb_objective")
+
+    values = _scan_values(ss.get(sskey, lo), lo, hi, step, cast, n=n_vals)
+    combos = [{key: v} for v in values]
+    sig = (f"{strategy_choice}|{key}|{values}|{k}|{min_trades}|{objective}"
+           f"|{start_date}|{end_date}|{initial}|{hold}|{top}|{use_class}")
+    runner = _make_segment_runner(strategy_choice, feat_data, sp, ss, initial,
+                                  hold, top, lu_pct, use_class)
+
+    tab_k, tab_wf = st.tabs(["K 段稳健评估", "滚动样本外"])
+    with tab_k:
+        try:
+            windows = rb.split_windows(start_date, end_date, k)
+        except ValueError as e:
+            st.error(str(e))
+            return
+        runs = len(combos) * len(windows)
+        st.caption(f"扫描取值 {values} · {len(combos)} 组 × {len(windows)} 段 = {runs} 次分段回测")
+        if st.button("▶ 运行 K 段稳健评估", key="rb_run_k", use_container_width=True):
+            prog = st.progress(0.0)
+            ph = st.empty()
+
+            def _cb(done, total, msg):
+                prog.progress(min(done / max(total, 1), 1.0))
+                ph.caption(msg)
+
+            with st.spinner("稳健评估中..."):
+                out = rb.run_robust_sweep(runner, combos, windows,
+                                          objective=objective,
+                                          min_trades=int(min_trades),
+                                          on_progress=_cb)
+            prog.empty()
+            ph.empty()
+            st.session_state["_rb_k"] = {"sig": sig, "out": out}
+
+        cached = st.session_state.get("_rb_k")
+        if cached and cached["sig"] == sig:
+            out = cached["out"]
+            champ = next((r for r in out["rows"] if not r["disqualified"]), None)
+            if champ is None:
+                st.warning("所有参数组合均不合格（交易数不足或有效段不足）")
+            else:
+                conv = rb.champion_convergence(out["rows"], len(out["windows"]))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("稳健分", f"{champ['score']:.3f}")
+                m2.metric("中位数 / 最差段", f"{champ['median']:.2f} / {champ['worst']:.2f}")
+                m3.metric("累计交易数", f"{champ['trades']}")
+                m4.metric("各段冠军一致性",
+                          {"unanimous": "完全一致", "majority": "多数一致",
+                           "scattered": "分散"}.get(conv["label"], "-"))
+                show = []
+                for r in out["rows"][:10]:
+                    row = {"参数": ", ".join(f"{k}={v}" for k, v in r["params"].items()),
+                           "稳健分": None if r["score"] is None else round(r["score"], 3),
+                           "中位数": None if r["median"] is None else round(r["median"], 3),
+                           "最差段": None if r["worst"] is None else round(r["worst"], 3),
+                           "交易数": r["trades"], "结论": r["reason"] or "合格"}
+                    for i, seg in enumerate(r["segments"]):
+                        row[f"段{i + 1}"] = (None if seg["value"] is None
+                                             else round(seg["value"], 3))
+                    show.append(row)
+                st.dataframe(pd.DataFrame(show), use_container_width=True, hide_index=True)
+                st.caption(f"验证段: {', '.join(w['start'] + '~' + w['end'] for w in out['windows'])}")
+
+    with tab_wf:
+        f1, f2, f3 = st.columns(3)
+        train_days = f1.selectbox("训练窗(天)", [365, 730, 1095], index=1, key="wf_train")
+        test_days = f2.selectbox("测试窗(天)", [60, 90, 180], index=1, key="wf_test")
+        folds = rb.generate_folds(start_date, end_date, train_days=train_days,
+                                  test_days=test_days)
+        runs = len(folds) * (len(combos) + 1)
+        st.caption(f"{len(folds)} 折 × ({len(combos)} 组训练选参 + 1 次测试) = {runs} 次回测"
+                   + ("，预计耗时较长，建议缩小日期范围或扫描档位" if runs > 60 else ""))
+        if folds:
+            st.dataframe(pd.DataFrame([{
+                "折": i + 1,
+                "训练窗": f"{f['train'][0].date()} ~ {f['train'][1].date()}",
+                "测试窗": f"{f['test'][0].date()} ~ {f['test'][1].date()}",
+            } for i, f in enumerate(folds)]), use_container_width=True, hide_index=True)
+        if st.button("▶ 运行滚动样本外", key="rb_run_wf", use_container_width=True,
+                     disabled=not folds):
+            prog = st.progress(0.0)
+            ph = st.empty()
+
+            def _cb(done, total, msg):
+                prog.progress(min(done / max(total, 1), 1.0))
+                ph.caption(msg)
+
+            with st.spinner("滚动样本外验证中..."):
+                out = rb.run_walkforward(runner, combos, folds,
+                                         objective=objective,
+                                         min_trades=int(min_trades),
+                                         on_progress=_cb)
+            prog.empty()
+            ph.empty()
+            st.session_state["_rb_wf"] = {"sig": sig + f"|wf{train_days}|{test_days}", "out": out}
+
+        cached_wf = st.session_state.get("_rb_wf")
+        wf_sig = sig + f"|wf{train_days}|{test_days}"
+        if cached_wf and cached_wf["sig"] == wf_sig:
+            out = cached_wf["out"]
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("样本外复利收益",
+                      "-" if out["compounded_return"] is None
+                      else f"{out['compounded_return']:+.2f}%")
+            n2.metric("胜折占比",
+                      "-" if out["consistency"] is None else f"{out['consistency'] * 100:.0f}%")
+            n3.metric("IS→OOS 退化",
+                      "-" if out["degradation_pct"] is None
+                      else f"{out['degradation_pct']:.1f}%")
+            n4.metric("有效折数", f"{out['valid_folds']}/{out['total_folds']}")
+            rows = []
+            for r in out["folds"]:
+                rows.append({
+                    "折": r["fold"],
+                    "训练窗": " ~ ".join(r["train"]),
+                    "测试窗": " ~ ".join(r["test"]),
+                    "选中参数": (" - " if not r["params"]
+                                else ", ".join(f"{k}={v}" for k, v in r["params"].items())),
+                    "训练目标": None if r["is_value"] is None else round(r["is_value"], 3),
+                    "样本外目标": None if r["oos_value"] is None else round(r["oos_value"], 3),
+                    "样本外收益%": None if r["oos_return"] is None else round(r["oos_return"], 2),
+                    "说明": r["reason"] or ("样本外" if not r["skipped"] else "跳过"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("退化率 > 50% 通常说明参数过拟合训练窗；胜折占比低于 50% 说明策略不稳定。")
+
+
 if page == "home":
     _render_top_nav(page)
 
@@ -2654,14 +2902,15 @@ elif page == "backtest":
                     initial_capital=initial_capital, top_n=_mc.n_slots,
                     hold_days=hold_days, limit_up_pct=limit_up_pct,
                     start_date=backtest_start, end_date=backtest_end,
-                    cost_params=get_cost_params(), use_strategy_class=True)
+                    cost_params=get_cost_params(), use_strategy_class=True,
+                    limit_rules=get_limit_rules())
             else:
                 result = run_backtest_auto(
                     feat_data, STRATEGIES[strategy_choice], strategy_params=sp,
                     initial_capital=initial_capital, hold_days=hold_days, top_n=top_n,
                     limit_up_pct=limit_up_pct,
                     start_date=backtest_start, end_date=backtest_end,
-                    cost_params=get_cost_params())
+                    cost_params=get_cost_params(), limit_rules=get_limit_rules())
         _elapsed = time.perf_counter() - _t_bt
         _n_tr = result["performance"].get("trades_count", 0)
         if _elapsed >= 60:
@@ -2681,6 +2930,13 @@ elif page == "backtest":
 
     if result:
         p = result["performance"]
+        _fb = result.get("fill_blocks") or {}
+        if any(_fb.values()):
+            st.caption(
+                f"撮合拦截统计：涨停放弃买入 {_fb.get('buy_limit_up', 0)} 笔 · "
+                f"跌停顺延卖出 {_fb.get('sell_limit_down', 0)} 笔 · "
+                f"停牌顺延 {_fb.get('buy_suspended', 0) + _fb.get('sell_suspended', 0)} 笔"
+            )
         curve = result.get("curve")
         if curve is None or len(curve) == 0:
             st.info("回测没有产生净值曲线")
@@ -2775,6 +3031,13 @@ elif page == "backtest":
                         _comp2.html(_html.decode("utf-8"), height=2600, scrolling=True)
     else:
         st.info("👈 选好策略、点 ⚙️ 设置调参数，然后点 🚀 开始回测")
+
+    st.divider()
+    with st.expander("🔬 参数稳健性检验（K 段 / 滚动样本外）", expanded=False):
+        _render_robust_panel(
+            strategy_choice, feat_data, sp, st.session_state,
+            initial_capital, hold_days, top_n, limit_up_pct,
+            _use_strategy_class, backtest_start, backtest_end)
 
 # --- 🎯 今日选股 ---
 elif page == "picks":
@@ -3049,6 +3312,24 @@ elif page == "settings":
         data_store.set_setting("cost_transfer_fee_rate", new_tr)
         data_store.set_setting("cost_slippage_rate", new_sl)
         st.success("✅ 交易成本已保存, 回测将使用新参数")
+
+    st.divider()
+    st.subheader("🧱 撮合规则")
+    st.caption("按板块识别涨跌停（主板 10% / 创业板·科创板 20% / 北交所 30%，ST 按日期分段），"
+               "封板时买不进、跌停时卖不出，避免回测虚高。")
+    _lf = bool(int(data_store.get_setting("limit_fill_enforce", 1)))
+    _ls = bool(int(data_store.get_setting("limit_fill_strict_open", 1)))
+    _lc1, _lc2 = st.columns(2)
+    new_lf = _lc1.checkbox("涨跌停不可成交", value=_lf, key="set_limit_fill",
+                           help="关闭后回到旧口径：T+1 开盘无条件成交（收益偏乐观）")
+    new_ls = _lc2.checkbox("开盘触板即拦截", value=_ls, key="set_limit_strict",
+                           disabled=not new_lf,
+                           help="开启：开盘价触及涨/跌停即视为排队不成交；"
+                                "关闭：仅拦一字板（与 tick-stock-panel 的 open_t+1 口径一致）")
+    if (new_lf, new_ls) != (_lf, _ls):
+        data_store.set_setting("limit_fill_enforce", int(new_lf))
+        data_store.set_setting("limit_fill_strict_open", int(new_ls))
+        st.success("✅ 撮合规则已保存, 回测缓存已失效")
 
     st.divider()
     st.subheader(t("bt_range"))

@@ -267,7 +267,8 @@ class FastBacktest:
     def __init__(self, feat: dict, M: SelectionMatrix, sel_vec, params: dict,
                  initial_capital: float = 1_000_000, top_n: int = 5,
                  hold_days: int = 5, limit_up_pct: float = 9.5,
-                 start_date=None, end_date=None, cost_params: dict = None):
+                 start_date=None, end_date=None, cost_params: dict = None,
+                 limit_rules: dict = None):
         self.feat = feat
         self.M = M
         self.sel_vec = sel_vec
@@ -280,7 +281,13 @@ class FastBacktest:
         self._sel_pos = {d: i for i, d in enumerate(M.sel_dates)}
         self.cost_model = be.CostModel(**(cost_params or {}))
         self.portfolio = be.Portfolio(initial_capital)
+        self.limit_rules = be.normalize_limit_rules(limit_rules)
         self._pending = []
+        self._deferred_sells = {}
+        self.fill_blocks = {
+            "buy_limit_up": 0, "buy_suspended": 0,
+            "sell_limit_down": 0, "sell_suspended": 0,
+        }
         self.curve_rows = []
         self.holdings_log = []
         self.trade_dates = set()
@@ -303,25 +310,68 @@ class FastBacktest:
         except Exception:
             return []
 
+    def _do_fill(self, order, date, row):
+        ref_px = row.get("open", row["close"])
+        if not ref_px or ref_px <= 0:
+            return False
+        day_amount = row.get("amount", 0.0) or 0.0
+        fp, comm, stamp, trans, slip, impact = self.cost_model.calc_fill(
+            order.code, order.direction, order.quantity, ref_px, day_amount)
+        fill = be.FillEvent(date, order.code, order.direction, order.quantity,
+                            fp, comm, stamp, trans, slip, impact,
+                            reason=getattr(order, "reason", "rebalance"))
+        self.portfolio.apply_fill(fill)
+        return True
+
     def _execute_orders(self, date):
-        if not self._pending:
+        """T+1 开盘撮合, 含涨跌停约束 (与事件驱动引擎同口径)"""
+        if not self._pending and not self._deferred_sells:
             return
+        enforce = bool(self.limit_rules.get("enforce", True))
+        if not enforce:
+            self._deferred_sells.clear()
         executed = False
+
+        for code, order in list(self._deferred_sells.items()):
+            pos = self.portfolio.positions.get(code)
+            if pos is None:
+                self._deferred_sells.pop(code, None)
+                continue
+            order.quantity = pos.quantity
+            row = self.bars.row(code, date)
+            if row is None:
+                self.fill_blocks["sell_suspended"] += 1
+                continue
+            block = be._order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                self.fill_blocks[f"sell_{block}"] += 1
+                continue
+            if self._do_fill(order, date, row):
+                self._deferred_sells.pop(code, None)
+                executed = True
+
         for order in self._pending:
+            if order.direction == "sell" and order.code in self._deferred_sells:
+                continue
             row = self.bars.row(order.code, date)
             if row is None:
+                if enforce and order.direction == "sell" and order.code in self.portfolio.positions:
+                    self._deferred_sells[order.code] = order
+                    self.fill_blocks["sell_suspended"] += 1
+                elif order.direction == "buy":
+                    self.fill_blocks["buy_suspended"] += 1
                 continue
-            ref_px = row.get("open", row["close"])
-            if not ref_px or ref_px <= 0:
+            block = be._order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                if order.direction == "sell":
+                    self._deferred_sells[order.code] = order
+                    self.fill_blocks[f"sell_{block}"] += 1
+                else:
+                    self.fill_blocks[f"buy_{block}"] += 1
                 continue
-            day_amount = row.get("amount", 0.0) or 0.0
-            fp, comm, stamp, trans, slip, impact = self.cost_model.calc_fill(
-                order.code, order.direction, order.quantity, ref_px, day_amount)
-            fill = be.FillEvent(date, order.code, order.direction, order.quantity,
-                                fp, comm, stamp, trans, slip, impact,
-                                reason=getattr(order, "reason", "rebalance"))
-            self.portfolio.apply_fill(fill)
-            executed = True
+            if self._do_fill(order, date, row):
+                executed = True
+
         if executed:
             self.trade_dates.add(date)
         self._pending = []
@@ -420,6 +470,7 @@ class FastBacktest:
             "trade_dates": sorted(self.trade_dates),
             "lu_dates": sorted(self.lu_dates),
             "all_trade_days": [pd.Timestamp(d) for d in self.dates.tolist()],
+            "fill_blocks": dict(self.fill_blocks),
         }
 
 
@@ -555,7 +606,7 @@ def run_fast(feat: dict, select_fn, strategy_params: dict = None,
              initial_capital: float = 1_000_000, top_n: int = 5,
              hold_days: int = 5, limit_up_pct: float = 9.5,
              start_date=None, end_date=None, M: SelectionMatrix = None,
-             cost_params: dict = None) -> dict:
+             cost_params: dict = None, limit_rules: dict = None) -> dict:
     """快速回测入口 (返回结构与 run_backtest 一致)"""
     sel_vec, _, _ = _resolve(select_fn)
     if sel_vec is None:
@@ -567,7 +618,7 @@ def run_fast(feat: dict, select_fn, strategy_params: dict = None,
                       initial_capital=initial_capital, top_n=top_n,
                       hold_days=hold_days, limit_up_pct=limit_up_pct,
                       start_date=start_date, end_date=end_date,
-                      cost_params=cost_params)
+                      cost_params=cost_params, limit_rules=limit_rules)
     return bt.run()
 
 
@@ -601,7 +652,8 @@ def _sweep_worker(params: dict):
                      hold_days=p.get("hold_days", ctx["hold_days"]),
                      limit_up_pct=ctx["limit_up_pct"],
                      start_date=ctx["start_date"], end_date=ctx["end_date"],
-                     M=ctx["M"])
+                     M=ctx["M"], limit_rules=ctx.get("limit_rules"),
+                     cost_params=ctx.get("cost_params"))
         perf = r["performance"]
         row = {"params": p}
         for k in SWEEP_METRICS:
@@ -619,7 +671,8 @@ def run_sweep(feat: dict, select_fn, grid: dict, fixed: dict = None,
               metric: str = "calmar", top: int = 20, workers: int = None,
               initial_capital: float = 1_000_000, top_n: int = 5,
               hold_days: int = 5, limit_up_pct: float = 9.5,
-              start_date=None, end_date=None, max_combos: int = 2000) -> dict:
+              start_date=None, end_date=None, max_combos: int = 2000,
+              cost_params: dict = None, limit_rules: dict = None) -> dict:
     """参数网格寻优
 
     Returns: {"results": [Top-N 按 metric 降序], "total": 组合数,
@@ -642,6 +695,7 @@ def run_sweep(feat: dict, select_fn, grid: dict, fixed: dict = None,
         "initial_capital": initial_capital, "top_n": top_n,
         "hold_days": hold_days, "limit_up_pct": limit_up_pct,
         "start_date": start_date, "end_date": end_date,
+        "limit_rules": limit_rules, "cost_params": cost_params,
     })
 
     results = []

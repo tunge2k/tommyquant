@@ -2,7 +2,7 @@
 
 > 目标：不重复造轮子。遇到问题先看成熟项目怎么做，能借规则就借规则，能借实现就借实现，只在没人做过的地方自研。
 >
-> 基线：2026-11-17；当前代码 `v14` / `m1`
+> 基线：2026-11-18；当前代码 `v15` / `m1`
 
 ---
 
@@ -20,7 +20,7 @@
 | 我们的问题 | 观测到的事实 | 成熟做法 | 出处 |
 |---|---|---|---|
 | 换手过高，成本吃掉收益 | 日均换手 3.66%，3.9 年成本 1356 万，净收益 +2.2% | **Topk-Drop**：只在持仓跌出候选前 K 名时卖出，用 `n_drop` 做缓冲，日换手 ≈ `2×n_drop/topk`（50/5 配置约 10%/日，可按需下调） | Qlib `TopkDropoutStrategy` |
-| 涨跌停仍能成交 | 回测成交价没有约束 | 涨停不买、跌停不卖（`limit_threshold≈0.095`），停牌日无 bar 直接不成交 | Qlib `backtest.limit_threshold`；RQAlpha `sys_simulation` |
+| 涨跌停仍能成交 | 回测成交价没有约束 | 涨停不买、跌停不卖，停牌日无 bar 不成交；板块感知涨跌停价（10/20/30%，ST 与创业板改革日分段），跌停卖单顺延 | Qlib `limit_threshold`；RQAlpha `sys_simulation`；tick-stock-panel `price_limits` |
 | 成本模型零散 | 佣金/印花/过户/滑点分散硬编码 | 开仓与平仓费率分开配置 + `min_cost` 最低手续费 | Qlib `open_cost/close_cost/min_cost`；RQAlpha `commission_multiplier` |
 | 绩效指标手写 20 项 | 无法与外部口径对齐 | 用 `empyrical`/`quantstats` 的口径对齐，直接出 HTML tearsheet（月度收益热力图、滚动夏普、回撤区间） | QuantStats |
 | 单标的验证看不出为什么空仓 | 卖出后 10 个月无成交，界面无解释 | 策略内显式记录「未成交原因」，成交流水展示真实原因 | 本项目已实现（`ma30_exit`） |
@@ -38,6 +38,7 @@
 | [polakowo/vectorbt](https://github.com/polakowo/vectorbt) | 向量化回测 | 参数网格扫描、组合权重分配的向量化写法 | Apache-2.0 |
 | [ranaroussi/quantstats](https://github.com/ranaroussi/quantstats) | 绩效分析报告 | `stats` / `plots` / `reports.html` 全套口径与 tearsheet | Apache-2.0 |
 | [akfamily/akshare](https://github.com/akfamily/akshare) | 数据源（已在用） | 备用接口与交叉校验思路 | MIT |
+| [shy3130/tick-stock-panel](https://github.com/shy3130/tick-stock-panel) | A 股研究面板（FastAPI + React + Polars） | 板块感知涨跌停撮合、稳健选参（0.6×中位数 + 0.4×最差段）、滚动样本外、策略守护 | MIT |
 | [QUANTAXIS/QUANTAXIS](https://github.com/QUANTAXIS/QUANTAXIS) | A 股数据 + 回测一体化 | 行情表结构与复权处理参考 | 以仓库为准 |
 
 > 许可证以仓库最新声明为准；表中只影响「能不能复制代码」，不限制我们读文档、抄口径。
@@ -95,6 +96,23 @@
 - **降级策略**：`perf_report.available()` 为 False 时界面提示重建镜像，不影响其他标签。
 - **字体告警可忽略**：QuantStats 样式指定 Arial，容器内没有该字体，回退 DejaVu Sans，只输出 `findfont` 提示，图表正常。
 - 依赖会带来 matplotlib / scipy / seaborn / yfinance，镜像体积增加约 250 MB，首次构建耗时约 2 分钟。
+
+### P1-4 借 tick-stock-panel 补涨跌停撮合与稳健选参（v1.2.0 已完成）
+
+tick-stock-panel 是 A 股研究面板，技术栈与本项目不同，但回测口径与研究方法可直接移植。本次只借规则与流程，不引入其 FastAPI/React/Open API 体系。
+
+落地内容：
+
+- `price_limits.py`：板块感知涨跌停价。主板 10%、创业板/科创板 20%、北交所 30%；创业板 2020-08-24 前按 10%；主板 ST 2026-07-06 前 5%、之后 10%；涨跌停价按「分」四舍五入（`Decimal` 避免 `10.005*100` 的浮点截断）。
+- 两个引擎统一走 `backtest_engine._order_block_reason`：T+1 开盘价触及涨停 → 买入放弃；触及跌停或无行情（停牌）→ 卖单进入 `_deferred_sells` 顺延到下一可卖日，不再静默丢弃。结果新增 `fill_blocks` 统计，界面展示拦截笔数。
+- `add_factors` 的 `limit_up` 从写死 `9.5%` 改为板块口径，修复创业板/科创板/北交所标的涨停标记错误。
+- `robust_backtest.py`：K 段互不重叠验证段 + `0.6×中位数 + 0.4×最差段` 稳健分、最小交易数门槛、主目标白名单（拒绝胜率等退化指标）、各段冠军一致性诊断；滚动样本外按「训练窗末日 + 1 天」切测试窗，输出 OOS 复利收益、IS→OOS 退化率与胜折占比。
+- 回测页新增「参数稳健性检验」面板，可在线运行 K 段评估与滚动样本外；缓存版本升至 `v15`。
+
+刻意不借的部分：15 列存储 + 68 个指标现算、6 类数据集能力路由、65 端点 Open API、MCP/AI 助手。这些服务于多用户、多数据源的生产平台，与当前单人研究工具的复杂度不匹配。
+
+> 与 P1-2 的关系：P1-2 只是「涨停不买/跌停不卖」的粗略规则，本次补上了板块与历史日期差异、价位取整、卖出顺延和拦截统计。若只想恢复旧行为，可在「参数设置 → 撮合规则」关闭开关。
+
 
 ---
 

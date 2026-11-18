@@ -219,3 +219,4 @@
 | 2026-11-17 | 建立 git 版本管理（P0-4 完成）：公开仓库 `tunge2k/tommyquant`，`git_release.py` 一条命令完成提交/打标签/推送；NAS 凭据外置到本地 `nas_conf.py`（P0-3 完成），文档内网 IP 改为 `<NAS_IP>` | `.gitignore`、`git_release.py`、`deploy_update.py`、`docs/05` |
 | 2026-11-17 | 界面收敛：导航改为一层平铺 8 项（去掉「量化策略」父级与「⋯ 更多」折叠，「投资组合」更名「模拟交易」，「资讯」更名「财经资讯」）；回测设置改为工具栏 + 弹窗；去掉渐变背景与毛玻璃；修复首页展开项与侧边栏图标重复 | `streamlit_app.py` |
 | 2026-11-17 | 建立文档体系（本目录） | 本文件 |
+| 2026-11-18 | 借鉴 tick-stock-panel（MIT）：新增 `price_limits.py` 板块感知涨跌停（10/20/30%，ST 与创业板改革日分段、按分取整）；两个引擎统一「涨停买不进、跌停/停牌卖出顺延」，新增 `fill_blocks` 拦截统计与界面开关；`limit_up` 因子改为板块口径；新增 `robust_backtest.py`（K 段稳健分、最小交易数门槛、主目标白名单、冠军一致性）与滚动样本外；回测页新增「参数稳健性检验」面板；缓存版本升至 `v15`，补 7 项测试 | `price_limits.py`、`robust_backtest.py`、`backtest_engine.py`、`fast_backtest.py`、`streamlit_app.py`、`tests/`、`docs/04`、`docs/06` |
