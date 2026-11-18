@@ -21,6 +21,7 @@ REMOTE_DIR = "/volume1/docker/limit-up-hunter"
 LOCAL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 FILES = ["streamlit_app.py", "backtest_engine.py", "fast_backtest.py",
+         "price_limits.py", "robust_backtest.py",
          "data_store.py", "data_manager.py", "perf_report.py",
          "news_fetcher.py", "update_worker.py", "doh_patch.py",
          "entrypoint.sh",
