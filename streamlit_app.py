@@ -24,7 +24,7 @@ except Exception:
 # 导入本地回测引擎
 from backtest_engine import (
     STRATEGIES, run_backtest, get_today_picks,
-    bt_cache_key, serialize_result, deserialize_result,
+    serialize_result, deserialize_result,
     MarketCapStrategy,
 )
 import data_store
@@ -50,8 +50,15 @@ def run_backtest_auto(feat, select_fn, strategy_params=None, **kwargs):
 
 data_store.init_db()   # 幂等建表, 防止首次启动时表不存在
 
-# 首页「策略绩效概览」并排对比的策略
-DASH_STRATEGIES = ["小市值轮动·戴维斯双击", "动量+均线+小市值"]
+# 研究阶段: 界面暴露「市值策略(股票)」与「ETF策略」两个入口, 共用 MarketCapStrategy 引擎
+VISIBLE_STRATEGIES = ("市值策略", "ETF策略")
+# 走 MarketCapStrategy 类的策略: 参数由 _bt_params 组装, 不依赖 STRATEGIES 函数表
+CLASS_STRATEGIES = ("市值策略", "ETF策略")
+STRATEGY_NAMES = ([k for k in STRATEGIES if k in VISIBLE_STRATEGIES]
+                  + [k for k in VISIBLE_STRATEGIES if k not in STRATEGIES])
+
+# 首页「策略绩效概览」并排对比的策略 (与 VISIBLE_STRATEGIES 保持一致)
+DASH_STRATEGIES = list(VISIBLE_STRATEGIES)
 
 # 参数寻优: 每个策略可扫描的数值参数
 SWEEP_TUNABLES = {
@@ -318,7 +325,7 @@ st.markdown("""
     h2 { font-size: 1.2rem !important; font-weight: 600; color: var(--text-primary) !important;
          margin-top: 1.5rem !important; letter-spacing: -0.005em; line-height: 1.35; }
     h3 { font-size: 1.0625rem !important; font-weight: 600; color: var(--text-secondary) !important;
-         margin-top: 1.25rem !important; line-height: 1.4; }
+         margin-top: 0.5rem !important; margin-bottom: 0.375rem !important; line-height: 1.4; }
     h4 { font-size: 0.9375rem !important; font-weight: 600; color: var(--text-secondary) !important; }
     p, span, li, label { color: var(--text-secondary); }
 
@@ -689,9 +696,19 @@ st.markdown("""
         min-height: 2.5rem !important;
     }
     [data-testid="stAppViewContainer"] .block-container {
-        padding-top: 1rem !important;
+        padding-top: 0.5rem !important;
         padding-bottom: 1.5rem !important;
         max-width: 1400px !important;
+    }
+    /* 压缩 Streamlit divider 上下间距 (首页/各页分隔线) */
+    hr, [data-testid="stHorizontalBlock"] hr,
+    [data-testid="stVerticalBlock"] hr {
+        margin-top: 0.5rem !important;
+        margin-bottom: 0.5rem !important;
+    }
+    [data-testid="stMarkdownContainer"] > hr {
+        margin-top: 0.375rem !important;
+        margin-bottom: 0.375rem !important;
     }
 
     /* ============ 15. Hero 横幅 ============ */
@@ -1111,6 +1128,118 @@ for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+# 回测策略参数默认值 (全局初始化: 首页「策略绩效概览」与回测页共用同一套参数)
+BT_PARAM_DEFAULTS = {
+    "sd_cap_max": 30, "sd_ret20": 5, "sd_ma20": True, "sd_ma60": True,
+    "sd_turn_min": 3, "sd_turn_max": 20,
+    "ret_20_min": 5, "cap_max": 200, "require_ma20": True,
+    "mc_cap_min": 15, "mc_cap_max": 200, "mc_weight_frac": 0.75,
+    "mc_cap_chg_th": 0.04, "mc_rebal_th": 0.05, "mc_listed_yrs": 3.0,
+    "mc_ma30_lookback": 5, "mc_universe": "", "mc_ma30_exit": True,
+    "mc_entry_weeks": 2,
+    "mc_ex_st": True, "mc_ex_ocf": True, "mc_ex_nonop": True,
+    "mc_ex_nodiv": True, "mc_div_years": 3,
+    "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_universe_list": [],
+    # ETF 策略 (池选品: 动量排名 + 流动性/趋势门槛, 无财务/分红参数)
+    "etf_mom_days": 60, "etf_min_amount": 0.5, "etf_min_history": 120,
+    "etf_weight_frac": 0.95, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
+    "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
+    "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_check_freq": "weekly",
+    # ETF 风控因子 (华泰柏瑞增强数据: 溢价率 / 资金流 / 全市场资金流)
+    "etf_premium_cap": 1.0, "etf_flow_on": False, "etf_flow_min": -3.0,
+    "etf_mkt_flow_guard": False, "etf_mkt_flow_days": 5,
+}
+for _k, _v in BT_PARAM_DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+
+# ===== 回测设置持久化: 记住最近一次「确定」的设置, 重启/新会话不再回到默认值 =====
+_BT_PERSIST_KEYS = ("initial_capital", "hold_days", "top_n", "limit_up_pct",
+                    "backtest_start", "backtest_end") + tuple(BT_PARAM_DEFAULTS)
+
+
+def _bt_settings_snapshot() -> dict:
+    """当前生效的回测设置 (只含需要持久化的键, 不含草稿键)"""
+    out = {}
+    for k in _BT_PERSIST_KEYS:
+        v = st.session_state.get(k)
+        if isinstance(v, (pd.Timestamp, datetime)):
+            v = v.strftime("%Y-%m-%d")
+        out[k] = v
+    return out
+
+
+def _load_bt_settings():
+    raw = data_store.get_setting("bt_settings")
+    if not raw:
+        return
+    try:
+        saved = json.loads(raw)
+    except Exception:
+        return
+    if not isinstance(saved, dict):
+        return
+    for k in ("backtest_start", "backtest_end"):
+        if saved.get(k):
+            try:
+                saved[k] = pd.to_datetime(saved[k])
+            except Exception:
+                saved.pop(k, None)
+    for k in _BT_PERSIST_KEYS:
+        if k in saved:
+            st.session_state[k] = saved[k]
+
+
+def _persist_bt_settings():
+    """设置变化时写库 (每次 rerun 末尾调用, 任何页面的改动都能记住)"""
+    raw = json.dumps(_bt_settings_snapshot(), sort_keys=True,
+                     ensure_ascii=False, default=str)
+    if st.session_state.get("_bt_settings_raw") == raw:
+        return
+    st.session_state["_bt_settings_raw"] = raw
+    try:
+        data_store.set_setting("bt_settings", raw)
+    except Exception:
+        pass
+
+
+# 只在会话首次运行读库回填; 后续 rerun 若再回填会用旧值覆盖刚改的新值
+if not st.session_state.get("_bt_settings_loaded"):
+    _load_bt_settings()
+    st.session_state["_bt_settings_loaded"] = True
+
+# 设置弹窗点「确定」时, 各策略从草稿键回写到生效键的列表
+_APPLY_KEYS = {
+    "小市值轮动·戴维斯双击": ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
+                               "sd_turn_min", "sd_turn_max"),
+    "动量+均线+小市值": ("ret_20_min", "cap_max", "require_ma20"),
+    "市值策略": ("mc_universe_list", "mc_cap_min", "mc_cap_max", "mc_listed_yrs",
+                 "mc_div_years", "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop",
+                 "mc_ex_nodiv", "mc_ma30_exit", "mc_ma30_lookback",
+                 "mc_entry_weeks",
+                 "mc_weight_frac", "mc_rank_buffer", "mc_rebal_mode",
+                 "mc_cap_chg_th", "mc_rebal_th"),
+    "ETF策略": ("etf_mom_days", "etf_min_amount", "etf_min_history",
+                 "etf_weight_frac", "etf_rank_buffer", "etf_rebal_mode",
+                 "etf_check_freq",
+                 "etf_cap_chg_th", "etf_rebal_th", "etf_ma30_exit",
+                 "etf_ma30_lookback", "etf_entry_weeks",
+                 "etf_premium_cap", "etf_flow_on", "etf_flow_min",
+                 "etf_mkt_flow_guard", "etf_mkt_flow_days"),
+}
+
+# 函数式策略: 引擎参数名 -> 界面 session_state 键
+_FN_PARAM_MAP = {
+    "小市值轮动·戴维斯双击": {
+        "cap_max": "sd_cap_max", "ret_20_min": "sd_ret20",
+        "require_ma20": "sd_ma20", "require_ma60": "sd_ma60",
+        "turn_min": "sd_turn_min", "turn_max": "sd_turn_max",
+    },
+    "动量+均线+小市值": {
+        "ret_20_min": "ret_20_min", "cap_max": "cap_max",
+        "require_ma20": "require_ma20",
+    },
+}
+
 # 语言选择写入 URL (?lang=en), 刷新页面后仍然保持
 try:
     _q_lang = st.query_params.get("lang")
@@ -1260,39 +1389,156 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-def cached_backtest(strategy_key, _feat_data, initial, hold, top, lu_pct,
-                    start_d, end_d, fingerprint=""):
-    """
-    双层缓存:
-      L1: st.cache_data (内存, 24h)
-      L2: SQLite backtest_cache (持久, 数据指纹变化自动失效)
-    参数/数据均未变化时, 重启容器也能秒开
-    """
-    cost_str = _cost_str()
-    key_raw, cache_key = bt_cache_key(strategy_key, initial, hold, top, lu_pct,
-                                      start_d, end_d, fingerprint, cost_str)
+def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
+    """当前回测参数 (含成本/撮合指纹)。参数不变 → 直接复用库内最近结果"""
+    ss = st.session_state
+    p = {
+        "initial_capital": int(float(initial)),
+        "hold_days": int(hold),
+        "top_n": int(top),
+        "limit_up_pct": round(float(lu_pct), 4),
+        "start": str(start_d)[:10],
+        "end": str(end_d)[:10],
+        "cost": _cost_str(),
+    }
+    if strategy_key == "市值策略":
+        uni = sorted(str(c) for c in (ss.get("mc_universe_list") or []))
+        p.update({
+            "universe": uni,
+            "top_n": len(uni) if uni else int(top),
+            "cap_min": float(ss["mc_cap_min"]),
+            "cap_max": float(ss["mc_cap_max"]),
+            "weight_fraction": float(ss["mc_weight_frac"]),
+            "cap_change_threshold": float(ss["mc_cap_chg_th"]),
+            "rebalance_threshold": float(ss["mc_rebal_th"]),
+            "min_listed_years": float(ss["mc_listed_yrs"]),
+            "exclude_st": bool(ss["mc_ex_st"]),
+            "exclude_ocf_diverge": bool(ss["mc_ex_ocf"]),
+            "exclude_nonop_profit": bool(ss["mc_ex_nonop"]),
+            "exclude_no_dividend": bool(ss["mc_ex_nodiv"]),
+            "dividend_years": int(ss["mc_div_years"]),
+            "ma30_lookback": int(ss["mc_ma30_lookback"]),
+            "ma30_exit": bool(ss["mc_ma30_exit"]),
+            "ma30_entry_weeks": int(ss["mc_entry_weeks"]),
+            "rebalance_mode": str(ss["mc_rebal_mode"]),
+            "rank_buffer": int(ss["mc_rank_buffer"]),
+        })
+    elif strategy_key == "ETF策略":
+        p.update({
+            "pool_type": "etf",
+            "top_n": int(top),
+            "etf_mom_days": int(ss["etf_mom_days"]),
+            "etf_min_amount": float(ss["etf_min_amount"]),
+            "etf_min_history": int(ss["etf_min_history"]),
+            "weight_fraction": float(ss["etf_weight_frac"]),
+            "cap_change_threshold": float(ss["etf_cap_chg_th"]),
+            "rebalance_threshold": float(ss["etf_rebal_th"]),
+            "ma30_lookback": int(ss["etf_ma30_lookback"]),
+            "ma30_exit": bool(ss["etf_ma30_exit"]),
+            "ma30_entry_weeks": int(ss["etf_entry_weeks"]),
+            "rebalance_mode": str(ss["etf_rebal_mode"]),
+            "rank_buffer": int(ss["etf_rank_buffer"]),
+            "check_freq": str(ss["etf_check_freq"]),
+            "etf_premium_cap": float(ss["etf_premium_cap"]),
+            "etf_flow_min": float(ss["etf_flow_min"]) if ss["etf_flow_on"] else None,
+            "etf_mkt_flow_guard": bool(ss["etf_mkt_flow_guard"]),
+            "etf_mkt_flow_days": int(ss["etf_mkt_flow_days"]),
+        })
+    elif strategy_key in _FN_PARAM_MAP:
+        p["params"] = {k: ss.get(v) for k, v in _FN_PARAM_MAP[strategy_key].items()}
+    return p
 
-    # L2: SQLite 命中 → 直接返回
-    hit = data_store.get_backtest_cache(cache_key)
-    if hit:
-        return deserialize_result(hit)
 
-    # 未命中 → 跑回测 (向量化引擎优先)
-    select_fn = STRATEGIES[strategy_key]
-    result = run_backtest_auto(
-        _feat_data, select_fn, strategy_params={"top_n": top},
-        initial_capital=initial, hold_days=hold, limit_up_pct=lu_pct,
-        start_date=start_d, end_date=end_d, cost_params=get_cost_params(),
-        limit_rules=get_limit_rules(),
-    )
+def _bt_sig(params: dict) -> str:
+    """参数签名: 参数/成本任一变化即换签名, 用于取「最近一次回测结果」"""
+    import hashlib
+    raw = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(raw.encode()).hexdigest()
 
-    # 回写 L2
-    if result.get("curve") is not None and len(result.get("curve", [])) > 0:
+
+def _run_backtest_params(strategy_key, params, feat_data):
+    """按参数跑回测 (市值/ETF 策略走同一个 MarketCapStrategy, 只是 pool_type 不同)"""
+    if strategy_key in CLASS_STRATEGIES:
+        mc = MarketCapStrategy(
+            top_n=params["top_n"],
+            universe=params.get("universe") or None,
+            pool_type=params.get("pool_type", "stock"),
+            etf_mom_days=params.get("etf_mom_days", 60),
+            etf_min_amount=params.get("etf_min_amount", 0.5),
+            etf_min_history=params.get("etf_min_history", 120),
+            cap_min=params.get("cap_min", 15.0),
+            cap_max=params.get("cap_max", 200.0),
+            weight_fraction=params["weight_fraction"],
+            cap_change_threshold=params["cap_change_threshold"],
+            rebalance_threshold=params["rebalance_threshold"],
+            min_listed_years=params.get("min_listed_years", 3.0),
+            exclude_st=params.get("exclude_st", True),
+            exclude_ocf_diverge=params.get("exclude_ocf_diverge", True),
+            exclude_nonop_profit=params.get("exclude_nonop_profit", True),
+            exclude_no_dividend=params.get("exclude_no_dividend", True),
+            dividend_years=params.get("dividend_years", 3),
+            ma30_lookback=params["ma30_lookback"],
+            ma30_exit=params["ma30_exit"],
+            ma30_entry_weeks=params["ma30_entry_weeks"],
+            rebalance_mode=params["rebalance_mode"],
+            rank_buffer=params["rank_buffer"],
+            check_freq=params.get("check_freq", "daily"),
+            etf_premium_cap=params.get("etf_premium_cap", 0.0),
+            etf_flow_min=params.get("etf_flow_min"),
+            etf_mkt_flow_guard=params.get("etf_mkt_flow_guard", False),
+            etf_mkt_flow_days=params.get("etf_mkt_flow_days", 5),
+        )
+        return run_backtest(
+            feat_data, mc, strategy_params={},
+            initial_capital=params["initial_capital"], top_n=mc.n_slots,
+            hold_days=params["hold_days"], limit_up_pct=params["limit_up_pct"],
+            start_date=params["start"], end_date=params["end"],
+            cost_params=get_cost_params(), use_strategy_class=True,
+            limit_rules=get_limit_rules())
+    return run_backtest_auto(
+        feat_data, STRATEGIES[strategy_key], strategy_params=dict(params.get("params") or {}),
+        initial_capital=params["initial_capital"], hold_days=params["hold_days"],
+        top_n=params["top_n"], limit_up_pct=params["limit_up_pct"],
+        start_date=params["start"], end_date=params["end"],
+        cost_params=get_cost_params(), limit_rules=get_limit_rules())
+
+
+def _bt_result_from_rec(rec, stale_params=False):
+    """库内记录 → 结果 dict (带展示用的 _meta)"""
+    result = deserialize_result(rec["payload"])
+    result["_meta"] = {
+        "created_at": str(rec["created_at"]).replace("T", " "),
+        "stale": rec["fingerprint"] != DATA_FINGERPRINT,
+        "stale_params": stale_params,
+    }
+    return result
+
+
+def load_or_run_backtest(strategy_key, feat_data, initial, hold, top, lu_pct,
+                         start_d, end_d, force=False, allow_run=True):
+    """参数不变 → 回显库内最近一次回测 (含成交/持仓明细);
+    参数变 → 先回显上次结果并标记 stale_params, 点「开始回测」(force=True) 才重跑覆盖。"""
+    params = _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d)
+    sig = _bt_sig(params)
+    if not force:
+        rec = data_store.get_backtest_result(strategy_key, sig)
+        if rec:
+            return _bt_result_from_rec(rec)
+        rec = data_store.get_latest_backtest_result(strategy_key)
+        if rec:
+            return _bt_result_from_rec(rec, stale_params=True)
+        if not allow_run:
+            return None
+    result = _run_backtest_params(strategy_key, params, feat_data)
+    curve = result.get("curve")
+    if curve is not None and len(curve) > 0:
         try:
-            data_store.save_backtest_cache(cache_key, strategy_key, key_raw,
-                                           fingerprint, serialize_result(result))
+            data_store.save_backtest_result(strategy_key, sig, params,
+                                            DATA_FINGERPRINT, serialize_result(result))
         except Exception:
             pass
+        result["_meta"] = {"created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           "stale": False, "stale_params": False}
     return result
 
 
@@ -1318,7 +1564,7 @@ _CFG_KEYS = ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
              "ret_20_min", "cap_max", "require_ma20",
              "mc_cap_min", "mc_cap_max", "mc_weight_frac", "mc_cap_chg_th",
              "mc_rebal_th", "mc_listed_yrs", "mc_ma30_lookback", "mc_universe",
-             "mc_ma30_exit",
+             "mc_ma30_exit", "mc_entry_weeks",
              "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop", "mc_ex_nodiv", "mc_div_years")
 
 
@@ -2181,12 +2427,39 @@ ROBUST_SCAN_PARAMS = {
         ("weight_fraction", "资金比例", 0.50, 1.00, 0.05, float, "mc_weight_frac"),
         ("rank_buffer", "排名缓冲", 0, 10, 1, int, "mc_rank_buffer"),
     ],
+    "ETF策略": [
+        ("etf_min_amount", "成交额下限(亿)", 0.1, 3.0, 0.1, float, "etf_min_amount"),
+        ("weight_fraction", "资金比例", 0.50, 1.00, 0.05, float, "etf_weight_frac"),
+        ("rank_buffer", "排名缓冲", 0, 10, 1, int, "etf_rank_buffer"),
+    ],
 }
 
 
-def _mc_strategy_from_state(ss, overrides: dict | None = None):
-    """按当前界面参数 + 扫描覆盖值重建市值策略"""
+def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
+    """按当前界面参数 + 扫描覆盖值重建市值/ETF 策略"""
     o = dict(overrides or {})
+    if strategy_key == "ETF策略":
+        return MarketCapStrategy(
+            top_n=int(o.pop("top_n", 0)) or int(ss.get("top_n", 5)),
+            pool_type="etf",
+            etf_mom_days=int(ss.get("etf_mom_days", 60)),
+            etf_min_amount=o.get("etf_min_amount", ss.get("etf_min_amount", 0.5)),
+            etf_min_history=int(ss.get("etf_min_history", 120)),
+            weight_fraction=o.get("weight_fraction", ss.get("etf_weight_frac", 0.95)),
+            cap_change_threshold=ss.get("etf_cap_chg_th", 0.04),
+            rebalance_threshold=ss.get("etf_rebal_th", 0.05),
+            ma30_lookback=ss.get("etf_ma30_lookback", 5),
+            ma30_exit=ss.get("etf_ma30_exit", True),
+            ma30_entry_weeks=ss.get("etf_entry_weeks", 2),
+            rebalance_mode=ss.get("etf_rebal_mode", "topk_drop"),
+            rank_buffer=o.get("rank_buffer", ss.get("etf_rank_buffer", 5)),
+            check_freq=ss.get("etf_check_freq", "weekly"),
+            etf_premium_cap=float(ss.get("etf_premium_cap", 0.0) or 0.0),
+            etf_flow_min=(float(ss.get("etf_flow_min", -3.0))
+                          if ss.get("etf_flow_on") else None),
+            etf_mkt_flow_guard=bool(ss.get("etf_mkt_flow_guard", False)),
+            etf_mkt_flow_days=int(ss.get("etf_mkt_flow_days", 5)),
+        )
     uni = list(ss.get("mc_universe_list") or [])
     top = int(o.pop("top_n", 0)) or (len(uni) if uni else int(ss.get("top_n", 3)))
     return MarketCapStrategy(
@@ -2202,6 +2475,7 @@ def _mc_strategy_from_state(ss, overrides: dict | None = None):
         dividend_years=ss["mc_div_years"],
         ma30_lookback=ss.get("mc_ma30_lookback", 5),
         ma30_exit=ss.get("mc_ma30_exit", True),
+        ma30_entry_weeks=ss.get("mc_entry_weeks", 2),
         rebalance_mode=ss.get("mc_rebal_mode", "topk_drop"),
         rank_buffer=o.get("rank_buffer", ss.get("mc_rank_buffer", 2)),
     )
@@ -2213,7 +2487,7 @@ def _make_segment_runner(strategy_choice, feat_data, sp, ss, initial, hold, top,
 
     def run_one(params, start, end):
         if use_class:
-            strat = _mc_strategy_from_state(ss, params)
+            strat = _class_strategy_from_state(strategy_choice, ss, params)
             return run_backtest(
                 feat_data, strat, strategy_params={},
                 initial_capital=initial, top_n=strat.n_slots, hold_days=hold,
@@ -2267,9 +2541,17 @@ def _render_robust_panel(strategy_choice, feat_data, sp, ss, initial, hold, top,
                   help="K 越大越严格，但每段交易日变少；区间过短会自动降 K")
     min_trades = c3.number_input("最小交易数", 5, 300, 30, 5, key="rb_min_trades",
                                  help="全部验证段累计交易数不足则直接判为不合格")
-    objective = c4.selectbox("主目标", ["calmar", "sharpe", "sortino",
-                                     "total_return", "max_drawdown"],
-                             key="rb_objective")
+    # 主目标: 值保持英文键 (引擎按白名单匹配), 界面按语言显示中文/英文名
+    _obj_labels = {
+        "calmar": ("卡玛比率", "Calmar"),
+        "sharpe": ("夏普比率", "Sharpe"),
+        "sortino": ("索提诺比率", "Sortino"),
+        "total_return": ("总收益率", "Total Return"),
+        "max_drawdown": ("最大回撤", "Max Drawdown"),
+    }
+    objective = c4.selectbox(
+        "主目标", list(_obj_labels), key="rb_objective",
+        format_func=lambda v: _obj_labels[v][1] if lang() == "en" else _obj_labels[v][0])
 
     values = _scan_values(ss.get(sskey, lo), lo, hi, step, cast, n=n_vals)
     combos = [{key: v} for v in values]
@@ -2398,7 +2680,14 @@ def _render_robust_panel(strategy_choice, feat_data, sp, ss, initial, hold, top,
 
 
 if page == "home":
-    _render_top_nav(page)
+    # ---- 紧凑 hero 行 (取代旧的 _render_top_nav: 侧边栏已有品牌按钮, 首页不需重复) ----
+    _hero_sub = t("home_sub")
+    st.markdown(f"""
+<div style="display:flex;align-items:center;gap:0.75rem;padding:0.5rem 0 0.25rem 0;">
+  <div style="font-size:1.25rem;font-weight:700;color:var(--text-primary);">📈 托米量化</div>
+  <div style="color:var(--text-tertiary);font-size:0.8125rem;">{_hero_sub}</div>
+</div>
+""", unsafe_allow_html=True)
 
     # ---- 全球主要市场: 浏览器端直连腾讯行情 (2 秒刷新, 不经 Streamlit 重绘) ----
     import data_manager
@@ -2540,34 +2829,40 @@ if page == "home":
 
     st.divider()
 
-    # ---- 策略绩效概览 (可展开, 数据来自缓存) ----
+    # ---- 策略绩效概览 (参数未变时直接回显最近一次回测) ----
     with st.expander(t('strat_perf'), expanded=False):
         st.caption(f"{t('dash_range')}: {backtest_start.strftime('%Y-%m-%d')} ~ "
                    f"{backtest_end.strftime('%Y-%m-%d')}")
 
-        _miss = [k for k in DASH_STRATEGIES
-                 if not data_store.get_backtest_cache(
-                     bt_cache_key(k, initial_capital, hold_days, top_n, limit_up_pct,
-                                  backtest_start, backtest_end, DATA_FINGERPRINT,
-                                  _cost_str())[1])]
-        if _miss:
-            feat_data = require_data()
-            _n = len(feat_data)
-        else:
-            feat_data = {}
-            try:
-                _n = data_store.coverage_stats("daily_bar")["symbols"]
-            except Exception:
-                _n = 0
+        _dash_params = {
+            k: _bt_params(k, initial_capital, hold_days, top_n, limit_up_pct,
+                          backtest_start, backtest_end)
+            for k in DASH_STRATEGIES}
+        _need_run = [k for k in DASH_STRATEGIES
+                     if not (data_store.get_backtest_result(k, _bt_sig(_dash_params[k]))
+                             or data_store.get_latest_backtest_result(k))]
+        feat_data = require_data() if _need_run else {}
 
         with st.spinner(t("running_bt")):
             results = {}
             for key in DASH_STRATEGIES:
                 try:
-                    results[key] = cached_backtest(key, feat_data, initial_capital, hold_days, top_n, limit_up_pct,
-                                                     backtest_start, backtest_end, DATA_FINGERPRINT)
+                    results[key] = load_or_run_backtest(
+                        key, feat_data, initial_capital, hold_days, top_n,
+                        limit_up_pct, backtest_start, backtest_end)
                 except Exception as e:
                     st.error(f"{key} 回测失败: {e}")
+
+        _metas = [r.get("_meta") or {} for r in results.values()]
+        if _metas and all(m.get("created_at") for m in _metas):
+            _ts = max(m["created_at"] for m in _metas)
+            if any(m.get("stale_params") for m in _metas):
+                _hint = "参数/区间已调整，可到「策略回测」点「开始回测」生成新结果"
+            elif any(m.get("stale") for m in _metas):
+                _hint = "行情数据已更新，可到「策略回测」点「开始回测」刷新"
+            else:
+                _hint = "参数未变更，直接展示已保存结果"
+            st.caption(f"📌 最近回测：{_ts} · {_hint}")
 
         st.subheader(t("perf_compare"))
         col_perf = st.columns(len(results))
@@ -2660,27 +2955,16 @@ elif page == "backtest":
     _render_top_nav("backtest", subtitle=t("bt_sub"))
     feat_data = require_data()
 
-    # ---------- session_state 初始化 ----------
-    for _k, _v in {
-        "sd_cap_max": 30, "sd_ret20": 5, "sd_ma20": True, "sd_ma60": True,
-        "sd_turn_min": 3, "sd_turn_max": 20,
-        "ret_20_min": 5, "cap_max": 200, "require_ma20": True,
-        "mc_cap_min": 15, "mc_cap_max": 200, "mc_weight_frac": 0.75,
-        "mc_cap_chg_th": 0.04, "mc_rebal_th": 0.05, "mc_listed_yrs": 3.0,
-        "mc_ma30_lookback": 5, "mc_universe": "", "mc_ma30_exit": True,
-        "mc_ex_st": True, "mc_ex_ocf": True, "mc_ex_nonop": True,
-        "mc_ex_nodiv": True, "mc_div_years": 3,
-        "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_universe_list": [],
-    }.items():
-        st.session_state.setdefault(_k, _v)
-
-    if "bt_strategy_choice" not in st.session_state:
-        st.session_state["bt_strategy_choice"] = list(STRATEGIES.keys())[0]
+    # ---------- session_state 初始化 (参数默认值已在全局初始化) ----------
+    if st.session_state.get("bt_strategy_choice") not in STRATEGY_NAMES:
+        st.session_state["bt_strategy_choice"] = STRATEGY_NAMES[0]
     if "bt_open_settings" not in st.session_state:
         st.session_state["bt_open_settings"] = False
 
     if "_pending_pick" in st.session_state:
         st.session_state["bt_strategy_choice"] = st.session_state.pop("_pending_pick")
+    if st.session_state.get("bt_strategy_choice") not in STRATEGY_NAMES:
+        st.session_state["bt_strategy_choice"] = STRATEGY_NAMES[0]
 
     strategy_choice = st.session_state["bt_strategy_choice"]
 
@@ -2701,15 +2985,15 @@ elif page == "backtest":
     except Exception:
         pass
 
-    # ---------- 预计算策略概览缓存 ----------
-    _all_names = list(STRATEGIES.keys())
+    # ---------- 策略概览: 参数未变 → 直接用库内最近一次结果 ----------
+    _all_names = list(STRATEGY_NAMES)
     with st.spinner("加载策略概览..."):
         _cached = {}
         for name in _all_names:
             try:
-                _cached[name] = cached_backtest(
+                _cached[name] = load_or_run_backtest(
                     name, feat_data, initial_capital, hold_days, top_n,
-                    limit_up_pct, backtest_start, backtest_end, DATA_FINGERPRINT)
+                    limit_up_pct, backtest_start, backtest_end, allow_run=False)
             except Exception:
                 _cached[name] = None
 
@@ -2731,7 +3015,19 @@ elif page == "backtest":
                     st.rerun()
 
     _summary_parts = [f"{initial_capital // 10000}万"]
-    if strategy_choice != "市值策略":
+    if strategy_choice == "ETF策略":
+        _summary_parts.append(f"{top_n}只ETF")
+        _summary_parts.append(
+            f"动量{st.session_state.get('etf_mom_days', 60)}日"
+            f"·成交额≥{st.session_state.get('etf_min_amount', 0.5)}亿")
+        _cap = float(st.session_state.get("etf_premium_cap", 0) or 0)
+        if _cap > 0:
+            _summary_parts.append(f"溢价≤{_cap:.1f}%")
+        if st.session_state.get("etf_flow_on"):
+            _summary_parts.append(f"净申购≥{st.session_state.get('etf_flow_min', -3)}%")
+        if st.session_state.get("etf_mkt_flow_guard"):
+            _summary_parts.append("全市场资金流风控")
+    elif strategy_choice != "市值策略":
         _summary_parts.append(f"{top_n}只")
         _summary_parts.append(f"持有{hold_days}天·涨停{limit_up_pct:.1f}%")
     else:
@@ -2771,17 +3067,6 @@ elif page == "backtest":
     # 所以控件不能直接绑「已生效」键: 那样关闭弹窗参数就丢了。
     # 约定: 控件一律用 di_ 前缀的草稿键, 生效值存在不带前缀的平键上,
     # 只有点「确定」才把草稿回写; 关闭/取消保持上一次生效的设置。
-    _APPLY_KEYS = {
-        "小市值轮动·戴维斯双击": ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
-                                   "sd_turn_min", "sd_turn_max"),
-        "动量+均线+小市值": ("ret_20_min", "cap_max", "require_ma20"),
-        "市值策略": ("mc_universe_list", "mc_cap_min", "mc_cap_max", "mc_listed_yrs",
-                     "mc_div_years", "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop",
-                     "mc_ex_nodiv", "mc_ma30_exit", "mc_ma30_lookback",
-                     "mc_weight_frac", "mc_rank_buffer", "mc_rebal_mode",
-                     "mc_cap_chg_th", "mc_rebal_th"),
-    }
-
     def _draft(key: str, default=None) -> str:
         """返回草稿键; 草稿首次出现时用当前生效值初始化"""
         dk = f"di_{key}"
@@ -2804,14 +3089,14 @@ elif page == "backtest":
         initial_capital = _r1[0].number_input(
             "初始资金(万)", 10, 10000, _cur_initial // 10000, 10,
             format="%d", key="di_initial") * 10000
-        if strategy_choice != "市值策略":
+        if strategy_choice == "市值策略":
+            _mc_uni2 = list(st.session_state.get("mc_universe_list") or [])
+            _r1[1].metric("持仓数", len(_mc_uni2) if _mc_uni2 else "按选股")
+        else:
             top_n = _r1[1].slider("持仓数", 1, 30, _cur_top_n, key="di_topn")
             hold_days = _r1[2].slider("持有天数", 1, 30, _cur_hold, key="di_hold")
             limit_up_pct = _r1[3].slider("涨停阈值(%)", 5.0, 15.0, _cur_lup, 0.1,
                                          key="di_limitup")
-        else:
-            _mc_uni2 = list(st.session_state.get("mc_universe_list") or [])
-            _r1[1].metric("持仓数", len(_mc_uni2) if _mc_uni2 else "按选股")
         _r2 = st.columns([1, 1, 2])
         _dr = _r2[0].date_input("回测起点", value=backtest_start, key="di_start")
         _de = _r2[1].date_input("回测终点", value=backtest_end, key="di_end")
@@ -2834,13 +3119,58 @@ elif page == "backtest":
             _a[0].slider("20日涨幅下限(%)", 1, 20, key=_draft("ret_20_min", 5))
             _a[1].slider("市值上限(亿)", 50, 500, key=_draft("cap_max", 200))
             _a[2].checkbox("MA20 以上", key=_draft("require_ma20", True))
+        elif strategy_choice == "ETF策略":
+            st.caption("ETF 没有财务/分红/市值数据：用「动量排名 + 成交额流动性 + 周K MA30 趋势」选品。")
+            _a = st.columns(4)
+            _a[0].radio("动量窗口", options=[20, 60], horizontal=True,
+                        format_func=lambda v: f"近{v}日涨幅",
+                        key=_draft("etf_mom_days", 60))
+            _a[1].slider("成交额下限(亿)", 0.1, 5.0, key=_draft("etf_min_amount", 0.5),
+                         step=0.1, help="近20日日均成交额，低于该值的 ETF 不参与排名")
+            _a[2].slider("最少K线(根)", 60, 500, key=_draft("etf_min_history", 120),
+                         step=10, help="次新 ETF 数据不足时不参与排名")
+            _a[3].slider("资金比例", 0.50, 1.00, key=_draft("etf_weight_frac", 0.95),
+                         step=0.05, help="买入金额占总市值比例")
+            _b = st.columns(4)
+            _b[0].checkbox("MA30 拐头清仓", key=_draft("etf_ma30_exit", True), help="趋势止损")
+            _b[1].slider("MA30 回看(周)", 2, 15, key=_draft("etf_ma30_lookback", 5))
+            _b[2].slider("建仓确认(周)", 0, 4, key=_draft("etf_entry_weeks", 2),
+                         help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
+            _b[3].slider("排名缓冲(名)", 0, 10, key=_draft("etf_rank_buffer", 5),
+                         help="排名跌出 持仓数+缓冲 才换出")
+            st.radio("调仓方式", options=["topk_drop", "deviation"],
+                     format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
+                                            "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
+                     key=_draft("etf_rebal_mode", "topk_drop"), horizontal=True)
+            st.radio("排名检查频率", options=["weekly", "daily"],
+                     format_func=lambda v: {"weekly": "每周最后一个交易日",
+                                             "daily": "每个交易日"}[v],
+                     key=_draft("etf_check_freq", "weekly"), horizontal=True,
+                     help="60日动量排名的日间噪声很大，周频检查可显著降低换手与成本")
+            _d = st.columns(4)
+            _d[0].slider("价格变化阈值(%)", 0.01, 0.15, key=_draft("etf_cap_chg_th", 0.04),
+                         step=0.01, help="ETF 无市值数据，按价格相对建仓基准的偏离判断")
+            _d[1].slider("持仓偏离阈值(%)", 0.02, 0.15, key=_draft("etf_rebal_th", 0.05),
+                         step=0.01)
+            st.caption("风控因子（需先同步华泰柏瑞增强数据；无数据时自动不拦截）")
+            _e = st.columns(4)
+            _e[0].slider("溢价率上限(%)", 0.0, 3.0, key=_draft("etf_premium_cap", 1.0),
+                         step=0.1, help="当日溢价率超过该值则剔除，0=关闭；QDII 建议 1.5~2")
+            _e[1].checkbox("资金流过滤", key=_draft("etf_flow_on", False),
+                           help="启用后按「近5日净申购/规模」剔除持续净赎回的 ETF")
+            _e[2].slider("净申购下限(%)", -10.0, 0.0, key=_draft("etf_flow_min", -3.0),
+                         step=0.5, help="近5日净申购额占规模比例低于该值则剔除")
+            _e[3].checkbox("市场资金流风控", key=_draft("etf_mkt_flow_guard", False),
+                           help="全市场股票型 ETF 资金持续净流出时清仓/不开新仓")
+            st.slider("市场资金流观察窗(交易日)", 2, 10, key=_draft("etf_mkt_flow_days", 5),
+                      help="上述窗口内的净流入均值 < 0 视为风险")
         elif strategy_choice == "市值策略":
             if "_mc_symbols" not in st.session_state:
                 _all = sorted(feat_data.keys())
+                # 股票池不含 ETF/LOF (引擎层也会再次显式排除)
                 _ETF_PRE = ("sz159", "sh51", "sh52", "sh56", "sh58")
-                _etf = [s for s in _all if any(s.startswith(p) for p in _ETF_PRE)]
-                _equity = [s for s in _all if s not in _etf]
-                st.session_state["_mc_symbols"] = _etf + _equity
+                st.session_state["_mc_symbols"] = [
+                    s for s in _all if not s.startswith(_ETF_PRE)]
             st.multiselect(
                 "标的池（留空 = 全市场选股）",
                 options=st.session_state["_mc_symbols"],
@@ -2877,6 +3207,8 @@ elif page == "backtest":
                          step=0.01)
             _d[1].slider("持仓偏离阈值(%)", 0.02, 0.15, key=_draft("mc_rebal_th", 0.05),
                          step=0.01)
+            _d[2].slider("建仓确认(周)", 0, 4, key=_draft("mc_entry_weeks", 2),
+                         help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
 
         # 底部按钮行
         dlg_c1, dlg_c2, dlg_c3 = st.columns([1, 1, 1])
@@ -2888,16 +3220,19 @@ elif page == "backtest":
             if st.button("✅ 确定", type="primary", use_container_width=True,
                          key="bt_dlg_ok"):
                 st.session_state["initial_capital"] = initial_capital
-                if strategy_choice != "市值策略":
+                if strategy_choice not in CLASS_STRATEGIES:
                     st.session_state["top_n"] = top_n
                     st.session_state["hold_days"] = hold_days
                     st.session_state["limit_up_pct"] = limit_up_pct
+                elif strategy_choice != "市值策略":
+                    st.session_state["top_n"] = top_n
                 st.session_state["backtest_start"] = pd.Timestamp(_dr)
                 st.session_state["backtest_end"] = pd.Timestamp(_de)
                 for _pk in _APPLY_KEYS.get(strategy_choice, ()):
                     _pv = f"di_{_pk}"
                     if _pv in st.session_state:
                         st.session_state[_pk] = st.session_state[_pv]
+                _persist_bt_settings()   # 立即落库: 下面 st.rerun() 会中断脚本
                 st.session_state["bt_open_settings"] = False
                 st.rerun()
 
@@ -2916,7 +3251,7 @@ elif page == "backtest":
     elif strategy_choice == "动量+均线+小市值":
         sp = {"ret_20_min": _ss["ret_20_min"], "cap_max": _ss["cap_max"],
               "require_ma20": _ss["require_ma20"]}
-    elif strategy_choice == "市值策略":
+    elif strategy_choice in CLASS_STRATEGIES:
         sp = {}
         _use_strategy_class = True
     else:
@@ -2925,41 +3260,9 @@ elif page == "backtest":
     if run_btn:
         with st.spinner("🔄 运行回测..."):
             _t_bt = time.perf_counter()
-            if _use_strategy_class:
-                _uni = list(_ss.get("mc_universe_list") or [])
-                _mc = MarketCapStrategy(
-                    top_n=len(_uni) if _uni else top_n,
-                    universe=_uni or None,
-                    cap_min=_ss["mc_cap_min"],
-                    cap_max=_ss["mc_cap_max"],
-                    weight_fraction=_ss["mc_weight_frac"],
-                    cap_change_threshold=_ss["mc_cap_chg_th"],
-                    rebalance_threshold=_ss["mc_rebal_th"],
-                    min_listed_years=_ss["mc_listed_yrs"],
-                    exclude_st=_ss["mc_ex_st"],
-                    exclude_ocf_diverge=_ss["mc_ex_ocf"],
-                    exclude_nonop_profit=_ss["mc_ex_nonop"],
-                    exclude_no_dividend=_ss["mc_ex_nodiv"],
-                    dividend_years=_ss["mc_div_years"],
-                    ma30_lookback=_ss.get("mc_ma30_lookback", 5),
-                    ma30_exit=_ss.get("mc_ma30_exit", True),
-                    rebalance_mode=_ss.get("mc_rebal_mode", "topk_drop"),
-                    rank_buffer=_ss.get("mc_rank_buffer", 2),
-                )
-                result = run_backtest(
-                    feat_data, _mc, strategy_params={},
-                    initial_capital=initial_capital, top_n=_mc.n_slots,
-                    hold_days=hold_days, limit_up_pct=limit_up_pct,
-                    start_date=backtest_start, end_date=backtest_end,
-                    cost_params=get_cost_params(), use_strategy_class=True,
-                    limit_rules=get_limit_rules())
-            else:
-                result = run_backtest_auto(
-                    feat_data, STRATEGIES[strategy_choice], strategy_params=sp,
-                    initial_capital=initial_capital, hold_days=hold_days, top_n=top_n,
-                    limit_up_pct=limit_up_pct,
-                    start_date=backtest_start, end_date=backtest_end,
-                    cost_params=get_cost_params(), limit_rules=get_limit_rules())
+            result = load_or_run_backtest(
+                strategy_choice, feat_data, initial_capital, hold_days, top_n,
+                limit_up_pct, backtest_start, backtest_end, force=True)
         _elapsed = time.perf_counter() - _t_bt
         _n_tr = result["performance"].get("trades_count", 0)
         if _elapsed >= 60:
@@ -2967,17 +3270,23 @@ elif page == "backtest":
         else:
             _t_str = f"{_elapsed:.1f} 秒"
         st.success(f"✅ 回测完成! {_n_tr} 笔交易 · 回测计算耗时 {_t_str}")
-        if _use_strategy_class:
-            st.session_state["_mc_result"] = result
         try:
             data_store.save_run("backtest", strategy_choice, sp, result["performance"])
         except Exception:
             pass
     else:
-        result = (st.session_state.get("_mc_result")
-                  if _use_strategy_class else None) or _cached.get(strategy_choice)
+        result = _cached.get(strategy_choice)
 
     if result:
+        _meta = result.get("_meta") or {}
+        if _meta.get("created_at"):
+            if _meta.get("stale_params"):
+                _hint = "展示的是上次回测结果，参数/区间已变更，点「🚀 开始回测」生成新结果"
+            elif _meta.get("stale"):
+                _hint = "行情数据已更新，点「🚀 开始回测」可按最新数据刷新"
+            else:
+                _hint = "参数未变更，直接展示已保存结果"
+            st.caption(f"📌 最近回测：{_meta['created_at']} · {_hint}")
         p = result["performance"]
         _fb = result.get("fill_blocks") or {}
         if any(_fb.values()):
@@ -3093,7 +3402,11 @@ elif page == "picks":
     _render_top_nav("picks", subtitle=t("picks_sub"))
     feat_data = require_data()
 
-    strategy_choice = st.selectbox("选择选股策略", list(STRATEGIES.keys()), index=0, key="today_strategy")
+    # 今日选股只支持函数式策略 (ETF 池为回测口径, 不走这里的函数式选股链)
+    _pick_strategies = [k for k in STRATEGY_NAMES if k in STRATEGIES]
+    if st.session_state.get("today_strategy") not in _pick_strategies:
+        st.session_state["today_strategy"] = _pick_strategies[0]
+    strategy_choice = st.selectbox("选择选股策略", _pick_strategies, index=0, key="today_strategy")
     select_fn = STRATEGIES[strategy_choice]
 
     # 策略触发: 该策略需要但库内缺失的数据, 交给后台 Worker 补
@@ -3567,6 +3880,29 @@ elif page == "data":
     a3.metric("实时快照标的", f"{len(rt):,}", delta=rt_latest or "尚无")
     a4.metric("数据任务", f"{len(tasks)}", delta=f"{pending_n} 待处理")
 
+    # ETF 覆盖 (ETF 策略候选池, Worker 每日盘后自动同步清单并补缺口)
+    etf = data_store.etf_stats()
+    f1, f2 = st.columns(2)
+    f1.metric("ETF 覆盖标的", f"{etf['symbols']:,}", delta=f"{etf['bars']:,} 条K线")
+    f2.metric("ETF 数据区间", f"{etf['first_date']} ~ {etf['last_date']}")
+
+    # ETF 增强数据 (华泰柏瑞数据源: 资金流/规模份额/两融/溢价)
+    ex = data_store.etf_ext_stats()
+    try:
+        import htbr_source
+        ok, why = htbr_source.available()
+        qs = htbr_source.quota_status()
+        quota_txt = f"今日已用 {qs['used']}/{qs['limit']}" if ok else why
+    except Exception as e:
+        quota_txt = f"数据源未就绪: {e}"
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("ETF 资金流天", f"{ex['flow_bars']:,}", delta=f"最新 {ex['flow_last']}")
+    g2.metric("ETF 规模份额", f"{ex['capital_symbols']:,} 只",
+              delta=f"{ex['capital_bars']:,} 条 / {ex['capital_last']}")
+    g3.metric("ETF 行情增强", f"{ex['quote_symbols']:,} 只",
+              delta=f"{ex['quote_bars']:,} 条 / {ex['quote_last']}")
+    g4.metric("华泰柏瑞配额", quota_txt, delta=f"两融 {ex['margin_bars']:,} 条")
+
     import data_manager
     req_lines = "\n".join(
         f"| {k} | {' + '.join(v['datasets'])} | {v.get('lookback_days', 250)} |"
@@ -3598,6 +3934,21 @@ elif page == "data":
                                                 "end": datetime.now().strftime("%Y%m%d")},
                                                f"手动补全 {len(need)} 只标的")
                         n += 1
+                    # ETF 清单差集: 让新上市 ETF 也进入补数计划
+                    etf_syms = {s for s, _ in data_store.get_etf_codes()}
+                    if etf_syms and not any(t["dataset"] == "etf" for t in pending):
+                        data_store.task_create("etf", {"start": "20200101"}, "ETF 清单同步")
+                        n += 1
+                # ETF 增强数据 (华泰柏瑞): 已有数据源与凭据时按需补一次
+                try:
+                    import htbr_source
+                    if htbr_source.available()[0] and not any(
+                            t["dataset"] == "etf_extra" for t in pending):
+                        data_store.task_create("etf_extra", {"top_n": 60, "days": 5},
+                                               "ETF 增强数据同步")
+                        n += 1
+                except Exception:
+                    pass
                 if fst["symbols"] < max(1, stats["symbols"]) * 0.5 \
                         and not any(t["dataset"] == "fundamental" for t in pending):
                     data_store.task_create("fundamental", {"quarters": 4}, "财务季报回填")
@@ -3748,7 +4099,8 @@ elif page == "data":
 | **调度** | `data_task` | 策略提交的数据需求队列, Worker 消费执行 |
 | **策略** | `strategy_run` / `pick_record` | 回测参数绩效 / 选股跟踪 |
 | **资讯面** | `news` | 新闻/公告 + 多源去重 |
-| **缓存** | `backtest_cache` | 回测结果持久化, 数据指纹变化自动失效 |
+| **缓存** | `backtest_cache` | 回测中间缓存, 数据指纹变化自动失效 |
+| **回测结果** | `backtest_result` | 按「策略+参数」保存最近一次结果(含成交/持仓), 参数不变时页面直接回显 |
 
 > 数据流: 策略声明需求 → `data_task` 入队 → Worker 按覆盖索引补缺口 → 落库 → 回测/选股读取。
     """)
@@ -3867,3 +4219,6 @@ elif page == "help":
 
 st.divider()
 st.caption("🔬 数据来自 akshare (新浪财经) · 仅供研究参考，不构成投资建议")
+
+# 末尾统一落库: 参数被修改后自动记住最近一次设置
+_persist_bt_settings()

@@ -24,6 +24,7 @@ FILES = ["streamlit_app.py", "backtest_engine.py", "fast_backtest.py",
          "price_limits.py", "robust_backtest.py",
          "data_store.py", "data_manager.py", "perf_report.py",
          "news_fetcher.py", "update_worker.py", "doh_patch.py",
+         "htbr_source.py",
          "entrypoint.sh",
          "Dockerfile", "docker-compose.yml", "requirements.txt"]
 
@@ -63,6 +64,30 @@ if os.path.exists(cfg):
     run(f"mkdir -p {REMOTE_DIR}/.streamlit")
     scp.put(cfg, f"{REMOTE_DIR}/.streamlit/config.toml")
     print("  ✅ .streamlit/config.toml")
+
+# 华泰柏瑞技能运行时 (ETF 增强数据源): 只传代码/文档/配置, 不传 __pycache__
+vendor_src = os.path.join(LOCAL_DIR, "vendor", "htbr")
+if os.path.isdir(vendor_src):
+    for root, dirs, files in os.walk(vendor_src):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        rel = os.path.relpath(root, vendor_src).replace("\\", "/")
+        remote = f"{REMOTE_DIR}/vendor/htbr" + ("" if rel == "." else "/" + rel)
+        run(f"mkdir -p {remote}")
+        for f in files:
+            if f.endswith((".py", ".md", ".json")):
+                scp.put(os.path.join(root, f), f"{remote}/{f}")
+    print("  ✅ vendor/htbr (技能运行时)")
+
+# 凭据: 只读挂载到容器 /root/.htbr, 不进镜像与版本库
+cred_local = os.path.join(os.path.expanduser("~"), ".htbr", "credentials.json")
+if os.path.exists(cred_local):
+    run(f"mkdir -p {REMOTE_DIR}/secrets")
+    scp.put(cred_local, f"{REMOTE_DIR}/secrets/credentials.json")
+    run(f"chmod 600 {REMOTE_DIR}/secrets/credentials.json")
+    print("  ✅ secrets/credentials.json (只读挂载)")
+else:
+    print("  ⚠ 未找到本机 ~/.htbr/credentials.json, 跳过凭据同步")
+
 scp.close()
 
 print("\n=== 2. 后台重建容器 ===")

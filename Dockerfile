@@ -29,6 +29,8 @@ COPY news_fetcher.py .
 COPY update_worker.py .
 COPY perf_report.py .
 COPY doh_patch.py .
+COPY htbr_source.py .
+COPY vendor ./vendor
 COPY entrypoint.sh .
 COPY .streamlit ./.streamlit
 

@@ -10,6 +10,7 @@ backtest_report.txt
 .git/
 .vscode/
 .trae/
+secrets/
 *.log
 .DS_Store
 cache/        # cache 会通过 volume 挂载，不进镜像

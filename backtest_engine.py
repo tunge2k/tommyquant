@@ -49,7 +49,9 @@ def serialize_result(r) -> dict:
     curve["date"] = curve["date"].astype(str)
     return {
         "curve": curve.to_dict(orient="records"),
-        "trades": r["trades"],
+        "trades": [_py_scalar(t) for t in (r.get("trades") or [])],
+        "fills": [_py_scalar(f) for f in (r.get("fills") or [])],
+        "holdings_log": [_py_scalar(h) for h in (r.get("holdings_log") or [])],
         "performance": {k: _py_scalar(v) for k, v in (r.get("performance") or {}).items()},
         "selection_dates": [str(d)[:10] for d in r.get("selection_dates", [])],
         "trade_dates": [str(d)[:10] for d in r.get("trade_dates", [])],
@@ -64,7 +66,9 @@ def deserialize_result(d) -> dict:
     curve["date"] = pd.to_datetime(curve["date"])
     return {
         "curve": curve,
-        "trades": d["trades"],
+        "trades": d.get("trades") or [],
+        "fills": d.get("fills") or [],
+        "holdings_log": d.get("holdings_log") or [],
         "performance": {k: _num(v) for k, v in (d.get("performance") or {}).items()},
         "selection_dates": d.get("selection_dates", []),
         "trade_dates": d.get("trade_dates", []),
@@ -96,6 +100,34 @@ def load_cache() -> dict:
     return raw
 
 
+def _adjust_fund_splits(df: pd.DataFrame) -> pd.DataFrame:
+    """ETF/LOF 份额折算复权 (新浪源为不复权价)
+
+    ETF 大比例分红或 1拆N / N合1 时价格会出现 -60%~-80% 的跳变,
+    不复权直接回测会把这些折算当成真实暴跌 (例如 561980 2026-06-26 4.147→0.842)。
+    A股/ETF 单日涨跌幅上限最多 20%, 因此把单日 |涨跌幅| > 25% 视为份额折算,
+    用当日比例因子回溯调整之前的价格 (价格×因子, 成交量÷因子, 成交额不变)。
+    """
+    if df is None or len(df) < 2 or "close" not in df.columns:
+        return df
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    ratio = close[1:] / close[:-1]
+    bad = ~np.isfinite(ratio) | (ratio <= 0)
+    flag = (~bad) & ((ratio > 1.25) | (ratio < 0.80))
+    if not flag.any():
+        return df
+    fac = np.ones(len(close), dtype=float)
+    for i in np.where(flag)[0]:
+        fac[:i + 1] *= ratio[i]
+    df = df.copy()
+    for c in ("open", "high", "low", "close"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce") * fac
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce") / fac
+    return df
+
+
 def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
     """为单只股票计算技术面因子
 
@@ -104,6 +136,9 @@ def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
     """
     if df is None or len(df) < 120:
         return None
+    # 场内基金先做份额折算复权, 否则拆分日会被当成 -70% 暴跌
+    if code and price_limits.is_etf(code):
+        df = _adjust_fund_splits(df)
     df = df.copy()
     for c in ["open", "close", "high", "low", "volume", "turnover", "outstanding_share"]:
         if c in df.columns:
@@ -125,6 +160,12 @@ def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
     df["limit_up"] = (df["pct"] >= lu_threshold).astype(int)
     df["vol_ma5"] = df["volume"].rolling(5).mean()
     df["vol_expand"] = (df["volume"] > df["vol_ma5"] * 1.5).astype(int)
+    # 成交额均值: ETF 策略的流动性门槛 (ETF 无市值/换手数据, 用日均成交额代替)
+    if "amount" in df.columns:
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        df["amount_ma20"] = df["amount"].rolling(20).mean()
+    else:
+        df["amount_ma20"] = np.nan
 
     return df
 
@@ -221,6 +262,8 @@ class BarIndex:
             for c in codes
         ])
         self._gem_arr = np.array([p.startswith("30") or p.startswith("688") for p in pure_arr])
+        # 场内基金 (ETF/LOF): 股票策略池需显式排除, ETF 策略池只保留它们
+        self._etf_arr = np.array([price_limits.is_etf(c) for c in codes])
         # 每只标的上市首日 (datetime64[ns], 无数据用 NaT)
         self._first_dates = np.empty(N, dtype="datetime64[ns]")
         self._first_dates.fill(np.datetime64("NaT"))
@@ -379,6 +422,8 @@ class CrossSection:
             return None
         if name == "gem":
             return bi._gem_arr[self._jmask]
+        if name == "etf":
+            return bi._etf_arr[self._jmask]
         if name == "first_date":
             return bi._first_dates[self._jmask]
         return None
@@ -753,6 +798,56 @@ def ma30_slope_up(cache: dict, code: str, date, lookback: int = None) -> bool | 
     return bool(cur > past)
 
 
+def ma30_rising_weeks(cache: dict, code: str, date, weeks: int) -> bool | None:
+    """周K线 MA30 是否连续 weeks 周上升 (建仓趋势确认)
+
+    判定 MA30(t) > MA30(t-1) > ... > MA30(t-weeks), 其中 t 为当前周
+    (未走完的一周用当日收盘补齐, 与 ma30_slope_up 口径一致)。
+    None = 周线数据不足, 不做判断; weeks<=0 = 不启用该条件。
+    """
+    weeks = int(weeks or 0)
+    if weeks <= 0:
+        return None
+    item = cache.get(code) if cache else None
+    if item is None or date is None:
+        return None
+    d = pd.Timestamp(date).to_datetime64()
+    prefix = item["prefix"]
+    nwk = len(item["wk_idx"])
+    i = int(np.searchsorted(item["wk_idx"], d, side="left"))
+    beyond = i >= nwk
+    if beyond:
+        i = nwk - 1
+    # 需要 ma30[i-1] ... ma30[i-weeks] 均有效 (索引 >= 29), 且当周补齐数据可用
+    if i < 29 + weeks:
+        return None
+    cur_sum = prefix[i] - prefix[i - 29]
+    if beyond:
+        cur = (cur_sum + (prefix[min(i + 1, len(prefix) - 1)] - prefix[i])) / 30.0
+    else:
+        di = int(np.searchsorted(item["dates"], d, side="right")) - 1
+        if di < 0:
+            return None
+        close_now = item["closes"][di]
+        if not np.isfinite(close_now):
+            return None
+        cur = (cur_sum + close_now) / 30.0
+
+    ma30 = item["ma30"]
+    prev = ma30[i - 1]
+    if not (np.isfinite(cur) and np.isfinite(prev)):
+        return None
+    if cur <= prev:                      # 当周 MA30 未上升
+        return False
+    for k in range(1, weeks):            # 之前各周同样逐周上升
+        a, b = ma30[i - k], ma30[i - k - 1]
+        if not (np.isfinite(a) and np.isfinite(b)):
+            return None
+        if a <= b:
+            return False
+    return True
+
+
 _STATIC_META_CACHE = {}
 
 # 全市场过滤器预计算缓存, 键 (id(feat), ma30_lb):
@@ -799,23 +894,42 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                                 f_map: dict = None, div_map: dict = None,
                                 ma30_up_only: bool = True,
                                 ma30_lookback: int = 5,
-                                ma30_cache: dict = None) -> list:
+                                ma30_entry_weeks: int = 0,
+                                ma30_cache: dict = None,
+                                pool_type: str = "stock",
+                                etf_mom_days: int = 60,
+                                etf_min_amount: float = 0.5,
+                                etf_min_history: int = 120,
+                                premium_map: dict = None,
+                                flow_map: dict = None,
+                                premium_cap: float = 0.0,
+                                flow_min: float | None = None,
+                                market_ok: bool | None = None) -> list:
     """
-    市值策略股票池过滤:
-    - CrossSection 输入走向量化快路径 (numpy 掩码, 绕开逐标的 dict 构造, 1000x 快)
-    - 普通 dict 输入保留原逐标的逻辑 (回退路径, 兼容函数式选股等)
-    - 排除创业板 (30) / 科创板 (688) / 北交所 (8/4) — 北交所已由数据层排除
-    - 市值 [cap_min, cap_max] 亿之间
-    - 上市 >= min_listed_years 年 / 周K线 MA30 上升 / 不良标的剔除
-    - 按市值从小到大排列
+    标的池过滤 (股票池 / ETF 池共用入口, pool_type 分流):
+    - stock: 市值区间 + 上市年限 + 财务/分红剔除 + 周K MA30 上升, 按市值升序
+      (显式排除 ETF/LOF: 场内基金 outstanding_share 缺失, cap_yi=0 会混进小市值池)
+    - etf: 无财务/分红/市值过滤, 按「近 N 日涨幅」降序排名,
+      并叠加 20 日均成交额流动性门槛 + 最少K线长度 + 周K MA30 趋势确认
+
+    CrossSection 输入走向量化快路径 (numpy 掩码); 普通 dict 输入走回退路径。
     """
+    if pool_type == "etf":
+        return _filter_etf_universe(
+            snap, feat=feat, date=date, mom_days=etf_mom_days,
+            min_amount=etf_min_amount, min_history=etf_min_history,
+            ma30_up_only=ma30_up_only, ma30_lookback=ma30_lookback,
+            ma30_entry_weeks=ma30_entry_weeks, ma30_cache=ma30_cache,
+            premium_map=premium_map, flow_map=flow_map,
+            premium_cap=premium_cap, flow_min=flow_min, market_ok=market_ok)
+
     # --- CrossSection 向量化快路径 ---
     if isinstance(snap, CrossSection):
         return _filter_crosssection_vec(
             snap, feat, date, cap_min, cap_max, min_listed_years,
             exclude_st, exclude_ocf_diverge, exclude_nonop_profit,
             exclude_no_dividend, dividend_years, f_map, div_map,
-            ma30_up_only, ma30_lookback, ma30_cache)
+            ma30_up_only, ma30_lookback, ma30_entry_weeks, ma30_cache)
 
     # --- dict 输入: 原逐标的逻辑 (回退) ---
     any_fund_filter = exclude_st or exclude_ocf_diverge or exclude_nonop_profit
@@ -834,6 +948,9 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
         if pure is None:
             pure = code[2:] if code.startswith(("sh", "sz")) else code
         if pure.startswith(("30", "688")):
+            continue
+        # 股票池显式排除场内基金 (ETF/LOF 无市值数据, 不能进小市值排序)
+        if price_limits.is_etf(code):
             continue
         mc = row.get("cap_yi", np.nan)
         if np.isnan(mc) or mc <= 0 or mc < cap_min or mc > cap_max:
@@ -859,6 +976,9 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
         if ma30_up_only and ma30_cache is not None and date is not None:
             if ma30_slope_up(ma30_cache, code, date) is False:
                 continue
+            if ma30_entry_weeks and ma30_rising_weeks(
+                    ma30_cache, code, date, ma30_entry_weeks) is False:
+                continue
         elif ma30_up_only and feat and code in feat:
             df = feat[code]
             close_col = "close" if "close" in df.columns else "adj_close"
@@ -874,6 +994,12 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                     ma30_past = wk[-30 - ma30_lookback:-ma30_lookback].mean()
                     if ma30_now <= ma30_past:
                         continue
+                if ma30_entry_weeks and len(wk) >= 30 + ma30_entry_weeks:
+                    # 连续 N 周周K MA30 逐周上升 (建仓趋势确认)
+                    seq = [wk[len(wk) - 30 - k:len(wk) - k].mean()
+                           for k in range(0, ma30_entry_weeks + 1)]
+                    if any(seq[k] <= seq[k + 1] for k in range(ma30_entry_weeks)):
+                        continue
         candidates.append((code, mc))
     candidates.sort(key=lambda x: x[1])
     return [c[0] for c in candidates]
@@ -883,7 +1009,8 @@ def _filter_crosssection_vec(cs: "CrossSection", feat, date,
                               cap_min, cap_max, min_listed_years,
                               exclude_st, exclude_ocf_diverge, exclude_nonop_profit,
                               exclude_no_dividend, dividend_years, f_map, div_map,
-                              ma30_up_only, ma30_lookback, ma30_cache) -> list:
+                              ma30_up_only, ma30_lookback, ma30_entry_weeks,
+                              ma30_cache) -> list:
     """CrossSection 输入的向量化过滤版本 (直接 numpy 掩码, 零 dict 构造)
 
     预构建静态过滤器 (gem, first_dates) + MA30 日频布尔矩阵, 逐日过滤退化为
@@ -903,6 +1030,11 @@ def _filter_crosssection_vec(cs: "CrossSection", feat, date,
     if gem is not None:
         mask &= ~gem
 
+    # --- 场内基金 (ETF/LOF) 不进股票池 ---
+    etf = cs.static_filter("etf")
+    if etf is not None:
+        mask &= ~etf
+
     # --- 上市年限 (BarIndex 预构建 first_dates, 直接 numpy 比较) ---
     if mask.any():
         first_dates = cs.static_filter("first_date")
@@ -914,7 +1046,8 @@ def _filter_crosssection_vec(cs: "CrossSection", feat, date,
 
     # --- MA30 上升 (预构建日频矩阵, 取一行掩码) ---
     if ma30_up_only and ma30_cache is not None and date is not None and mask.any():
-        ma30_mat = _get_ma30_up_matrix(cs._bar_index, ma30_cache, ma30_lookback)
+        ma30_mat = _get_ma30_up_matrix(cs._bar_index, ma30_cache, ma30_lookback,
+                                       ma30_entry_weeks)
         if ma30_mat is not None:
             row_idx = cs._i
             if 0 <= row_idx < ma30_mat.shape[0]:
@@ -929,16 +1062,128 @@ def _filter_crosssection_vec(cs: "CrossSection", feat, date,
     return [codes[j] for j in picked]
 
 
-def _get_ma30_up_matrix(bar_index, ma30_cache, lookback) -> np.ndarray | None:
+def _filter_etf_universe(snap, feat: dict = None, date=None,
+                         mom_days: int = 60, min_amount: float = 0.5,
+                         min_history: int = 120,
+                         ma30_up_only: bool = True, ma30_lookback: int = 5,
+                         ma30_entry_weeks: int = 0, ma30_cache: dict = None,
+                         premium_map: dict = None, flow_map: dict = None,
+                         premium_cap: float = 0.0,
+                         flow_min: float | None = None,
+                         market_ok: bool | None = None) -> list:
+    """ETF 池筛选: 动量排名 (近 N 日涨幅降序)
+
+    与股票池的差异 (ETF 没有财务/分红/市值/换手/ST 概念):
+      1. 只保留场内基金 (price_limits.is_etf)
+      2. 流动性: 近 20 日日均成交额 >= min_amount 亿元 (ETF 无市值, 用成交额代替)
+      3. 数据长度: 上市/有行情 >= min_history 根K线 (新 ETF 数据不足不参与排序)
+      4. 趋势: 周K MA30 向上 (+ 可选连续 N 周上升的建仓确认), 复用股票池的预计算矩阵
+      5. 按近 mom_days 日涨幅从大到小排序 (20 或 60 日)
+      6. 溢价过滤: 当日溢价率 > premium_cap(%) 剔除 (QDII 溢价回落是主要亏损源)
+      7. 资金流: 近 5 日净申购/规模 < flow_min(%) 剔除
+      8. 市场级风控: market_ok=False (全市场 ETF 资金持续净流出) 时返回空池 → 触发清仓
+
+    说明: 溢价/资金流数据缺失 (未同步或历史不可得) 时视为「无信号」, 不剔除标的,
+    避免接入初期把整个池子误删; market_ok=None 同样视为不拦截。
+    """
+    if market_ok is False:
+        return []
+    mom_col = f"ret_{int(mom_days)}"
+    if isinstance(snap, CrossSection):
+        codes = snap._codes[snap._jmask]
+        if len(codes) == 0:
+            return []
+        etf = snap.static_filter("etf")
+        if etf is None:
+            return []
+        mask = etf.copy()
+
+        amt = snap.col("amount_ma20")
+        mask &= np.isfinite(amt) & (amt >= float(min_amount) * 1e8)
+
+        ret = snap.col(mom_col)
+        if not np.isfinite(ret).any():      # 兼容旧因子缓存
+            ret = snap.col("ret_60")
+        mask &= np.isfinite(ret)
+
+        # 溢价 / 资金流 (仅在有数据的标的上生效)
+        if premium_cap and premium_cap > 0 and premium_map:
+            pv = np.array([premium_map.get(c, np.nan) for c in codes], dtype=float)
+            mask &= ~(np.isfinite(pv) & (pv > float(premium_cap)))
+        if flow_min is not None and flow_map:
+            fv = np.array([flow_map.get(c, np.nan) for c in codes], dtype=float)
+            mask &= ~(np.isfinite(fv) & (fv < float(flow_min)))
+
+        date_ts = pd.Timestamp(date) if date is not None else None
+        first_dates = snap.static_filter("first_date")
+        if first_dates is not None and date_ts is not None:
+            dt = np.datetime64(date_ts.to_datetime64())
+            age_days = (dt - first_dates).astype("timedelta64[D]").astype(float)
+            # 交易日数量约等于日历天数 × 250/365
+            approx_bars = age_days * 250.0 / 365.0
+            mask &= ~((approx_bars < int(min_history)) & np.isfinite(approx_bars))
+
+        if ma30_up_only and ma30_cache is not None and date is not None and mask.any():
+            ma30_mat = _get_ma30_up_matrix(snap._bar_index, ma30_cache,
+                                           ma30_lookback, ma30_entry_weeks)
+            if ma30_mat is not None and 0 <= snap._i < ma30_mat.shape[0]:
+                mask &= ma30_mat[snap._i, snap._jmask]
+        if not mask.any():
+            return []
+        sort_ret = np.where(mask, ret, -np.inf)
+        order = np.argsort(-sort_ret, kind="stable")
+        return [codes[j] for j in order[mask[order]]]
+
+    # --- dict 回退路径 ---
+    date_ts = pd.Timestamp(date) if date is not None else None
+    out = []
+    for code, row in snap.items():
+        if not price_limits.is_etf(code):
+            continue
+        amt = row.get("amount_ma20", np.nan)
+        if not np.isfinite(amt) or amt < float(min_amount) * 1e8:
+            continue
+        r = row.get(mom_col, np.nan)
+        if not np.isfinite(r):
+            r = row.get("ret_60", np.nan)
+        if not np.isfinite(r):
+            continue
+        if premium_cap and premium_cap > 0 and premium_map:
+            pv = premium_map.get(code)
+            if pv is not None and float(pv) > float(premium_cap):
+                continue
+        if flow_min is not None and flow_map:
+            fv = flow_map.get(code)
+            if fv is not None and float(fv) < float(flow_min):
+                continue
+        if feat and code in feat and date_ts is not None:
+            df = feat[code]
+            if int((df["date"] <= date_ts).sum()) < int(min_history):
+                continue
+        if ma30_up_only and ma30_cache is not None and date is not None:
+            if ma30_slope_up(ma30_cache, code, date) is False:
+                continue
+            if ma30_entry_weeks and ma30_rising_weeks(
+                    ma30_cache, code, date, ma30_entry_weeks) is False:
+                continue
+        out.append((code, float(r)))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in out]
+
+
+def _get_ma30_up_matrix(bar_index, ma30_cache, lookback,
+                        weeks: int = 0) -> np.ndarray | None:
     """预构建 [D, N] 布尔矩阵, 记录每日每只标的 MA30 是否向上
 
     严格对齐 ma30_slope_up 的逐日口径 (含未走完一周用当日收盘补齐、beyond 边界等),
     构建一次 ~1s (5000×900), 之后逐日过滤只是取一行布尔数组, 无 Python 循环。
+    weeks>0 时额外要求 MA30 连续 weeks 周逐周上升 (建仓趋势确认)。
     缓存挂在 bar_index 实例上, 生命周期与 bar_index 一致。
     """
     if bar_index is None:
         return None
-    cache_attr = f"_ma30_up_mat_{lookback}"
+    weeks = int(weeks or 0)
+    cache_attr = f"_ma30_up_mat_{lookback}_{weeks}"
     mat = getattr(bar_index, cache_attr, None)
     if mat is not None:
         return mat
@@ -959,14 +1204,15 @@ def _get_ma30_up_matrix(bar_index, ma30_cache, lookback) -> np.ndarray | None:
         closes = item["closes"]
         dates_ns = item["dates"]
         nwk = len(wk_idx)
+        ma30 = item["ma30"]
 
         # --- 逐日查找 ---
         wi = np.searchsorted(wk_idx, dates_arr, side="left")  # 第一个 wk_idx >= date
         beyond = wi >= nwk
         wi_eff = np.where(beyond, nwk - 1, wi)
 
-        # 有效日期: 有足够的历史 (i >= 29 + lb)
-        valid = wi_eff >= (29 + lb)
+        # 有效日期: 有足够的历史 (i >= 29 + max(lookback, 连续上升周数))
+        valid = wi_eff >= (29 + max(lb, weeks))
 
         if not valid.any():
             continue
@@ -993,9 +1239,25 @@ def _get_ma30_up_matrix(bar_index, ma30_cache, lookback) -> np.ndarray | None:
         past_idx = wi_eff - lb
         past = np.full(D, np.nan)
         in_range = past_idx >= 0
-        past[in_range] = item["ma30"][past_idx[in_range]]
+        past[in_range] = ma30[past_idx[in_range]]
 
         mask_j = valid & np.isfinite(cur) & np.isfinite(past) & (cur > past)
+
+        # --- 连续 weeks 周逐周上升: MA30(t) > MA30(t-1) > ... > MA30(t-weeks) ---
+        if weeks > 0:
+            def _lookup(offset):
+                idx = wi_eff - offset
+                arr = np.full(D, np.nan)
+                ok = idx >= 0
+                arr[ok] = ma30[idx[ok]]
+                return arr
+
+            prev = _lookup(1)
+            mask_j &= np.isfinite(prev) & (cur > prev)
+            for k in range(1, weeks):
+                a, b = _lookup(k), _lookup(k + 1)
+                mask_j &= np.isfinite(a) & np.isfinite(b) & (a > b)
+
         mat[:, j] = mask_j
 
     setattr(bar_index, cache_attr, mat)
@@ -1423,6 +1685,14 @@ class MarketCapStrategy(BaseStrategy):
          - "topk_drop" (借 Qlib Topk-Drop): 持仓跌出候选前 top_n+rank_buffer 名才换出,
            空槽位才补新标的; 不做偏离度再平衡, 显著降低换手与成本
          - 指定标的池 (universe) 时没有排名概念, topk_drop 自动退化为偏离度再平衡
+      8. 标的池类型 pool_type:
+         - "stock": 上条 1-3 的股票口径 (市值区间 + 财务/分红/ST 剔除 + 市值升序)
+         - "etf": 场内 ETF 口径 (无财务/分红/市值概念), 按近 etf_mom_days 日涨幅降序排名,
+           叠加近 20 日日均成交额 >= etf_min_amount 亿元 的流动性门槛、最少
+           etf_min_history 根K线的数据长度门槛; 建仓/调仓/撮合/成本与股票版完全一致
+         - ETF 风控因子 (数据来自华泰柏瑞增强表, 缺失时自动不拦截):
+           溢价率 > etf_premium_cap(%) 剔除; 近5日净申购/规模 < etf_flow_min(%) 剔除;
+           etf_mkt_flow_guard=True 时全市场股票型 ETF 资金持续净流出 → 清仓
     """
 
     name = "市值策略"
@@ -1433,8 +1703,30 @@ class MarketCapStrategy(BaseStrategy):
                  exclude_st=True, exclude_ocf_diverge=True,
                  exclude_nonop_profit=True, exclude_no_dividend=True,
                  dividend_years=3, ma30_lookback=5, universe=None,
-                 ma30_exit=True, rebalance_mode="deviation", rank_buffer=2):
+                 ma30_exit=True, ma30_entry_weeks=2,
+                 rebalance_mode="deviation", rank_buffer=2,
+                 check_freq="daily",
+                 pool_type="stock", etf_mom_days=60,
+                 etf_min_amount=0.5, etf_min_history=120,
+                 etf_premium_cap=1.0, etf_flow_min=None,
+                 etf_mkt_flow_guard=False, etf_mkt_flow_days=5):
         self.top_n = int(top_n)
+        # 标的池类型: stock=股票(市值+财务筛选) / etf=ETF(动量排名+流动性门槛)
+        # 两类共用同一套建仓/调仓/撮合逻辑, 只有选品规则不同
+        self.pool_type = str(pool_type)
+        self.etf_mom_days = int(etf_mom_days)          # 动量窗口: 20 / 60 日涨幅
+        self.etf_min_amount = float(etf_min_amount)    # 近20日日均成交额下限 (亿元)
+        self.etf_min_history = int(etf_min_history)    # 最少K线根数 (次新ETF数据不足)
+        # ETF 风控因子 (数据来自华泰柏瑞增强表, 缺失时自动不拦截):
+        # 溢价率上限(%): 超过则剔除, 0=关闭; QDII 高溢价回落是主要亏损源
+        self.etf_premium_cap = float(etf_premium_cap or 0.0)
+        # 近5日净申购/规模(%) 下限: 低于则剔除, None=关闭 (负值=允许小幅流出)
+        self.etf_flow_min = None if etf_flow_min is None else float(etf_flow_min)
+        # 市场级风控: 全市场股票型 ETF 资金持续净流出时不开新仓并清仓
+        self.etf_mkt_flow_guard = bool(etf_mkt_flow_guard)
+        self.etf_mkt_flow_days = int(etf_mkt_flow_days)
+        self._etf_ext = None        # {premium/flow/market} 按日索引的因子字典
+        self._mkt_ok = None         # {date: 市场资金流是否健康}
         # 标的池: 指定后跳过市值/财务选股, 只在这些标的内建仓与调仓 (单标的验证用)
         self.universe = [str(c) for c in universe] if universe else None
         self.cap_min = float(cap_min)
@@ -1450,9 +1742,15 @@ class MarketCapStrategy(BaseStrategy):
         self.dividend_years = int(dividend_years)
         self.ma30_lookback = int(ma30_lookback)  # 周K线 MA30 斜率判断回看周数
         self.ma30_exit = bool(ma30_exit)         # 周K线 MA30 拐头向下是否清仓换出
+        # 建仓趋势确认: 周K MA30 需连续 N 周上升 (0=关闭), 避免刚建仓就遇 MA30 走弱
+        self.ma30_entry_weeks = int(ma30_entry_weeks)
         # 调仓方式: deviation=偏离度再平衡 (旧逻辑); topk_drop=排名缓冲 (借 Qlib Topk-Drop)
         self.rebalance_mode = str(rebalance_mode)
         self.rank_buffer = int(rank_buffer)      # topk_drop: 排名跌出 top_n+rank_buffer 才换出
+        # 排名检查频率: daily=每日; weekly=每周最后一个交易日
+        # (ETF 60日动量排名日间噪声大, 日频检查会带来无谓换手与成本)
+        self.check_freq = str(check_freq)
+        self._check_days = None
 
         # 运行时状态 (由 on_init / on_bar 维护)
         self.portfolio = None
@@ -1474,8 +1772,46 @@ class MarketCapStrategy(BaseStrategy):
             self._ma30_cache = build_ma30_cache(self.feat, self.ma30_lookback)
         return self._ma30_cache
 
+    def _ensure_etf_ext(self) -> dict:
+        """按需加载 ETF 增强因子 (溢价/资金流/全市场资金流), 只读库一次"""
+        if self._etf_ext is None:
+            from data_store import load_etf_factor_maps
+            self._etf_ext = load_etf_factor_maps()
+            if self.etf_mkt_flow_guard:
+                self._mkt_ok = {}
+                vals = []
+                for d in sorted(self._etf_ext["market"]):
+                    v = self._etf_ext["market"][d].get("stock")
+                    if v is None:
+                        v = self._etf_ext["market"][d].get("all")
+                    vals.append(v if v is not None else np.nan)
+                    win = [x for x in vals[-self.etf_mkt_flow_days:] if np.isfinite(x)]
+                    need = min(2, self.etf_mkt_flow_days)
+                    self._mkt_ok[d] = (sum(win) >= 0) if len(win) >= need else True
+        return self._etf_ext
+
     def _selection_kwargs(self, date):
         """选股过滤参数: 财务/分红上下文按 as-of 加载 (避免未来函数)"""
+        if self.pool_type == "etf":
+            # ETF 不依赖财务/分红/市值: 只给动量/流动性/数据长度 + MA30 上下文
+            kw = dict(pool_type="etf", etf_mom_days=self.etf_mom_days,
+                      etf_min_amount=self.etf_min_amount,
+                      etf_min_history=self.etf_min_history,
+                      ma30_up_only=True, ma30_lookback=self.ma30_lookback,
+                      ma30_entry_weeks=self.ma30_entry_weeks,
+                      ma30_cache=self._ensure_ma30_cache(), date=date)
+            # 溢价/资金流/市场风控: 仅有增强数据时才参与, 否则保持原行为
+            if (self.etf_premium_cap or self.etf_flow_min is not None
+                    or self.etf_mkt_flow_guard):
+                ext = self._ensure_etf_ext()
+                d = str(pd.Timestamp(date))[:10] if date is not None else None
+                kw.update(premium_cap=self.etf_premium_cap,
+                          premium_map=ext["premium"].get(d),
+                          flow_min=self.etf_flow_min,
+                          flow_map=ext["flow"].get(d))
+                if self.etf_mkt_flow_guard and self._mkt_ok is not None:
+                    kw["market_ok"] = self._mkt_ok.get(d, True)
+            return kw
         f_map = None
         if self.exclude_st or self.exclude_ocf_diverge or self.exclude_nonop_profit:
             f_map = fundamental_asof(date)["map"]
@@ -1491,6 +1827,7 @@ class MarketCapStrategy(BaseStrategy):
                     dividend_years=self.dividend_years,
                     ma30_up_only=True,
                     ma30_lookback=self.ma30_lookback,
+                    ma30_entry_weeks=self.ma30_entry_weeks,
                     ma30_cache=self._ensure_ma30_cache(),
                     f_map=f_map, div_map=div_map, date=date)
 
@@ -1498,6 +1835,19 @@ class MarketCapStrategy(BaseStrategy):
         self.portfolio = context.get("portfolio")
         self.bars = context.get("bars")
         self.feat = context.get("feat")
+        # 每周调仓: 预计算「每个自然周最后一个交易日」, 排名检查只在这些日子做
+        self._check_days = None
+        if self.check_freq == "weekly" and self.bars is not None:
+            dates = pd.DatetimeIndex(self.bars.all_dates)
+            wk = dates.strftime("%Y-%W")
+            self._check_days = set(pd.Series(dates).groupby(wk.to_numpy()).max().tolist())
+            self._check_days = {pd.Timestamp(d) for d in self._check_days}
+
+    def _is_check_day(self, date) -> bool:
+        """排名/换股检查日: daily=每个交易日, weekly=每周最后一个交易日"""
+        if self.check_freq != "weekly" or self._check_days is None:
+            return True
+        return pd.Timestamp(date) in self._check_days
 
     def _current_cap(self, code, date) -> float:
         """取标的当日市值 (亿)"""
@@ -1558,6 +1908,17 @@ class MarketCapStrategy(BaseStrategy):
         ma30_now = closes[-30:].mean()
         ma30_past = closes[-need:-self.ma30_lookback].mean()
         return ma30_now <= ma30_past
+
+    def _ma30_entry_ok(self, code, date) -> bool:
+        """建仓趋势确认: 周K MA30 连续 N 周上升 (0=关闭)
+
+        数据不足时不拦截 (与 MA30 选股过滤的放行口径一致)。
+        """
+        weeks = int(self.ma30_entry_weeks)
+        if weeks <= 0:
+            return True
+        up = ma30_rising_weeks(self._ensure_ma30_cache(), code, date, weeks)
+        return up is not False
 
     def _build_rebalance(self, date, targets: dict, extra_cash: float = 0.0) -> list:
         """
@@ -1642,7 +2003,8 @@ class MarketCapStrategy(BaseStrategy):
         #     空槽位才补最靠前的候选; 不做偏离度再平衡
         #     → 换手从"每天全额重排"降到"只在排名变化时换股"
         # =========================================
-        if self.rebalance_mode == "topk_drop" and snap and not self.universe:
+        if (self.rebalance_mode == "topk_drop" and snap and not self.universe
+                and self._is_check_day(date)):
             ranked = _filter_market_cap_universe(
                 snap, feat=self.feat, **self._selection_kwargs(date))
             rank_map = {c: i + 1 for i, c in enumerate(ranked)}
@@ -1695,6 +2057,8 @@ class MarketCapStrategy(BaseStrategy):
                     if px is None or np.isnan(px):
                         continue
                     if self.ma30_exit and self._ma30_is_decreasing(code, date):
+                        continue
+                    if not self._ma30_entry_ok(code, date):
                         continue
                     selected.append(code)
             else:

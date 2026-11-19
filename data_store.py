@@ -9,6 +9,7 @@ SQLite 数据层 —— 历史回测数据 + 实时策略数据 统一存储
   download_log  下载日志 (数据覆盖范围管理)
 """
 import os
+import time
 import sqlite3
 import random
 import numpy as np
@@ -79,6 +80,17 @@ def init_db():
         fingerprint TEXT,             -- 数据指纹(股票数+日期范围), 数据更新后自动失效
         payload TEXT,                 -- JSON: metrics + curve + calendar
         created_at TEXT
+    );
+
+    -- ===== 回测结果 (按策略+参数指纹保存, 参数不变时页面直接回显) =====
+    CREATE TABLE IF NOT EXISTS backtest_result (
+        strategy  TEXT NOT NULL,
+        param_sig TEXT NOT NULL,      -- 参数签名 (含初始资金/区间/成本/策略参数)
+        params    TEXT,               -- JSON: 参数明细
+        fingerprint TEXT,             -- 运行时的数据指纹
+        payload   TEXT,               -- JSON: curve/trades/fills/holdings/performance
+        created_at TEXT,
+        PRIMARY KEY (strategy, param_sig)
     );
 
     -- ===== 数据覆盖索引: 每个标的已同步到哪个区间 (只补缺口) =====
@@ -189,6 +201,97 @@ def init_db():
         conn.execute("ALTER TABLE news ADD COLUMN link TEXT")
     except Exception:
         pass
+
+    # ===== 华泰柏瑞 ETF 增强数据 (htbr_source 数据源) =====
+    # 单位统一: 金额一律「元」, 份额一律「份」; 取数时 unit=3(万元/万份) 后 ×1e4
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS etf_meta (
+        symbol      TEXT PRIMARY KEY,   -- sh510300
+        secu_code   TEXT,               -- 510300
+        inner_code  TEXT,               -- 基金内码 (fund-daily-quote.fundobject 回填)
+        fund_name   TEXT,
+        updated_at  TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS etf_quote_ext (
+        symbol          TEXT NOT NULL,
+        date            TEXT NOT NULL,
+        turnover_value  REAL,           -- 成交额(元)
+        turnover_volume REAL,           -- 成交量(股)
+        turnover_rate   REAL,           -- 换手率(%)
+        avg_price       REAL,
+        change_pct      REAL,
+        range_pct       REAL,
+        discount_ratio  REAL,           -- 贴水率(%)
+        premium_ratio   REAL,           -- 溢价率(%)
+        is_suspend      INTEGER,
+        updated_at      TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+
+    CREATE TABLE IF NOT EXISTS etf_capital (
+        symbol          TEXT NOT NULL,
+        date            TEXT NOT NULL,
+        unit_nv         REAL,           -- 单位净值(元)
+        close_price     REAL,
+        exchange_shares REAL,           -- 场内份额(份)
+        market_scale    REAL,           -- 规模(元)
+        net_sub_shares  REAL,           -- 净申购份额(份)
+        finance_net_buy REAL,           -- 融资净买入(元)
+        finance_balance REAL,           -- 融资余额(元)
+        near3_netbuy    REAL,
+        near5_netbuy    REAL,
+        near20_netbuy   REAL,
+        near60_netbuy   REAL,
+        updated_at      TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+
+    CREATE TABLE IF NOT EXISTS etf_margin (
+        symbol              TEXT NOT NULL,
+        date                TEXT NOT NULL,
+        finance_buy         REAL,       -- 融资买入额(元)
+        finance_refund      REAL,       -- 融资偿还额(元)
+        finance_net_buy     REAL,       -- 融资净买入额(元)
+        security_sell_vol   REAL,       -- 融券卖出量
+        security_refund_vol REAL,       -- 融券偿还量
+        security_net_sell_vol REAL,     -- 融券净卖出量
+        finance_balance     REAL,       -- 期末融资余额(元)
+        security_balance    REAL,       -- 期末融券余额
+        security_volume     REAL,       -- 期末融券余量
+        finance_pct         REAL,       -- 融资余额占流通市值(%)
+        security_pct        REAL,       -- 融券余额占流通市值(%)
+        updated_at          TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+
+    CREATE TABLE IF NOT EXISTS etf_market_flow (
+        date       TEXT NOT NULL,
+        category   TEXT NOT NULL,       -- all/stock/bond/commodity/monetary/qdii
+        buy_value  REAL,
+        sell_value REAL,
+        net_value  REAL,
+        etf_count  INTEGER,
+        updated_at TEXT,
+        PRIMARY KEY (date, category)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_quote_ext_date  ON etf_quote_ext(date);
+    CREATE INDEX IF NOT EXISTS idx_capital_date    ON etf_capital(date);
+    CREATE INDEX IF NOT EXISTS idx_margin_date     ON etf_margin(date);
+
+    CREATE TABLE IF NOT EXISTS etf_valuation (
+        symbol        TEXT NOT NULL,
+        report_date   TEXT NOT NULL,
+        total_mv      REAL,             -- 持仓总市值(亿元, 原始口径)
+        negotiable_mv REAL,
+        pe_ttm        REAL,
+        pb            REAL,
+        dividend_ratio REAL,
+        updated_at    TEXT,
+        PRIMARY KEY (symbol, report_date)
+    );
+    """)
     conn.commit()
     conn.close()
 
@@ -367,6 +470,61 @@ def save_backtest_cache(cache_key: str, strategy: str, params: str,
     conn.close()
 
 
+# ==================== 回测结果 (参数不变时长期回显) ====================
+
+def get_backtest_result(strategy: str, param_sig: str) -> dict | None:
+    """按 (策略, 参数签名) 取最近一次回测结果 (含成交/持仓明细)"""
+    return _query_backtest_result(
+        "WHERE strategy=? AND param_sig=?", (strategy, param_sig))
+
+
+def get_latest_backtest_result(strategy: str) -> dict | None:
+    """取该策略最近一次回测结果 (任意参数), 用于参数变更后先回显旧结果"""
+    return _query_backtest_result(
+        "WHERE strategy=? ORDER BY created_at DESC LIMIT 1", (strategy,))
+
+
+def _query_backtest_result(where: str, args: tuple) -> dict | None:
+    import json as _json
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT payload, params, fingerprint, created_at, param_sig "
+        f"FROM backtest_result {where}", args).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        payload = _json.loads(row[0])
+    except Exception:
+        return None
+    try:
+        params = _json.loads(row[1]) if row[1] else {}
+    except Exception:
+        params = {}
+    return {"payload": payload, "params": params,
+            "fingerprint": row[2] or "", "created_at": row[3] or "",
+            "param_sig": row[4] or ""}
+
+
+def save_backtest_result(strategy: str, param_sig: str, params: dict,
+                         fingerprint: str, payload: dict):
+    """保存回测结果; 同参数重复回测覆盖, 每个策略只保留最近 10 组参数"""
+    import json as _json
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO backtest_result "
+        "(strategy, param_sig, params, fingerprint, payload, created_at) VALUES (?,?,?,?,?,?)",
+        (strategy, param_sig, _json.dumps(params, ensure_ascii=False, default=str),
+         fingerprint, _json.dumps(payload, ensure_ascii=False, default=str),
+         datetime.now().isoformat(timespec="seconds")))
+    conn.execute(
+        "DELETE FROM backtest_result WHERE strategy=? AND param_sig NOT IN "
+        "(SELECT param_sig FROM backtest_result WHERE strategy=? "
+        " ORDER BY created_at DESC LIMIT 10)", (strategy, strategy))
+    conn.commit()
+    conn.close()
+
+
 # ==================== 下载 (akshare → SQLite) ====================
 
 def get_main_board_codes(limit: int = None) -> list[tuple[str, str]]:
@@ -383,18 +541,249 @@ def get_main_board_codes(limit: int = None) -> list[tuple[str, str]]:
     return list(zip(mb["code"], mb["name"]))
 
 
-def get_etf_codes() -> list[tuple[str, str]]:
-    """全部场内 ETF 列表 [(sh510300, 名称)]"""
+_ETF_CACHE = {"ts": 0.0, "data": None}
+_ETF_CACHE_TTL = 3600.0     # 清单缓存 1 小时, 避免页面/worker 反复请求
+
+
+def _to_etf_symbol(code) -> str | None:
+    """代码归一化为 sh510300 / sz159915, 非场内 ETF 返回 None"""
+    s = str(code or "").strip().lower()
+    if s[:2] in ("sh", "sz"):
+        s = s[2:]
+    if len(s) != 6 or not s.isdigit():
+        return None
+    if not s.startswith(("51", "56", "58", "15")):
+        return None
+    return ("sh" if s.startswith(("51", "56", "58")) else "sz") + s
+
+
+def _etf_codes_em() -> list[tuple[str, str]]:
+    """东财 ETF 快照 (首选源)"""
     import akshare as ak
     df = ak.fund_etf_spot_em()
     out = []
     for _, r in df.iterrows():
-        code = str(r.get("代码", ""))
-        name = str(r.get("名称", ""))
-        if code.startswith(("51", "56", "58", "15", "159")):
-            sina = f"sh{code}" if code.startswith(("51", "56", "58")) else f"sz{code}"
-            out.append((sina, name))
+        sym = _to_etf_symbol(r.get("代码", ""))
+        if sym:
+            out.append((sym, str(r.get("名称", ""))))
     return out
+
+
+def _etf_codes_sina() -> list[tuple[str, str]]:
+    """新浪 ETF 分类行情 (备用源): 东财 push2 限流时仍可用"""
+    import akshare as ak
+    df = ak.fund_etf_category_sina(symbol="ETF基金")
+    out = []
+    for _, r in df.iterrows():
+        sym = _to_etf_symbol(r.get("代码", ""))
+        if sym:
+            out.append((sym, str(r.get("名称", ""))))
+    return out
+
+
+def _etf_codes_from_db() -> list[tuple[str, str]]:
+    """兜底: 库内已存在的 ETF (两个网络源都失败时至少保证增量补全不断档)"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM daily_bar WHERE asset_type='etf' ORDER BY symbol").fetchall()
+    conn.close()
+    return [(r[0], "") for r in rows]
+
+
+def get_etf_codes(use_cache: bool = True) -> list[tuple[str, str]]:
+    """全部场内 ETF 列表 [(sh510300, 名称)]
+
+    东财 fund_etf_spot_em 实测会抛 Push2RateLimitError, 因此:
+      1) 优先东财快照; 2) 失败退新浪分类行情; 3) 再失败退库内已知 ETF
+    成功结果缓存 1 小时, 避免限流时反复重试。
+    """
+    now = time.time()
+    if use_cache and _ETF_CACHE["data"] and now - _ETF_CACHE["ts"] < _ETF_CACHE_TTL:
+        return list(_ETF_CACHE["data"])
+    out = []
+    for fetcher in (_etf_codes_em, _etf_codes_sina):
+        try:
+            out = fetcher()
+        except Exception:
+            out = []
+        if out:
+            break
+    if not out:
+        out = _etf_codes_from_db()
+    if out:
+        _ETF_CACHE.update(ts=now, data=out)
+        return list(out)
+    return list(_ETF_CACHE["data"] or [])
+
+
+def etf_stats() -> dict:
+    """ETF 数据覆盖概览 (数据管理页展示)"""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT symbol), COUNT(*), MIN(date), MAX(date) "
+        "FROM daily_bar WHERE asset_type='etf'").fetchone()
+    conn.close()
+    return {"symbols": row[0] or 0, "bars": row[1] or 0,
+            "first_date": row[2] or "-", "last_date": row[3] or "-"}
+
+
+def _upsert_rows(table: str, cols: list[str], rows: list[dict]) -> int:
+    """通用批量写入 (INSERT OR REPLACE); rows 的键与 cols 同名, 缺省写 NULL"""
+    if not rows:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = []
+    for r in rows:
+        payload.append([r.get(c) for c in cols[:-1]] + [now])
+    conn = get_conn()
+    conn.executemany(
+        f"INSERT OR REPLACE INTO {table} ({','.join(cols)}) "
+        f"VALUES ({','.join(['?'] * len(cols))})", payload)
+    conn.commit()
+    n = len(payload)
+    conn.close()
+    return n
+
+
+def upsert_etf_meta(symbol: str, secu_code: str, inner_code: str | None,
+                    fund_name: str = "") -> None:
+    """记录 ETF 代码映射 (symbol ↔ 6位代码 ↔ 基金内码)"""
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO etf_meta (symbol, secu_code, inner_code, fund_name, updated_at) "
+        "VALUES (?,?,?,?,?)",
+        (symbol, secu_code, inner_code, fund_name,
+         datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+
+def etf_meta_map() -> dict:
+    """{symbol: inner_code} (仅包含已解析出内码的标的)"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT symbol, inner_code FROM etf_meta WHERE inner_code IS NOT NULL").fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def upsert_etf_quote_ext(symbol: str, rows: list[dict]) -> int:
+    cols = ["symbol", "date", "turnover_value", "turnover_volume", "turnover_rate",
+            "avg_price", "change_pct", "range_pct", "discount_ratio", "premium_ratio",
+            "is_suspend", "updated_at"]
+    for r in rows:
+        r["symbol"] = symbol
+    return _upsert_rows("etf_quote_ext", cols, rows)
+
+
+def upsert_etf_capital(symbol: str, rows: list[dict]) -> int:
+    cols = ["symbol", "date", "unit_nv", "close_price", "exchange_shares",
+            "market_scale", "net_sub_shares", "finance_net_buy", "finance_balance",
+            "near3_netbuy", "near5_netbuy", "near20_netbuy", "near60_netbuy", "updated_at"]
+    for r in rows:
+        r["symbol"] = symbol
+    return _upsert_rows("etf_capital", cols, rows)
+
+
+def upsert_etf_margin(symbol: str, rows: list[dict]) -> int:
+    cols = ["symbol", "date", "finance_buy", "finance_refund", "finance_net_buy",
+            "security_sell_vol", "security_refund_vol", "security_net_sell_vol",
+            "finance_balance", "security_balance", "security_volume",
+            "finance_pct", "security_pct", "updated_at"]
+    for r in rows:
+        r["symbol"] = symbol
+    return _upsert_rows("etf_margin", cols, rows)
+
+
+def upsert_etf_market_flow(rows: list[dict]) -> int:
+    cols = ["date", "category", "buy_value", "sell_value", "net_value",
+            "etf_count", "updated_at"]
+    return _upsert_rows("etf_market_flow", cols, rows)
+
+
+def upsert_etf_valuation(symbol: str, rows: list[dict]) -> int:
+    cols = ["symbol", "report_date", "total_mv", "negotiable_mv", "pe_ttm", "pb",
+            "dividend_ratio", "updated_at"]
+    for r in rows:
+        r["symbol"] = symbol
+    return _upsert_rows("etf_valuation", cols, rows)
+
+
+def etf_ext_stats() -> dict:
+    """ETF 增强数据覆盖 (数据管理页展示)"""
+    conn = get_conn()
+    q = lambda s: conn.execute(s).fetchone()
+    quote_n, quote_sym, quote_last = q(
+        "SELECT COUNT(*), COUNT(DISTINCT symbol), MAX(date) FROM etf_quote_ext")
+    cap_n, cap_sym, cap_last = q(
+        "SELECT COUNT(*), COUNT(DISTINCT symbol), MAX(date) FROM etf_capital")
+    mg_n, mg_last = q("SELECT COUNT(*), MAX(date) FROM etf_margin")
+    fl_n, fl_last = q("SELECT COUNT(*), MAX(date) FROM etf_market_flow")
+    meta_n = q("SELECT COUNT(*) FROM etf_meta")[0]
+    conn.close()
+    return {"meta_symbols": meta_n or 0,
+            "quote_bars": quote_n or 0, "quote_symbols": quote_sym or 0,
+            "quote_last": quote_last or "-",
+            "capital_bars": cap_n or 0, "capital_symbols": cap_sym or 0,
+            "capital_last": cap_last or "-",
+            "margin_bars": mg_n or 0, "margin_last": mg_last or "-",
+            "flow_bars": fl_n or 0, "flow_last": fl_last or "-"}
+
+
+def _has_year(table: str, symbol: str, year: int, min_rows: int = 200) -> bool:
+    """该标的是否已有某年的完整年度数据 (回补缺口判断)
+
+    规则: 行数 >= min_rows 视为完整; 当年数据从年初附近开始也视为完整,
+    避免只同步了近几日就把整年跳过。
+    """
+    b, e = f"{year}-01-01", f"{year}-12-31"
+    conn = get_conn()
+    n, first = conn.execute(
+        f"SELECT COUNT(*), MIN(date) FROM {table} WHERE symbol=? AND date BETWEEN ? AND ?",
+        (symbol, b, e)).fetchone()
+    conn.close()
+    if (n or 0) >= min_rows:
+        return True
+    return bool(year == datetime.now().year and first and str(first)[5:10] <= "02-15")
+
+
+def has_etf_quote_year(symbol: str, year: int) -> bool:
+    return _has_year("etf_quote_ext", symbol, year)
+
+
+def has_etf_capital_year(symbol: str, year: int) -> bool:
+    return _has_year("etf_capital", symbol, year)
+
+
+def load_etf_factor_maps() -> dict:
+    """ETF 增强因子 (按日期索引, 供回测 as-of 查询)
+
+    返回:
+      premium: {date: {symbol: 溢价率%}}      — etf_quote_ext.premium_ratio
+      flow:    {date: {symbol: 净申购强度%}}  — 近5日净申购 / 规模 × 100
+      market:  {date: {"stock": 亿元, "all": 亿元}} — 全市场 ETF 当日净流入
+    """
+    conn = get_conn()
+    premium, flow, market = {}, {}, {}
+    try:
+        for sym, d, v in conn.execute(
+                "SELECT symbol, date, premium_ratio FROM etf_quote_ext "
+                "WHERE premium_ratio IS NOT NULL"):
+            premium.setdefault(d, {})[sym] = float(v)
+        for sym, d, sub, scale in conn.execute(
+                "SELECT symbol, date, near5_netbuy, market_scale FROM etf_capital "
+                "WHERE near5_netbuy IS NOT NULL AND market_scale > 0"):
+            flow.setdefault(d, {})[sym] = float(sub) / float(scale) * 100.0
+        for d, cat, v in conn.execute(
+                "SELECT date, category, net_value FROM etf_market_flow "
+                "WHERE category IN ('all','stock') AND net_value IS NOT NULL"):
+            market.setdefault(d, {})[cat] = float(v) / 1e8
+    except sqlite3.OperationalError:
+        # 旧库未建增强表: 返回空因子, 策略保持原有行为
+        pass
+    finally:
+        conn.close()
+    return {"premium": premium, "flow": flow, "market": market}
 
 
 def _norm_day(d) -> str:
@@ -416,6 +805,10 @@ def download_etf_one(symbol: str, start: str, end: str) -> tuple[str, int]:
             return symbol, 0
         df = df.copy()
         df["date"] = pd.to_datetime(df["date"])
+        # 新浪 ETF 日线只有 volume (股), 没有成交额: 用 收盘价 × 成交量 折算,
+        # 否则 ETF 策略的「近20日日均成交额」流动性门槛会因 amount 全空而全部被剔除
+        if "amount" not in df.columns:
+            df["amount"] = df["close"] * df["volume"]
         s = pd.Timestamp(_norm_day(start))
         e = pd.Timestamp(_norm_day(end))
         df = df[(df["date"] >= s) & (df["date"] <= e)]
@@ -528,11 +921,12 @@ def update_all_bars(start: str, end: str, workers: int = 8, progress_cb=None) ->
         if pd.Timestamp(s) > pd.Timestamp(end):
             return symbol, 0
         try:
-            import akshare as ak
             if atype == "etf":
-                df = ak.fund_etf_hist_sina(symbol=symbol, start_date=s, end_date=end)
-            else:
-                df = _ak_stock_daily(symbol, s, end)
+                # fund_etf_hist_sina 不支持 start_date/end_date, 统一走 download_etf_one
+                # (内部拉全历史后本地裁剪, 金额由 收盘×成交量 补算)
+                _, n = download_etf_one(symbol, s, end)
+                return symbol, n
+            df = _ak_stock_daily(symbol, s, end)
             if df is None or df.empty:
                 return symbol, 0
             n = upsert_bars(symbol, df, asset_type=atype)
@@ -561,7 +955,7 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
     init_db()
     conn = get_conn()
     df = pd.read_sql(
-        "SELECT symbol,date,open,high,low,close,volume,amount,outstanding_share,turnover "
+        "SELECT symbol,date,open,high,low,close,volume,amount,outstanding_share,turnover,asset_type "
         "FROM daily_bar ORDER BY symbol,date", conn)
     conn.close()
 
@@ -569,7 +963,7 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
         import_csv_cache()
         conn = get_conn()
         df = pd.read_sql(
-            "SELECT symbol,date,open,high,low,close,volume,amount,outstanding_share,turnover "
+            "SELECT symbol,date,open,high,low,close,volume,amount,outstanding_share,turnover,asset_type "
             "FROM daily_bar ORDER BY symbol,date", conn)
         conn.close()
 
@@ -577,6 +971,13 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
         return {}
 
     df["date"] = pd.to_datetime(df["date"])
+    # 老数据兼容: 早期 ETF 由新浪源写入, amount 为空 (新浪只有 volume)。
+    # 用 收盘×成交量 回填, 否则 ETF 流动性门槛会把全部老 ETF 剔除。
+    etf_mask = df["asset_type"].fillna("") == "etf"
+    miss = etf_mask & df["amount"].isna()
+    if miss.any():
+        df.loc[miss, "amount"] = df.loc[miss, "close"] * df.loc[miss, "volume"]
+    df = df.drop(columns=["asset_type"])
     out = {}
     for sym, g in df.groupby("symbol", sort=False):
         out[sym] = g.drop(columns=["symbol"]).reset_index(drop=True)
@@ -585,6 +986,7 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
 
 # ==================== 因子缓存 (磁盘, 避免每次重启重算 80 秒) ====================
 FEAT_CACHE_PATH = os.path.join(DATA_DIR, "feat_cache.pkl")
+FEAT_CACHE_VERSION = 3      # 因子口径变更时 +1 (v3: ETF 份额折算复权)
 
 
 def load_feat_cached(fingerprint: str = None) -> dict:
@@ -598,7 +1000,8 @@ def load_feat_cached(fingerprint: str = None) -> dict:
         try:
             with open(p, "rb") as f:
                 d = pickle.load(f)
-            if d.get("fingerprint") == fingerprint and d.get("feat"):
+            if (d.get("fingerprint") == fingerprint and d.get("feat")
+                    and d.get("version") == FEAT_CACHE_VERSION):
                 return d["feat"]
         except Exception:
             pass
@@ -609,7 +1012,8 @@ def load_feat_cached(fingerprint: str = None) -> dict:
     try:
         tmp = p + ".tmp"
         with open(tmp, "wb") as f:
-            pickle.dump({"fingerprint": fingerprint, "feat": feat}, f, protocol=5)
+            pickle.dump({"fingerprint": fingerprint, "version": FEAT_CACHE_VERSION,
+                         "feat": feat}, f, protocol=5)
         os.replace(tmp, p)
     except Exception:
         pass

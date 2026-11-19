@@ -157,6 +157,18 @@ def after_close(fundamentals: bool = False):
         logger.info(f"盘后补全完成: {r}")
     except Exception as e:
         logger.error(f"盘后补全异常: {e}")
+    # ETF 清单同步: 次日新上市的 ETF 自动纳入并按缺口补历史
+    try:
+        r = data_manager.ensure_etf_universe()
+        logger.info(f"ETF 清单同步: {r}")
+    except Exception as e:
+        logger.error(f"ETF 清单同步异常: {e}")
+    # ETF 增强数据 (华泰柏瑞): 资金流/规模份额/两融/溢价, 受每日配额限制
+    try:
+        r = data_manager.ensure_etf_extras()
+        logger.info(f"ETF 增强数据: {r}")
+    except Exception as e:
+        logger.error(f"ETF 增强数据异常: {e}")
     try:
         symbols = data_store.list_symbols()[:10]
         logger.info(f"新闻: {news_fetcher.fetch_all_news(symbols=symbols)}")
@@ -188,6 +200,23 @@ def run_task(t: dict):
         ds = t["dataset"]
         if ds == "fundamental":
             r = data_manager.ensure_fundamentals(quarters=params.get("quarters", 4))
+        elif ds == "etf":
+            r = data_manager.ensure_etf_universe(params.get("start", "20200101"))
+        elif ds == "etf_extra":
+            r = data_manager.ensure_etf_extras(
+                top_n=params.get("top_n", 60), days=params.get("days", 5),
+                with_margin=params.get("with_margin", True),
+                with_valuation=params.get("with_valuation", True))
+        elif ds == "etf_backfill":
+            r = data_manager.backfill_etf_factors(
+                start_year=params.get("start_year", 2022),
+                top_n=params.get("top_n", 60),
+                max_calls=params.get("max_calls", 380),
+                with_capital=params.get("with_capital", True),
+                symbols=params.get("symbols"))
+        elif ds == "etf_flow_backfill":
+            r = data_manager.backfill_etf_market_flow(
+                start=params.get("start", "2020-01-01"))
         elif ds == "realtime":
             n = data_manager.ensure_realtime(params.get("symbols"))
             r = {"rows": n}

@@ -80,6 +80,8 @@ STRATEGY_REQUIREMENTS = {
     "小市值+高换手": {"datasets": ["daily_bar"], "lookback_days": 250},
     "短周期突破+量能": {"datasets": ["daily_bar"], "lookback_days": 120},
     "随机对照": {"datasets": ["daily_bar"], "lookback_days": 120},
+    "ETF策略": {"datasets": ["daily_bar"], "lookback_days": 250,
+               "note": "ETF 池按动量排名, 无财务/分红依赖"},
 }
 
 
@@ -192,6 +194,384 @@ def ensure_bars(symbols: list[str], start: str, end: str,
         time.sleep(0.2)
 
     return {"downloaded": done, "rows": rows, "skipped": p["skipped"]}
+
+
+def ensure_etf_universe(start: str = "20200101", end: str = None,
+                        progress_cb=None) -> dict:
+    """ETF 清单同步 + 自动补数
+
+    拉取最新场内 ETF 清单 (东财→新浪→库内兜底), 对清单内全部标的一次性
+    ensure_bars: 新上市的补全历史, 已有的只补最后日期之后的缺口。
+    盘后每天调用一次, 保证 ETF 策略候选池始终是最新的。
+    """
+    etfs = data_store.get_etf_codes()
+    symbols = [s for s, _ in etfs]
+    if not symbols:
+        return {"error": "ETF 清单获取失败", "universe": 0}
+    end = end or last_trading_day()
+    r = ensure_bars(symbols, start, end, progress_cb=progress_cb)
+    return {"universe": len(symbols), **r}
+
+
+# ==================== ETF 增强数据 (华泰柏瑞数据源) ====================
+
+def _fnum(v):
+    """字符串/数字 -> float; 空值或非法返回 None (不写 0)"""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _etf_pool(top_n: int = 60, lookback: int = 90, min_amount_yi: float = 0.5) -> list[str]:
+    """ETF 池 = 近 30 日选股记录中的 ETF ∪ 近 60 日动量前 top_n
+
+    动量用「近 20 个交易日涨幅」, 流动性用「近 20 日日均成交额(亿)」。
+    """
+    end = last_trading_day()
+    begin = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=lookback)).strftime("%Y-%m-%d")
+    conn = data_store.get_conn()
+    rows = conn.execute(
+        """
+        WITH t AS (
+            SELECT symbol, close, amount,
+                   ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY date DESC) rn
+            FROM daily_bar
+            WHERE asset_type='etf' AND date >= ? AND close > 0
+        )
+        SELECT symbol,
+               MAX(CASE WHEN rn = 1  THEN close END)  AS c_now,
+               MAX(CASE WHEN rn = 21 THEN close END)  AS c_20,
+               AVG(CASE WHEN rn <= 20 THEN amount END) AS amt_20
+        FROM t GROUP BY symbol
+        """, (begin,)).fetchall()
+    picks = conn.execute(
+        "SELECT DISTINCT symbol FROM pick_record WHERE pick_date >= ?", (begin,)).fetchall()
+    conn.close()
+
+    ranked = []
+    for sym, c_now, c_20, amt in rows:
+        if not c_now or not c_20 or not amt:
+            continue
+        if amt < min_amount_yi * 1e8:
+            continue
+        ranked.append((c_now / c_20 - 1.0, sym))
+    ranked.sort(reverse=True)
+    out = [s for _, s in ranked[:top_n]]
+    for (sym,) in picks:
+        if sym and sym.startswith(("sh51", "sh56", "sh58", "sz15")) and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _norm_quote_rows(recs: list[dict]) -> list[dict]:
+    """fund-daily-quote → etf_quote_ext（成交额万元→元, 成交量亿股→股）"""
+    out = []
+    for r in recs:
+        day = _norm_day(r.get("tradingday"))
+        if not day:
+            continue
+        amt = _fnum(r.get("turnovervalue"))
+        vol = _fnum(r.get("turnovervolume"))
+        out.append({
+            "date": day,
+            "turnover_value": amt * 1e4 if amt is not None else None,
+            "turnover_volume": vol * 1e8 if vol is not None else None,
+            "turnover_rate": _fnum(r.get("turnoverrate")),
+            "avg_price": _fnum(r.get("avgprice")),
+            "change_pct": _fnum(r.get("changepct")),
+            "range_pct": _fnum(r.get("rangepct")),
+            "discount_ratio": _fnum(r.get("discountratio")),
+            "premium_ratio": _fnum(r.get("premiumrate")),
+            "is_suspend": 1 if "未停牌" not in str(r.get("ifsuspend") or "未停牌") else 0,
+        })
+    return out
+
+
+def _norm_capital_rows(recs: list[dict]) -> list[dict]:
+    """etf-capital-report(unit=3: 万元/万份) → etf_capital（统一元/份）"""
+    out = []
+    for r in recs:
+        day = _norm_day(r.get("tradingday"))
+        if not day:
+            continue
+        def yi(key):
+            v = _fnum(r.get(key))
+            return v * 1e4 if v is not None else None
+        out.append({
+            "date": day,
+            "unit_nv": _fnum(r.get("unitnv")),
+            "close_price": _fnum(r.get("closepricelist")),
+            "exchange_shares": yi("exchangeshares"),
+            "market_scale": yi("marketscale"),
+            "net_sub_shares": yi("netsubscriptionshares"),
+            "finance_net_buy": yi("financenetbuyvalue"),
+            "finance_balance": yi("financebalancevalue"),
+            "near3_netbuy": yi("near3daynetbuy"),
+            "near5_netbuy": yi("near5daynetbuy"),
+            "near20_netbuy": yi("near20daynetbuy"),
+            "near60_netbuy": yi("near60daynetbuy"),
+        })
+    return out
+
+
+def _norm_margin_rows(recs: list[dict]) -> list[dict]:
+    """etf-margin(unit=3: 万元) → etf_margin（金额元, 数量原样）"""
+    out = []
+    for r in recs:
+        day = _norm_day(r.get("tradingday"))
+        if not day:
+            continue
+        def wan(key):
+            v = _fnum(r.get(key))
+            return v * 1e4 if v is not None else None
+        out.append({
+            "date": day,
+            "finance_buy": wan("financebuyvalue"),
+            "finance_refund": wan("financerefundvalue"),
+            "finance_net_buy": wan("financenetbuyvalue"),
+            "security_sell_vol": _fnum(r.get("securitysellvolume")),
+            "security_refund_vol": _fnum(r.get("securityrefundvolume")),
+            "security_net_sell_vol": _fnum(r.get("securitynetsellvolume")),
+            "finance_balance": wan("financevalue"),
+            "security_balance": _fnum(r.get("securityvalue")),
+            "security_volume": _fnum(r.get("securityvolume")),
+            "finance_pct": _fnum(r.get("negotiablemvoffinance")),
+            "security_pct": _fnum(r.get("negotiablemvofsecurity")),
+        })
+    return out
+
+
+def _norm_flow_rows(recs: list[dict]) -> list[dict]:
+    """etf-capital-flow-stats(unit=1) → etf_market_flow（全市场 + 5 分类）"""
+    cats = {"alletf": "all", "stocketf": "stock", "bondetf": "bond",
+            "commodityetf": "commodity", "monetaryetf": "monetary", "qdiietf": "qdii"}
+    out = []
+    for r in recs:
+        day = _norm_day(r.get("enddate"))
+        if not day:
+            continue
+        for prefix, cat in cats.items():
+            out.append({
+                "date": day, "category": cat,
+                "buy_value": _fnum(r.get(f"{prefix}totalbuyvalue")),
+                "sell_value": _fnum(r.get(f"{prefix}totalsellvalue")),
+                "net_value": _fnum(r.get(f"{prefix}netbuyvalue")),
+                "etf_count": int(_fnum(r.get(f"{prefix}num")) or 0),
+            })
+    return out
+
+
+def ensure_etf_extras(top_n: int = 60, days: int = 5, with_margin: bool = True,
+                      with_valuation: bool = True, progress_cb=None,
+                      dry_run: bool = False) -> dict:
+    """盘后同步 ETF 增强数据（华泰柏瑞数据源）
+
+    池子 = 近 30 日选股记录里的 ETF ∪ 近 90 日动量前 top_n。
+    依次拉取: 全市场资金流(1次) → 日行情/资金报表/两融(每只3次) → 持仓估值(每月1次)。
+    任何单标的失败只跳过, 不中断整批; 配额耗尽立即终止。
+    """
+    import htbr_source as hs
+
+    ok, reason = hs.available()
+    if not ok:
+        return {"skipped": reason, "symbols": 0, "rows": 0}
+    pool = _etf_pool(top_n=top_n)
+    if not pool:
+        return {"skipped": "ETF 池为空（缺少行情数据）", "symbols": 0, "rows": 0}
+
+    end = last_trading_day()
+    begin = (datetime.strptime(end, "%Y-%m-%d") - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+    compact = lambda d: d.replace("-", "")
+    plan_calls = 1 + len(pool) * (2 + int(with_margin)) + len(pool) * int(with_valuation)
+    stats = {"symbols": len(pool), "rows": 0, "calls_planned": plan_calls,
+             "calls_used": 0, "failed": [], "day": end}
+    if dry_run:
+        stats["pool"] = pool
+        return stats
+
+    def _log(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    # 1) 全市场 ETF 资金流（一次拿全市场）
+    try:
+        recs = hs.market_flow(compact(begin), compact(end))
+        stats["rows"] += data_store.upsert_etf_market_flow(_norm_flow_rows(recs))
+    except hs.HtbrQuotaExceeded:
+        stats["aborted"] = "配额耗尽"
+        return stats
+    except Exception as e:
+        stats["failed"].append(f"market_flow: {type(e).__name__}")
+
+    # 2) 逐只标的
+    inner_map = data_store.etf_meta_map()
+    for i, sym in enumerate(pool, 1):
+        secu = sym[2:] if sym.startswith(("sh", "sz")) else sym
+        try:
+            quotes = hs.daily_quote(secu, begin, end)
+            if quotes:
+                stats["rows"] += data_store.upsert_etf_quote_ext(sym, _norm_quote_rows(quotes))
+                if sym not in inner_map:
+                    inner_map[sym] = str(quotes[0].get("fundobject") or "") or None
+                    data_store.upsert_etf_meta(sym, secu, inner_map[sym],
+                                              str(quotes[0].get("fundname") or ""))
+
+            inner = inner_map.get(sym) or hs.resolve_inner_code(secu)
+            if not inner:
+                stats["failed"].append(f"{sym}: 无基金内码")
+                continue
+            inner_map[sym] = inner
+
+            stats["rows"] += data_store.upsert_etf_capital(
+                sym, _norm_capital_rows(hs.capital_report(inner, begin, end)))
+
+            if with_margin:
+                stats["rows"] += data_store.upsert_etf_margin(
+                    sym, _norm_margin_rows(hs.margin(inner, begin, end)))
+
+            if with_valuation:
+                # 估值按报告期更新, 每月取一次即可
+                vkey = f"htbr_val_{sym}"
+                last = data_store.get_setting(vkey, "")
+                month = end[:7]
+                if last != month:
+                    vrecs = hs.valuation(inner, "", end)
+                    if vrecs:
+                        rows = []
+                        for r in vrecs:
+                            rd = _norm_day(r.get("reportdate"))
+                            if not rd:
+                                continue
+                            rows.append({"report_date": rd,
+                                         "total_mv": _fnum(r.get("totalmv")),
+                                         "negotiable_mv": _fnum(r.get("negotiablemv")),
+                                         "pe_ttm": _fnum(r.get("pettm")),
+                                         "pb": _fnum(r.get("pb")),
+                                         "dividend_ratio": _fnum(r.get("dividendratio"))})
+                        stats["rows"] += data_store.upsert_etf_valuation(sym, rows)
+                    data_store.set_setting(vkey, month)
+        except hs.HtbrQuotaExceeded:
+            stats["aborted"] = "配额耗尽"
+            break
+        except Exception as e:
+            stats["failed"].append(f"{sym}: {type(e).__name__}: {str(e)[:80]}")
+            continue
+        finally:
+            stats["calls_used"] = hs.quota_used()
+        _log(f"[{i}/{len(pool)}] {sym} 累计 {stats['rows']} 行")
+    return stats
+
+
+def backfill_etf_market_flow(start: str = "2020-01-01", end: str | None = None) -> dict:
+    """回补全市场 ETF 资金流历史 (按自然年切窗, 约 1 次/年)
+
+    该接口不依赖基金内码, 单次返回一年数据, 是成本最低的历史回补项。
+    """
+    import htbr_source as hs
+    ok, reason = hs.available()
+    if not ok:
+        return {"skipped": reason, "rows": 0}
+    end = end or last_trading_day()
+    y0, y1 = int(start[:4]), int(end[:4])
+    rows, years = 0, []
+    for y in range(y0, y1 + 1):
+        b = max(start, f"{y}-01-01").replace("-", "")
+        e = min(end, f"{y}-12-31").replace("-", "")
+        try:
+            recs = hs.market_flow(b, e)
+        except hs.HtbrQuotaExceeded:
+            return {"rows": rows, "years": years, "aborted": "配额耗尽"}
+        except Exception as ex:
+            years.append(f"{y}:{type(ex).__name__}")
+            continue
+        rows += data_store.upsert_etf_market_flow(_norm_flow_rows(recs))
+        years.append(y)
+    return {"rows": rows, "years": years}
+
+
+def _traded_etf_symbols() -> list[str]:
+    """从历史 ETF 回测结果中提取「实际交易过的 ETF」, 用于定向回补溢价率
+
+    回补当前动量池之外的标的没有意义: 回测会买的往往是历史强势品种。
+    """
+    import re
+    conn = data_store.get_conn()
+    rows = conn.execute(
+        "SELECT payload FROM backtest_result WHERE strategy LIKE '%ETF%'").fetchall()
+    conn.close()
+    pat = re.compile(r'"(sh5\d{5}|sh58\d{4}|sz15\d{4}|sz16\d{4})"')
+    out = set()
+    for (payload,) in rows:
+        out.update(pat.findall(payload or ""))
+    return sorted(out)
+
+
+def backfill_etf_factors(start_year: int = 2022, top_n: int = 60,
+                         max_calls: int = 380, with_capital: bool = True,
+                         symbols: list[str] | None = None,
+                         progress_cb=None) -> dict:
+    """回补 ETF 的溢价率与资金流历史 (按年切窗, 供回测使用)
+
+    symbols 为空时 = 当前动量池 ∪ 历史 ETF 回测交易过的标的 (后者才是回测真正会买的);
+    每只标的每年 2 次调用 (行情 + 资金报表, with_capital=False 时只回补行情/溢价),
+    受 max_calls 保护, 未完成部分下次运行会从缺口处继续 (按年判断覆盖情况)。
+    """
+    import htbr_source as hs
+    ok, reason = hs.available()
+    if not ok:
+        return {"skipped": reason, "symbols": 0}
+    if symbols:
+        pool = list(dict.fromkeys(symbols))
+    else:
+        pool = _etf_pool(top_n=top_n)
+        pool = list(dict.fromkeys(pool + _traded_etf_symbols()))
+    end = last_trading_day()
+    years = list(range(int(start_year), int(end[:4]) + 1))
+    inner_map = data_store.etf_meta_map()
+    stats = {"symbols": 0, "rows": 0, "calls": 0, "done": 0, "skipped": 0,
+             "failed": [], "aborted": None}
+    calls0 = hs.quota_used()
+
+    for i, sym in enumerate(pool, 1):
+        secu = sym[2:] if sym.startswith(("sh", "sz")) else sym
+        for y in years:
+            if hs.quota_used() - calls0 >= max_calls:
+                stats["aborted"] = f"达到本次上限 {max_calls} 次"
+                return stats
+            b = f"{y}-01-01"
+            e = min(end, f"{y}-12-31")
+            # 已有该年数据则跳过 (按行情增强表首末日期粗判)
+            have = data_store.has_etf_quote_year(sym, y)
+            try:
+                if not have:
+                    quotes = hs.daily_quote(secu, b, e)
+                    stats["rows"] += data_store.upsert_etf_quote_ext(
+                        sym, _norm_quote_rows(quotes))
+                    if quotes and sym not in inner_map:
+                        inner_map[sym] = str(quotes[0].get("fundobject") or "") or None
+                        data_store.upsert_etf_meta(sym, secu, inner_map[sym],
+                                                  str(quotes[0].get("fundname") or ""))
+                    stats["done"] += 1
+                else:
+                    stats["skipped"] += 1
+                inner = inner_map.get(sym)
+                if with_capital and inner and not data_store.has_etf_capital_year(sym, y):
+                    stats["rows"] += data_store.upsert_etf_capital(
+                        sym, _norm_capital_rows(hs.capital_report(inner, b, e)))
+            except hs.HtbrQuotaExceeded:
+                stats["aborted"] = "配额耗尽"
+                return stats
+            except Exception as ex:
+                stats["failed"].append(f"{sym}/{y}: {type(ex).__name__}")
+        stats["symbols"] += 1
+        stats["calls"] = hs.quota_used() - calls0
+        if progress_cb:
+            progress_cb(f"[{i}/{len(pool)}] {sym} 累计 {stats['rows']} 行")
+    stats["calls"] = hs.quota_used() - calls0
+    return stats
 
 
 # ==================== 财务数据 ====================

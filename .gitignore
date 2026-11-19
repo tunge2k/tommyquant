@@ -3,6 +3,7 @@ nas_conf.py
 .env
 .gh_token
 .streamlit/secrets.toml
+secrets/
 
 # ===== 数据与缓存 (体积大、可再生) =====
 data/*.db

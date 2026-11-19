@@ -24,6 +24,8 @@ services:
       - ./data:/app/data
       # CSV 缓存 (可选, 兼容旧数据)
       - ./cache:/app/cache
+      # 华泰柏瑞 ETF 数据源凭据 (只读挂载, 不进镜像/版本库)
+      - ./secrets:/root/.htbr:ro
     restart: unless-stopped
     # 显式指定公共 DNS, 绕过 NAS 可能坏掉的 DNS 解析
     dns:

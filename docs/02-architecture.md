@@ -59,6 +59,8 @@
 | 数据服务 | `data_manager.py` | 交易日历、缺口规划、财务/分红、全球市场、基准指数 | 不直接渲染 |
 | 存储层 | `data_store.py` | SQLite 建表/读写、下载、回测缓存、任务队列、设置 KV | 不做策略逻辑 |
 | 采集层 | `news_fetcher.py` | 多源抓取、去重、翻译、代理分流 | 不做情绪分析（字段预留） |
+| 采集层 | `htbr_source.py` | 华泰柏瑞 ESA 数据源封装：限流（3 秒）、配额硬闸（450/日）、统一错误语义 | 不做业务编排（由 `data_manager` 负责） |
+| 采集层 | `vendor/htbr/` | 技能运行时（`api_client.py`/`config.py`/`guardrails.py`），凭据经 `/root/.htbr` 只读挂载 | 不含凭据 |
 | 调度层 | `update_worker.py` | 定时任务、自举、任务消费、缓存预热 | 不提供 HTTP |
 | 基础设施 | `doh_patch.py` | DoH 兜底 | — |
 
@@ -169,7 +171,7 @@ update_worker 主循环
 
 ## 5. 数据库模型
 
-SQLite 单库 `data/stock.db`，WAL 模式。共 12 张业务表 + SQLite 内部表 `sqlite_sequence`。
+SQLite 单库 `data/stock.db`，WAL 模式。共 18 张业务表 + SQLite 内部表 `sqlite_sequence`。
 
 | 表 | 主键 | 用途 | 关键字段 |
 |---|---|---|---|
@@ -185,6 +187,12 @@ SQLite 单库 `data/stock.db`，WAL 模式。共 12 张业务表 + SQLite 内部
 | `news` | `id` | 新闻与资讯 | date/source/symbol/title/content/sentiment/title_hash/source_time/link |
 | `download_log` | `symbol` | 下载流水 | status/rows/first_date/last_date |
 | `app_settings` | `key` | 运行时配置 KV | value/updated_at |
+| `etf_meta` | `symbol` | ETF 代码映射 | secu_code/inner_code/fund_name |
+| `etf_quote_ext` | `(symbol, date)` | ETF 真实行情增强（华泰柏瑞） | turnover_value(元)/turnover_rate/discount_ratio/premium_ratio/is_suspend |
+| `etf_capital` | `(symbol, date)` | ETF 单位净值/份额/规模/净申购 | unit_nv/exchange_shares(份)/market_scale(元)/net_sub_shares |
+| `etf_margin` | `(symbol, date)` | ETF 两融明细 | finance_buy/finance_balance/finance_pct |
+| `etf_market_flow` | `(date, category)` | 全市场 ETF 资金流（6 类） | buy_value/sell_value/net_value/etf_count |
+| `etf_valuation` | `(symbol, report_date)` | ETF 持仓加权估值（报告期） | pe_ttm/pb/dividend_ratio |
 | `sqlite_sequence` | — | SQLite 自增序列 | — |
 
 ### 5.1 一致性约束
