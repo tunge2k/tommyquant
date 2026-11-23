@@ -250,6 +250,43 @@ def fmt_money(v: float) -> str:
     """金额展示: 中文用「万」, 英文用千分位"""
     return f"{v/10000:.0f}万" if lang() == "zh" else f"{v:,.0f}"
 
+
+# ==================== 涨跌颜色 (随界面语言) ====================
+# 中文: 涨红跌绿 (A股习惯); 英文: 涨绿跌红 (欧美习惯)
+_UP_SET = ("#dc2626", "#fef2f2", "#fecaca")     # color, bg, border —— 红
+_DOWN_SET = ("#16a34a", "#f0fdf4", "#bbf7d0")   # color, bg, border —— 绿
+
+
+def _hex_rgb(h: str) -> str:
+    """#rrggbb -> 'r,g,b' (供 rgba 拼接)"""
+    h = h.lstrip("#")
+    return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
+
+
+def market_colors() -> dict:
+    """返回当前语言下的涨跌配色 (文本/背景/边框 + rgba 分量)"""
+    zh = lang() != "en"
+    up, down = (_UP_SET, _DOWN_SET) if zh else (_DOWN_SET, _UP_SET)
+    return {
+        "up": up[0], "down": down[0], "flat": "#64748b",
+        "up_bg": up[1], "up_border": up[2],
+        "down_bg": down[1], "down_border": down[2],
+        "up_rgb": _hex_rgb(up[0]), "down_rgb": _hex_rgb(down[0]),
+    }
+
+
+def paint_colors(html: str, c: dict) -> str:
+    """把 HTML 组件里的涨跌硬编码色替换为当前语言配色 (单次扫描, 避免链式覆盖)"""
+    import re
+    m = {
+        "#dc2626": c["up"], "#16a34a": c["down"],
+        "#ef4444": c["up"], "#22c55e": c["down"],
+        "rgba(239,68,68,.5)": f"rgba({c['up_rgb']},.5)",
+        "rgba(22,163,74,.5)": f"rgba({c['down_rgb']},.5)",
+    }
+    pat = re.compile("|".join(re.escape(k) for k in m))
+    return pat.sub(lambda mo: m[mo.group(0)], html)
+
 # ==================== 页面配置 ====================
 st.set_page_config(
     page_title="托米量化 · TommyQuant",
@@ -257,6 +294,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# 界面语言提前初始化: 优先 URL ?lang=en/zh, 使全局 CSS 涨跌色在首次渲染即正确
+try:
+    _ql = st.query_params.get("lang")
+    if _ql in ("zh", "en"):
+        st.session_state["lang"] = _ql
+except Exception:
+    pass
+st.session_state.setdefault("lang", "zh")
 
 # 自定义 CSS —— 金融量化专业版
 # 设计系统: 8px 栅格 + WCAG AA 对比度 + 金融语义化颜色 + 专业字体栈
@@ -1602,6 +1648,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# 涨跌色随界面语言覆盖 (中文涨红跌绿 / 英文涨绿跌红) —— 同 :root 后者胜出
+_mc = market_colors()
+st.markdown(f"""
+<style>
+    :root {{
+        --up-color: {_mc['up']}; --up-bg: {_mc['up_bg']}; --up-border: {_mc['up_border']};
+        --down-color: {_mc['down']}; --down-bg: {_mc['down_bg']}; --down-border: {_mc['down_border']};
+    }}
+</style>
+""", unsafe_allow_html=True)
+
 # ==================== session_state 默认参数 ====================
 # 回测结束日默认取「全市场有数据的最后交易日」(而不是 MAX(date)):
 # 个别标的先补了单根K线会把 MAX(date) 抬高, 用它当终点会让持仓取不到行情。
@@ -2162,20 +2219,31 @@ _MARKET_CARDS_HTML = r"""
   /* 世界地图区域筛选 (equirectangular, 真实大陆轮廓) */
   .mapwrap { position:relative; border:1px solid rgba(0,229,255,0.16); border-radius:12px;
              background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; margin-bottom:8px; }
-  svg.ww { width:100%; height:auto; max-height:210px; display:block; }
-  .land { fill:#16203f; stroke:#26324f; stroke-width:0.6; stroke-linejoin:round; }
-  .rg.land { fill:#1b2750; stroke:#2c3c66; cursor:pointer;
-             transition:fill 0.15s ease, stroke 0.15s ease; }
-  .rg.land:hover { fill:#24406e; stroke:#4b5f8f; }
+  svg.ww { width:100%; height:175px; display:block; }   /* 横向拉伸填满 mapwrap, 两端不留白 */
+  .land { fill:#16203f; stroke:#26324f; stroke-width:0.6; stroke-linejoin:round; }  /* 静态陆地(非洲/中东/南极) */
+  /* 可点击区域各自配色, 便于区分; 交易中时由 .live 动画统一覆盖为绿色呼吸 */
+  .rg.land { cursor:pointer; transition:fill 0.15s ease, stroke 0.15s ease; }
+  .rg.land[data-r="美洲"] { fill:#1e2a5a; stroke:#33406e; }
+  .rg.land[data-r="欧洲"] { fill:#16304a; stroke:#23425e; }
+  .rg.land[data-r="亚太"] { fill:#1a2550; stroke:#2c3866; }
+  .rg.land[data-r="美洲"]:hover { fill:#2a3a72; stroke:#4b5f8f; }
+  .rg.land[data-r="欧洲"]:hover { fill:#1d4264; stroke:#3a5678; }
+  .rg.land[data-r="亚太"]:hover { fill:#24326a; stroke:#41507e; }
   .rg.land.live { animation: breathe 1.8s ease-in-out infinite alternate; }
   @keyframes breathe {
     from { fill:#123a37; stroke:#0a7f6b; }
     to   { fill:#127a5c; stroke:#00ffa3; }
   }
+  /* 中国/香港 标记点各自配色 */
   .rg.mk { cursor:pointer; }
-  .rg.mk circle { fill:rgba(0,229,255,0.25); stroke:#00e5ff; stroke-width:1.2; transition:fill 0.15s; }
-  .rg.mk text { fill:#7fe9ff; font-size:10.5px; font-weight:600; pointer-events:none; }
-  .rg.mk:hover circle { fill:rgba(0,229,255,0.5); }
+  .rg.mk circle { stroke-width:1.3; transition:fill 0.15s; }
+  .rg.mk text { font-size:10.5px; font-weight:600; pointer-events:none; }
+  .rg.mk[data-r="中国"] circle { stroke:#ff7a45; fill:rgba(255,122,69,.28); }
+  .rg.mk[data-r="中国"] text { fill:#ffb088; }
+  .rg.mk[data-r="港股"] circle { stroke:#ffc53d; fill:rgba(255,197,61,.28); }
+  .rg.mk[data-r="港股"] text { fill:#ffe08a; }
+  .rg.mk[data-r="中国"]:hover circle { fill:rgba(255,122,69,.55); }
+  .rg.mk[data-r="港股"]:hover circle { fill:rgba(255,197,61,.55); }
   .rg.mk.live circle { animation: blinkDot 1.8s ease-in-out infinite alternate; }
   @keyframes blinkDot { from { fill:#0a7f6b; stroke:#0a7f6b; } to { fill:#00ffa3; stroke:#00ffa3; } }
   .legend { margin-top:4px; font-size:10.5px; color:#6b7596; display:flex; gap:12px; align-items:center; }
@@ -2191,7 +2259,7 @@ _MARKET_CARDS_HTML = r"""
   .tab.on { background:rgba(0,229,255,0.14); border-color:#00e5ff; color:#7fe9ff; }
 </style></head><body>
 <div class="mapwrap">
-  <svg class="ww" viewBox="0 0 1000 500" aria-label="世界主要市场区域图">
+  <svg class="ww" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-label="世界主要市场区域图">
 __WORLD_MAP__
     <text class="gl" x="222" y="138">美洲</text>
     <text class="gl" x="542" y="112">欧洲</text>
@@ -3458,10 +3526,13 @@ if page == "home":
         })
 
     st.markdown(f"### {t('global_markets')}")
+    _mc = market_colors()
     _comp.html(
-        _MARKET_CARDS_HTML
-            .replace("__ITEMS__", json.dumps(_items, ensure_ascii=False))
-            .replace("__WORLD_MAP__", WORLD_MAP_SVG),
+        paint_colors(
+            _MARKET_CARDS_HTML
+                .replace("__ITEMS__", json.dumps(_items, ensure_ascii=False))
+                .replace("__WORLD_MAP__", WORLD_MAP_SVG),
+            _mc),
         height=700, scrolling=True)
 
     st.divider()
@@ -3720,8 +3791,8 @@ elif page == "backtest":
                       "buy": round(float(_r["close"]), 2)} for _, _r in _h.iterrows()]
             import streamlit.components.v1 as _comp
             with st.expander(f"📈 当前持仓实时行情（{len(_rows)} 只 · 2 秒刷新）", expanded=False):
-                _comp.html(_LIVE_HOLDINGS_HTML.replace(
-                    "__ROWS__", json.dumps(_rows, ensure_ascii=False)),
+                _comp.html(paint_colors(_LIVE_HOLDINGS_HTML.replace(
+                    "__ROWS__", json.dumps(_rows, ensure_ascii=False)), market_colors()),
                     height=44 + 29 * len(_rows), scrolling=False)
     except Exception:
         pass
@@ -4325,9 +4396,10 @@ elif page == "picks":
         # 表格 + K线面板 (点击行在下方就地显示K线)
         _html = _PICKS_HTML.replace("__ROWS__", json.dumps(_rows, ensure_ascii=False))
         _html = _html.replace("__KLINES__", json.dumps(_kl, ensure_ascii=False))
-        _comp.html(_html, height=48 + 29 * len(_rows) + 390, scrolling=False)
+        _comp.html(paint_colors(_html, market_colors()), height=48 + 29 * len(_rows) + 390, scrolling=False)
 
         # 可视化: ETF 只画动量分布; 股票额外画市值分布
+        _mc = market_colors()
         if not _is_etf:
             col1, col2 = st.columns(2)
             with col1:
@@ -4342,7 +4414,7 @@ elif page == "picks":
                 st.plotly_chart(fig_cap, use_container_width=True)
             with col2:
                 st.subheader("📊 动量分布 (20日涨幅)")
-                colors = ["#ef4444" if v > 20 else "#f59e0b" if v > 0 else "#22c55e" for v in display["20日涨幅%"]]
+                colors = [_mc["up"] if v > 20 else "#f59e0b" if v > 0 else _mc["down"] for v in display["20日涨幅%"]]
                 fig_ret = go.Figure(go.Bar(
                     x=display["代码"], y=display["20日涨幅%"],
                     marker_color=colors, text=[f"{v:.1f}%" for v in display["20日涨幅%"]],
@@ -4354,7 +4426,7 @@ elif page == "picks":
                 st.plotly_chart(fig_ret, use_container_width=True)
         else:
             st.subheader("📊 动量分布 (20日涨幅)")
-            colors = ["#ef4444" if v > 20 else "#f59e0b" if v > 0 else "#22c55e" for v in display["20日涨幅%"]]
+            colors = [_mc["up"] if v > 20 else "#f59e0b" if v > 0 else _mc["down"] for v in display["20日涨幅%"]]
             fig_ret = go.Figure(go.Bar(
                 x=display["代码"], y=display["20日涨幅%"],
                 marker_color=colors, text=[f"{v:.1f}%" for v in display["20日涨幅%"]],
@@ -4401,7 +4473,7 @@ elif page == "portfolio":
                 "buy": round(_buy, 2), "last": round(_last, 2), "shares": int(_shares),
             })
         _comp.html(
-            _POSITIONS_HTML.replace("__ROWS__", json.dumps(_rows, ensure_ascii=False)),
+            paint_colors(_POSITIONS_HTML.replace("__ROWS__", json.dumps(_rows, ensure_ascii=False)), market_colors()),
             height=340, scrolling=False)
 
         st.divider()
