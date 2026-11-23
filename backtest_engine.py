@@ -19,7 +19,7 @@ def bt_cache_key(strategy_key, initial, hold, top, lu_pct, start_d, end_d,
                  fingerprint, cost_str="") -> tuple:
     """返回 (可读参数串, sha1 缓存键)。参数或数据指纹变化 → 缓存自动失效"""
     import hashlib
-    key_raw = f"v15|{strategy_key}|{initial}|{hold}|{top}|{lu_pct}|{start_d}|{end_d}|{cost_str}"
+    key_raw = f"v18|{strategy_key}|{initial}|{hold}|{top}|{lu_pct}|{start_d}|{end_d}|{cost_str}"
     return key_raw, hashlib.sha1((key_raw + "|" + fingerprint).encode()).hexdigest()
 
 
@@ -156,6 +156,13 @@ def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
     df["cap_yi"] = df["close"] * df["outstanding_share"] / 1e8
     df["above_ma20"] = (df["close"] > df["ma20"]).astype(int)
     df["above_ma60"] = (df["close"] > df["ma60"]).astype(int)
+    # MA60 20 日斜率 (中长期趋势强度): >0 表示 MA60 持续上行
+    df["ma60_slope"] = (df["ma60"] - df["ma60"].shift(20)) / df["ma60"].shift(20)
+    # 近 250 日高点回撤 (负值, 如 -0.25 表示当前价较近250日高点回撤 25%)
+    # 用单层 rolling(250) 而非双层, 使因子在 250 个交易日后即生效
+    # (原双层 rolling 需 500 天, 导致次新 ETF 的回撤过滤长期空转)
+    _roll_max = df["close"].rolling(250).max()
+    df["max_dd_250"] = (df["close"] - _roll_max) / _roll_max
     lu_threshold = price_limits.board_limit_pct(code) * 100 - 0.5 if code else 9.5
     df["limit_up"] = (df["pct"] >= lu_threshold).astype(int)
     df["vol_ma5"] = df["volume"].rolling(5).mean()
@@ -734,21 +741,36 @@ def build_ma30_cache(feat: dict, lookback: int = 5) -> dict:
             close_col = "close" if "close" in df.columns else "adj_close"
             if close_col not in df.columns:
                 continue
-            sub = df[["date", close_col]].dropna()
+            open_col = "open" if "open" in df.columns else None
+            cols = ["date", close_col] + ([open_col] if open_col else [])
+            sub = df[cols].dropna(subset=[close_col])
             if len(sub) < 60:
                 continue
             sub = sub.sort_values("date")
             dts = pd.to_datetime(sub["date"])
             vals_arr = sub[close_col].to_numpy(dtype="float64")
             wk = pd.Series(vals_arr, index=dts).resample("W-FRI").last().dropna()
+            # 周开盘价 = 该周首个交易日的开盘价, 用于判断「周阳线」(收盘 > 开盘)
+            if open_col:
+                wk_open = pd.Series(sub[open_col].to_numpy(dtype="float64"), index=dts) \
+                    .resample("W-FRI").first()
+                wk_open = wk_open.reindex(wk.index)
+                open_vals = wk_open.to_numpy(dtype="float64")
+            else:
+                open_vals = np.full(len(wk), np.nan)
             need = 30 + lb
             if len(wk) < need:
                 continue   # 周数不足 → 不参与 MA30 判断 (与原逻辑一致: 放行)
             vals = wk.to_numpy(dtype="float64")
+            s = pd.Series(vals)
             cache[code] = {
                 "wk_idx": wk.index.values,
                 "prefix": np.concatenate(([0.0], np.cumsum(vals))),
-                "ma30": pd.Series(vals).rolling(30).mean().to_numpy(),
+                "ma30": s.rolling(30).mean().to_numpy(),
+                "ma60": s.rolling(60).mean().to_numpy(),
+                "ma120": s.rolling(120).mean().to_numpy(),
+                "w_open": open_vals,
+                "w_close": vals,
                 "dates": dts.to_numpy(dtype="datetime64[ns]"),
                 "closes": vals_arr,
                 "lb": lb,
@@ -848,6 +870,118 @@ def ma30_rising_weeks(cache: dict, code: str, date, weeks: int) -> bool | None:
     return True
 
 
+def weekly_bull_weeks(cache: dict, code: str, date, weeks: int = 2) -> bool | None:
+    """最近 weeks 个「已走完的周」是否都是阳线 (周收盘 > 周开盘)
+
+    用于建仓确认: 周 MA30 由降转升后, 还需连续阳线证明上涨趋势真实。
+    None = 数据不足/缺开盘价, 不做判断 (放行); weeks<=0 = 不启用。
+    """
+    weeks = int(weeks or 0)
+    if weeks <= 0:
+        return None
+    item = cache.get(code) if cache else None
+    if item is None or date is None:
+        return None
+    w_open = item.get("w_open")
+    w_close = item.get("w_close")
+    if w_open is None or w_close is None:
+        return None
+    d = pd.Timestamp(date).to_datetime64()
+    nwk = len(item["wk_idx"])
+    i = int(np.searchsorted(item["wk_idx"], d, side="left"))
+    if i >= nwk:
+        i = nwk                      # 当日之后无行情 → 全部周都已走完
+    if i < weeks:
+        return None
+    for k in range(1, weeks + 1):
+        o, c = w_open[i - k], w_close[i - k]
+        if not (np.isfinite(o) and np.isfinite(c)):
+            return None
+        if c <= o:
+            return False
+    return True
+
+
+def weekly_ma30_premium(cache: dict, code: str, date) -> float | None:
+    """最新价相对周线 MA30 的溢价率 (最新价/MA30 - 1); None = 数据不足
+
+    用于「不追高」: 价格已远离 MA30 时不建仓, 避免买在阶段高点。
+    """
+    item = cache.get(code) if cache else None
+    if item is None or date is None:
+        return None
+    d = pd.Timestamp(date).to_datetime64()
+    prefix = item["prefix"]
+    nwk = len(item["wk_idx"])
+    i = int(np.searchsorted(item["wk_idx"], d, side="left"))
+    beyond = i >= nwk
+    if beyond:
+        i = nwk - 1
+    if i < 29:
+        return None
+    cur_sum = prefix[i] - prefix[i - 29]
+    if beyond:
+        cur = (cur_sum + (prefix[min(i + 1, len(prefix) - 1)] - prefix[i])) / 30.0
+        di = len(item["closes"]) - 1
+    else:
+        di = int(np.searchsorted(item["dates"], d, side="right")) - 1
+        if di < 0:
+            return None
+        close_now = item["closes"][di]
+        if not np.isfinite(close_now):
+            return None
+        cur = (cur_sum + close_now) / 30.0
+    last = item["closes"][di]
+    if not (np.isfinite(cur) and np.isfinite(last)) or cur <= 0:
+        return None
+    return float(last / cur - 1.0)
+
+
+def weekly_long_trend_ok(cache: dict, code: str, date) -> bool | None:
+    """长期趋势确认: 价格站上最长可用周均线(优先 MA120, 不足降级 MA60),
+    且周 MA30 在长期均线之上 (多头排列雏形)
+
+    用于建仓确认: 只在「长期向上」的趋势中建仓, 过滤下跌趋势中的死猫反弹。
+    返回 None = 周线不足 60 周 (连 MA60 都没有), 数据不足放行;
+         True  = 价格 > 长均线 且 MA30 > 长均线;
+         False = 价格在长均线下方 / MA30 在长均线下方 (长期趋势向下, 不建仓)。
+    """
+    item = cache.get(code) if cache else None
+    if item is None or date is None:
+        return None
+    wk_idx = item.get("wk_idx")
+    w_close = item.get("w_close")
+    ma30 = item.get("ma30")
+    ma60 = item.get("ma60")
+    ma120 = item.get("ma120")
+    if wk_idx is None or w_close is None or ma60 is None:
+        return None
+    d = pd.Timestamp(date).to_datetime64()
+    nwk = len(wk_idx)
+    i = int(np.searchsorted(wk_idx, d, side="left"))
+    if i >= nwk:
+        i = nwk - 1
+    if i < 0:
+        return None
+    # 最长可用周均线: 优先 MA120, 其次 MA60
+    long_ma = None
+    if ma120 is not None and i < len(ma120) and np.isfinite(ma120[i]):
+        long_ma = float(ma120[i])
+    elif i < len(ma60) and np.isfinite(ma60[i]):
+        long_ma = float(ma60[i])
+    if long_ma is None or long_ma <= 0:
+        return None                       # 不足 60 周, 放行
+    px = float(w_close[i])
+    if not np.isfinite(px):
+        return None
+    above_long = px > long_ma
+    # 短期均线在长期均线之上 = 多头排列雏形 (趋势向上的佐证)
+    ma30_ok = True
+    if ma30 is not None and i < len(ma30) and np.isfinite(ma30[i]):
+        ma30_ok = float(ma30[i]) > long_ma
+    return bool(above_long and ma30_ok)
+
+
 _STATIC_META_CACHE = {}
 
 # 全市场过滤器预计算缓存, 键 (id(feat), ma30_lb):
@@ -904,13 +1038,18 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                                 flow_map: dict = None,
                                 premium_cap: float = 0.0,
                                 flow_min: float | None = None,
-                                market_ok: bool | None = None) -> list:
+                                market_ok: bool | None = None,
+                                max_dd_threshold: float = 0.30,
+                                require_ma60_up: bool = True,
+                                ret20_min: float = 0.0,
+                                ret60_min: float = 0.0) -> list:
     """
     标的池过滤 (股票池 / ETF 池共用入口, pool_type 分流):
     - stock: 市值区间 + 上市年限 + 财务/分红剔除 + 周K MA30 上升, 按市值升序
       (显式排除 ETF/LOF: 场内基金 outstanding_share 缺失, cap_yi=0 会混进小市值池)
     - etf: 无财务/分红/市值过滤, 按「近 N 日涨幅」降序排名,
       并叠加 20 日均成交额流动性门槛 + 最少K线长度 + 周K MA30 趋势确认
+      + 2026-11-20 新增: 最大回撤 < 30% / MA60 上行 / 多周期动量非负
 
     CrossSection 输入走向量化快路径 (numpy 掩码); 普通 dict 输入走回退路径。
     """
@@ -921,7 +1060,9 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
             ma30_up_only=ma30_up_only, ma30_lookback=ma30_lookback,
             ma30_entry_weeks=ma30_entry_weeks, ma30_cache=ma30_cache,
             premium_map=premium_map, flow_map=flow_map,
-            premium_cap=premium_cap, flow_min=flow_min, market_ok=market_ok)
+            premium_cap=premium_cap, flow_min=flow_min, market_ok=market_ok,
+            max_dd_threshold=max_dd_threshold, require_ma60_up=require_ma60_up,
+            ret20_min=ret20_min, ret60_min=ret60_min)
 
     # --- CrossSection 向量化快路径 ---
     if isinstance(snap, CrossSection):
@@ -1070,8 +1211,18 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
                          premium_map: dict = None, flow_map: dict = None,
                          premium_cap: float = 0.0,
                          flow_min: float | None = None,
-                         market_ok: bool | None = None) -> list:
-    """ETF 池筛选: 动量排名 (近 N 日涨幅降序)
+                         market_ok: bool | None = None,
+                         max_dd_threshold: float = 0.30,
+                         require_ma60_up: bool = True,
+                         ret20_min: float = 0.0,
+                         ret60_min: float = 0.0) -> list:
+    """ETF 池筛选: 中长期向上趋势 + 低回撤 + 动量排名 (近 N 日涨幅降序)
+
+    新增 (2026-11-20) 优质标的过滤:
+      9.  历史最大回撤: 近 250 日最大回撤 < max_dd_threshold (默认 30%)
+      10. 中长期趋势: 收盘价站上 MA60 且 MA60 斜率 > 0 (持续上行)
+      11. 多周期动量: ret_20 >= ret20_min 且 ret_60 >= ret60_min (默认都 >= 0)
+      叠加在原有的流动性/数据长度/MA30/溢价/资金流过滤之上。
 
     与股票池的差异 (ETF 没有财务/分红/市值/换手/ST 概念):
       1. 只保留场内基金 (price_limits.is_etf)
@@ -1128,11 +1279,35 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
                                            ma30_lookback, ma30_entry_weeks)
             if ma30_mat is not None and 0 <= snap._i < ma30_mat.shape[0]:
                 mask &= ma30_mat[snap._i, snap._jmask]
+
+        # 中长期趋势: 站上 MA60 且 MA60 斜率 > 0 (因子缺失时不拦截, 避免次新ETF误杀)
+        if require_ma60_up:
+            above60 = snap.col("above_ma60")
+            slope = snap.col("ma60_slope")
+            above_ok = (above60 == 1) | ~np.isfinite(above60)
+            slope_ok = (np.isfinite(slope) & (slope > 0)) | ~np.isfinite(slope)
+            mask &= above_ok & slope_ok
+
+        # 近 250 日最大回撤 < 阈值 (max_dd_250 为负值, 如 -0.25; 缺失不拦截)
+        if max_dd_threshold is not None:
+            mdd = snap.col("max_dd_250")
+            mask &= (np.isfinite(mdd) & (mdd > -float(max_dd_threshold))) | ~np.isfinite(mdd)
+
+        # 多周期动量: ret_20 / ret_60 不低于各自阈值 (缺失不拦截)
+        r20 = snap.col("ret_20")
+        r60 = snap.col("ret_60")
+        mask &= (np.isfinite(r20) & (r20 >= float(ret20_min))) | ~np.isfinite(r20)
+        mask &= (np.isfinite(r60) & (r60 >= float(ret60_min))) | ~np.isfinite(r60)
+
         if not mask.any():
             return []
         sort_ret = np.where(mask, ret, -np.inf)
         order = np.argsort(-sort_ret, kind="stable")
-        return [codes[j] for j in order[mask[order]]]
+        picked = [codes[j] for j in order[mask[order]]]
+        # 建仓确认 (连续阳线 + 不追高): 仅作用于新标的入选, 不影响存量持仓调仓
+        if ma30_cache is not None and date is not None:
+            picked = [c for c in picked if _entry_confirm_ok(ma30_cache, c, date)]
+        return picked
 
     # --- dict 回退路径 ---
     date_ts = pd.Timestamp(date) if date is not None else None
@@ -1166,6 +1341,29 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
             if ma30_entry_weeks and ma30_rising_weeks(
                     ma30_cache, code, date, ma30_entry_weeks) is False:
                 continue
+            # 建仓确认: 连续阳线 + 不追高
+            if not _entry_confirm_ok(ma30_cache, code, date):
+                continue
+        # 中长期趋势: 站上 MA60 且 MA60 斜率 > 0 (因子缺失时不拦截)
+        if require_ma60_up:
+            above = row.get("above_ma60")
+            if above is not None and above != 1:
+                continue
+            slope = row.get("ma60_slope", np.nan)
+            if np.isfinite(slope) and slope <= 0:
+                continue
+        # 近 250 日最大回撤 < 阈值 (缺失不拦截)
+        if max_dd_threshold is not None:
+            mdd = row.get("max_dd_250", np.nan)
+            if np.isfinite(mdd) and mdd <= -float(max_dd_threshold):
+                continue
+        # 多周期动量 (缺失不拦截)
+        r20 = row.get("ret_20", np.nan)
+        r60 = row.get("ret_60", np.nan)
+        if np.isfinite(r20) and r20 < float(ret20_min):
+            continue
+        if np.isfinite(r60) and r60 < float(ret60_min):
+            continue
         out.append((code, float(r)))
     out.sort(key=lambda x: x[1], reverse=True)
     return [c for c, _ in out]
@@ -1295,10 +1493,38 @@ def select_market_cap(snap: dict, top_n: int = 3,
     return pool[:top_n]
 
 
+def select_etf(snap: dict, top_n: int = 5,
+               mom_days: int = 60, min_amount: float = 0.5,
+               min_history: int = 120,
+               max_dd_threshold: float = 0.30,
+               require_ma60_up: bool = True,
+               ret20_min: float = 0.0, ret60_min: float = 0.0) -> list:
+    """函数式 ETF 选股 (给今日选股用)
+
+    复用 _filter_etf_universe 的全部过滤: 流动性 / 数据长度 / 周K MA30 /
+    溢价 / 资金流 / 最大回撤 / MA60上行 / 多周期动量, 再按近 mom_days 日涨幅降序。
+    注意: 今日选股路径 ma30_cache 为 None, 周K MA30 过滤自动跳过 (不拦截)。
+    """
+    snap_date = None
+    for row in snap.values():
+        d = row.get("_sel_date") or row.get("date")
+        if d is not None:
+            snap_date = pd.Timestamp(d)
+            break
+    pool = _filter_etf_universe(
+        snap, date=snap_date, mom_days=mom_days,
+        min_amount=min_amount, min_history=min_history,
+        max_dd_threshold=max_dd_threshold,
+        require_ma60_up=require_ma60_up,
+        ret20_min=ret20_min, ret60_min=ret60_min)
+    return pool[:top_n]
+
+
 STRATEGIES = {
     "小市值轮动·戴维斯双击": select_smallcap_rotation,
     "动量+均线+小市值": select_momentum,
     "市值策略": select_market_cap,   # 函数式 (给今日选股/快速回测)
+    "ETF策略": select_etf,           # 函数式 (给今日选股)
 }
 
 
@@ -1390,6 +1616,7 @@ class CostModel:
     TRANSFER_FEE_RATE = 0.00001
     SLIPPAGE_RATE = 0.001
     IMPACT_THRESHOLD = 0.05     # 占当日成交额 5%
+    MAX_IMPACT_RATE = 0.02      # 冲击成本上限: 不超过交易金额的 2% (防止异常成交额数据导致天价成本)
 
     def __init__(self, commission_rate=None, commission_min=None,
                  etf_commission_rate=None, etf_commission_min=None,
@@ -1441,12 +1668,16 @@ class CostModel:
         # 过户费 (双向)
         transfer_fee = amount * self.TRANSFER_FEE_RATE
 
-        # 冲击成本
+        # 冲击成本:
+        # - ETF/LOF 流动性极好, 散户量级订单冲击可忽略, 跳过
+        # - 股票: 订单金额/当日成交额 > 5% 时触发, 但上限为交易金额的 2%
+        #   (防止数据源成交额异常偏低时产生天价冲击成本, 导致仓位被强制缩量)
         impact_cost = 0.0
-        if day_amount > 0:
+        if day_amount > 0 and not price_limits.is_etf(code):
             ratio = amount / day_amount
             if ratio > self.IMPACT_THRESHOLD:
                 impact_cost = amount * (ratio ** 1.5)
+                impact_cost = min(impact_cost, amount * self.MAX_IMPACT_RATE)
 
         return (fill_price, commission, stamp_tax, transfer_fee,
                 slippage_cost, impact_cost)
@@ -1476,6 +1707,10 @@ class Portfolio:
         self.positions: dict[str, Position] = {}
         self.trades = []         # 完成的配对交易 (buy→sell)
         self.fills = []          # 逐笔成交流水 (每笔买/卖独立记录)
+        # 资金实时校验计数: 买入被现金约束拦截 / 账户现金触底次数
+        # 正常情况下两者都应为 0 (先卖后买 + 下单前按可用资金定量)
+        self.rejected_buys = 0
+        self.cash_floor_hits = 0
         self.cost_summary = {
             "commission": 0.0, "stamp_tax": 0.0, "transfer_fee": 0.0,
             "slippage": 0.0, "impact": 0.0,
@@ -1489,10 +1724,39 @@ class Portfolio:
         """处理成交, 更新持仓与资金 (支持部分卖出)"""
         amount = fill.fill_price * fill.quantity
         realized_pnl = 0.0   # 本次卖出实现的盈亏 (买入为0)
+        cash_before = self.cash
 
         if fill.direction == "buy":
             total_cost = amount + fill.total_cost
+            # 资金实时校验: T+1 开盘实际成交价可能高于下单时估算价,
+            # 导致实际扣款超出可用资金。按「含费单位成本」收缩到可用现金内的
+            # 最大整手数, 并按数量等比例缩放各项费用, 保证现金永不为负。
+            if total_cost > self.cash + 1e-9:
+                orig_qty = max(float(fill.quantity), 1.0)
+                unit_cost = total_cost / orig_qty
+                max_qty = int(max(0.0, self.cash) / unit_cost) if unit_cost > 0 else 0
+                max_qty = (max_qty // 100) * 100
+                while max_qty >= 100:
+                    scale = max_qty / orig_qty
+                    if (fill.fill_price * max_qty + fill.total_cost * scale
+                            <= self.cash + 1e-9):
+                        break
+                    max_qty -= 100
+                if max_qty < 100:
+                    # 可用资金不足一手 → 放弃本笔, 不留负现金
+                    self.rejected_buys += 1
+                    return False
+                scale = max_qty / orig_qty
+                fill.commission *= scale
+                fill.stamp_tax *= scale
+                fill.transfer_fee *= scale
+                fill.slippage_cost *= scale
+                fill.impact_cost *= scale
+                fill.quantity = max_qty
+                amount = fill.fill_price * fill.quantity
+                total_cost = amount + fill.total_cost
             self.cash -= total_cost
+
             # 如果已有部分持仓 (部分卖出后再买回), 合并成本
             existing = self.positions.get(fill.code)
             if existing is not None:
@@ -1559,6 +1823,12 @@ class Portfolio:
                     "cost": fill.total_cost,
                 })
 
+        # 资金兜底校验: 浮点误差外若仍出现负现金, 说明成交口径异常。
+        # 记录并归零, 保证「账户余额始终非负」的硬约束。
+        if self.cash < -1e-6:
+            self.cash_floor_hits += 1
+            self.cash = 0.0
+
         self.cost_summary["commission"] += fill.commission
         self.cost_summary["stamp_tax"] += fill.stamp_tax
         self.cost_summary["transfer_fee"] += fill.transfer_fee
@@ -1566,18 +1836,23 @@ class Portfolio:
         self.cost_summary["impact"] += fill.impact_cost
 
         # 逐笔成交流水 (每笔买/卖独立记录, 含成交后账户余额与实现盈亏)
+        # phase/time: 先卖 (09:30) 后买 (09:31), 同一交易日不得同时点双向交易
         self.fills.append({
             "date": fill.date,
+            "time": "09:30:00" if fill.direction == "sell" else "09:31:00",
+            "seq": len(self.fills) + 1,
             "code": fill.code,
             "direction": fill.direction,
             "price": round(fill.fill_price, 3),
             "qty": fill.quantity,
             "amount": round(amount, 2),
             "cost": round(fill.total_cost, 2),
+            "cash_before": round(cash_before, 2),
             "cash_after": round(self.cash, 2),
             "pnl": round(realized_pnl, 2),
             "reason": fill.reason or "",
         })
+        return True
 
 
     def total_value(self, date, bars) -> float:
@@ -1659,6 +1934,39 @@ class FunctionStrategyAdapter(BaseStrategy):
         return SignalEvent(date, buys, sells) if (buys or sells) else None
 
 
+# 价格触发再平衡: 单一标的相对"上次建仓/调仓价"涨跌达到该幅度 → 调回目标权重
+# (仓位占比 75% 时, 价格变动 4% 仅带来约 1% 的权重变化, 单靠权重阈值会长期不调仓)
+PRICE_REBAL_THRESHOLD = 0.04
+
+# 建仓趋势确认: 周 MA30 上升之外, 还要求最近 N 个完整周为阳线 (收盘>开盘)
+MA30_BULL_WEEKS = 2
+# 不追高: 最新价相对周 MA30 的溢价上限 (10%); None/0 = 关闭
+MA30_MAX_PREMIUM = 0.10
+
+
+def _entry_confirm_ok(ma30_cache: dict, code: str, date,
+                      bull_weeks: int = None, max_premium: float = None) -> bool:
+    """建仓确认的后三道门槛: 连续 N 周阳线 + 不追高 + 长期趋势向上
+
+    与「周K MA30 连续上升」共同构成建仓确认, 用于过滤假突破/死猫反弹导致的
+    "建仓后数日即被 MA30 走弱清仓"的草率建仓。仅拦买入, 不影响存量持仓。
+    数据不足时一律放行 (与 MA30 选股过滤的放行口径一致)。
+    """
+    bw = MA30_BULL_WEEKS if bull_weeks is None else int(bull_weeks)
+    mp = MA30_MAX_PREMIUM if max_premium is None else float(max_premium)
+    if weekly_bull_weeks(ma30_cache, code, date, bw) is False:
+        return False
+    # 长期趋势向上: 价格站上最长可用周均线(MA120→MA60), 且周MA30在长均线之上
+    # 过滤下跌趋势中的短期反弹 (如 2023 年中的 510050 空头排列)
+    if weekly_long_trend_ok(ma30_cache, code, date) is False:
+        return False
+    if mp:
+        prem = weekly_ma30_premium(ma30_cache, code, date)
+        if prem is not None and prem > mp:
+            return False
+    return True
+
+
 class MarketCapStrategy(BaseStrategy):
     """
     市值策略: 15-200亿市值主板, 等比例买入总金额的75%, 动态再平衡
@@ -1703,13 +2011,16 @@ class MarketCapStrategy(BaseStrategy):
                  exclude_st=True, exclude_ocf_diverge=True,
                  exclude_nonop_profit=True, exclude_no_dividend=True,
                  dividend_years=3, ma30_lookback=5, universe=None,
-                 ma30_exit=True, ma30_entry_weeks=2,
+                 ma30_exit=True, ma30_entry_weeks=1,
                  rebalance_mode="deviation", rank_buffer=2,
                  check_freq="daily",
                  pool_type="stock", etf_mom_days=60,
-                 etf_min_amount=0.5, etf_min_history=120,
+                 etf_min_amount=0.2, etf_min_history=60,
                  etf_premium_cap=1.0, etf_flow_min=None,
-                 etf_mkt_flow_guard=False, etf_mkt_flow_days=5):
+                 etf_mkt_flow_guard=False, etf_mkt_flow_days=5,
+                 etf_abs_mom_days=60, etf_abs_mom_min=3.0,
+                 etf_max_dd_threshold=0.30, etf_require_ma60_up=True,
+                 etf_ret20_min=0.0, etf_ret60_min=0.0):
         self.top_n = int(top_n)
         # 标的池类型: stock=股票(市值+财务筛选) / etf=ETF(动量排名+流动性门槛)
         # 两类共用同一套建仓/调仓/撮合逻辑, 只有选品规则不同
@@ -1725,6 +2036,16 @@ class MarketCapStrategy(BaseStrategy):
         # 市场级风控: 全市场股票型 ETF 资金持续净流出时不开新仓并清仓
         self.etf_mkt_flow_guard = bool(etf_mkt_flow_guard)
         self.etf_mkt_flow_days = int(etf_mkt_flow_days)
+        # 绝对动量过滤 (ETF): 近 N 日涨幅 < 阈值 → 建仓剔除 / 持仓清仓
+        # 阈值为 0 或 None 时关闭 (与界面语义一致)
+        self.etf_abs_mom_days = int(etf_abs_mom_days or 60)
+        self.etf_abs_mom_min = (None if etf_abs_mom_min is None
+                                else float(etf_abs_mom_min))
+        # 优质标的过滤 (2026-11-20): 历史最大回撤 / MA60 趋势 / 多周期动量
+        self.etf_max_dd_threshold = float(etf_max_dd_threshold)
+        self.etf_require_ma60_up = bool(etf_require_ma60_up)
+        self.etf_ret20_min = float(etf_ret20_min)
+        self.etf_ret60_min = float(etf_ret60_min)
         self._etf_ext = None        # {premium/flow/market} 按日索引的因子字典
         self._mkt_ok = None         # {date: 市场资金流是否健康}
         # 标的池: 指定后跳过市值/财务选股, 只在这些标的内建仓与调仓 (单标的验证用)
@@ -1799,7 +2120,11 @@ class MarketCapStrategy(BaseStrategy):
                       etf_min_history=self.etf_min_history,
                       ma30_up_only=True, ma30_lookback=self.ma30_lookback,
                       ma30_entry_weeks=self.ma30_entry_weeks,
-                      ma30_cache=self._ensure_ma30_cache(), date=date)
+                      ma30_cache=self._ensure_ma30_cache(), date=date,
+                      max_dd_threshold=self.etf_max_dd_threshold,
+                      require_ma60_up=self.etf_require_ma60_up,
+                      ret20_min=self.etf_ret20_min,
+                      ret60_min=self.etf_ret60_min)
             # 溢价/资金流/市场风控: 仅有增强数据时才参与, 否则保持原行为
             if (self.etf_premium_cap or self.etf_flow_min is not None
                     or self.etf_mkt_flow_guard):
@@ -1863,6 +2188,9 @@ class MarketCapStrategy(BaseStrategy):
             return np.nan
         row = self.bars.row(code, date)
         if row is None:
+            # 当日无K线 (停牌/数据缺口): 退化为最近可用收盘价, 与 Portfolio.total_value 口径一致
+            row = self.bars.last_row(code, date)
+        if row is None:
             return np.nan
         return row.get("close", row.get("open", np.nan))
 
@@ -1910,15 +2238,34 @@ class MarketCapStrategy(BaseStrategy):
         return ma30_now <= ma30_past
 
     def _ma30_entry_ok(self, code, date) -> bool:
-        """建仓趋势确认: 周K MA30 连续 N 周上升 (0=关闭)
+        """建仓趋势确认: 周K MA30 连续 N 周上升 + 最近 M 周阳线 + 不追高
 
         数据不足时不拦截 (与 MA30 选股过滤的放行口径一致)。
         """
         weeks = int(self.ma30_entry_weeks)
-        if weeks <= 0:
+        cache = self._ensure_ma30_cache()
+        if weeks > 0:
+            up = ma30_rising_weeks(cache, code, date, weeks)
+            if up is False:
+                return False
+        return _entry_confirm_ok(cache, code, date)
+
+    def _abs_mom_enabled(self) -> bool:
+        """绝对动量过滤是否启用 (ETF 专用, 阈值 0/None = 关闭)"""
+        return (self.pool_type == "etf" and self.etf_abs_mom_min is not None
+                and abs(self.etf_abs_mom_min) > 1e-12)
+
+    def _abs_mom_ok(self, code, date) -> bool:
+        """近 N 日涨幅是否不低于绝对动量阈值 (数据缺失时放行)"""
+        if not self._abs_mom_enabled() or self.bars is None:
             return True
-        up = ma30_rising_weeks(self._ensure_ma30_cache(), code, date, weeks)
-        return up is not False
+        row = self.bars.row(code, date)
+        if row is None:
+            return True
+        r = row.get(f"ret_{self.etf_abs_mom_days}")
+        if r is None or not np.isfinite(r):
+            return True
+        return float(r) >= self.etf_abs_mom_min
 
     def _build_rebalance(self, date, targets: dict, extra_cash: float = 0.0) -> list:
         """
@@ -1939,8 +2286,10 @@ class MarketCapStrategy(BaseStrategy):
 
             cur_mv = cur_price * pos.quantity if pos is not None else 0.0
             diff = target_mv - cur_mv
-            if abs(diff) < cur_price * 100:
-                continue  # 差异不足100股, 跳过
+            # 最小交易额过滤: 既不足 100 股, 又不足 max(3000元, 持仓0.5%) → 视为噪音, 不交易
+            min_trade_mv = max(3000.0, cur_mv * 0.005)
+            if abs(diff) < cur_price * 100 or abs(diff) < min_trade_mv:
+                continue
 
             if diff < 0:
                 if pos is None:
@@ -1981,11 +2330,18 @@ class MarketCapStrategy(BaseStrategy):
         # =========================================
         # 1. 换股逻辑: 持仓中某只 MA30 减小 → 卖出
         # =========================================
-        if portfolio.positions and self.ma30_exit:
+        if portfolio.positions:
             for code in list(portfolio.positions.keys()):
-                if self._ma30_is_decreasing(code, date):
+                if self.ma30_exit and self._ma30_is_decreasing(code, date):
                     sells.append(code)
                     sell_reasons[code] = "ma30_exit"
+                    self._entry_cap_ratios.pop(code, None)
+                    self._entry_prices.pop(code, None)
+                    self._target_weights.pop(code, None)
+                elif self._abs_mom_enabled() and not self._abs_mom_ok(code, date):
+                    # 绝对动量转弱: 强制清仓 (与 MA30 走弱同级)
+                    sells.append(code)
+                    sell_reasons[code] = "abs_mom_exit"
                     self._entry_cap_ratios.pop(code, None)
                     self._entry_prices.pop(code, None)
                     self._target_weights.pop(code, None)
@@ -2002,31 +2358,45 @@ class MarketCapStrategy(BaseStrategy):
         #     持仓只有跌出候选前 top_n+rank_buffer 名才卖出;
         #     空槽位才补最靠前的候选; 不做偏离度再平衡
         #     → 换手从"每天全额重排"降到"只在排名变化时换股"
+        #     补充 (2026-11-22): 清仓当日即用当日排名补位, 不等到下一个检查日,
+        #     保证「持仓数」始终被填满 (有合格候选时不会出现 0 仓)
         # =========================================
-        if (self.rebalance_mode == "topk_drop" and snap and not self.universe
-                and self._is_check_day(date)):
-            ranked = _filter_market_cap_universe(
-                snap, feat=self.feat, **self._selection_kwargs(date))
-            rank_map = {c: i + 1 for i, c in enumerate(ranked)}
-            keep_limit = self.n_slots + self.rank_buffer
-            for code in list(remaining):
-                r = rank_map.get(code)
-                if r is None or r > keep_limit:
-                    sells.append(code)
-                    sell_reasons[code] = "rank_drop"
-                    remaining.remove(code)
-                    sell_codes.add(code)
-                    self._entry_cap_ratios.pop(code, None)
-                    self._entry_prices.pop(code, None)
-                    self._target_weights.pop(code, None)
+        if self.rebalance_mode == "topk_drop" and snap and not self.universe:
+            ranked = None
+            if self._is_check_day(date):
+                ranked = _filter_market_cap_universe(
+                    snap, feat=self.feat, **self._selection_kwargs(date))
+                rank_map = {c: i + 1 for i, c in enumerate(ranked)}
+                keep_limit = self.n_slots + self.rank_buffer
+                # 持仓跌出候选前 top_n+rank_buffer 名即换出 (2026-11-23: ETF 也启用)。
+                # 此前 ETF 只靠周K MA30 走弱退出, 实测出现「排名已跌出标的池仍死扛 85 天」,
+                # 是 2026 年两笔大额亏损的主要来源。
+                for code in list(remaining):
+                    r = rank_map.get(code)
+                    if r is None or r > keep_limit:
+                        sells.append(code)
+                        sell_reasons[code] = "rank_drop"
+                        remaining.remove(code)
+                        sell_codes.add(code)
+                        self._entry_cap_ratios.pop(code, None)
+                        self._entry_prices.pop(code, None)
+                        self._target_weights.pop(code, None)
 
             # 换出后重新计算空槽位 (上面 need_fill 是换出前的值)
             need_fill = self.n_slots - len(remaining)
             if need_fill > 0:
+                if ranked is None:
+                    # 非检查日出现空槽 (清仓后): 用当日排名即时补位
+                    ranked = _filter_market_cap_universe(
+                        snap, feat=self.feat, **self._selection_kwargs(date))
                 candidates = [c for c in ranked
-                              if c not in portfolio.positions and c not in sell_codes][:need_fill]
+                              if c not in portfolio.positions and c not in sell_codes
+                              and self._abs_mom_ok(c, date)][:need_fill]
                 if candidates:
-                    target_each = total_value * self.weight_fraction / self.n_slots
+                    # 按实际持仓数(remaining+candidates)均分目标仓位,
+                    # 避免候选不足 n_slots 时每只只分到 1/n_slots 导致总仓位不足
+                    _actual_n = len(remaining) + len(candidates)
+                    target_each = total_value * self.weight_fraction / max(_actual_n, 1)
                     # 换出回款当日可用于买入 (卖单先于买单执行)
                     proceeds = 0.0
                     for code in sell_codes:
@@ -2037,7 +2407,7 @@ class MarketCapStrategy(BaseStrategy):
                     rebalance_orders = self._build_rebalance(
                         date, {c: target_each for c in candidates}, extra_cash=proceeds)
                     for code in candidates:
-                        self._target_weights[code] = 1.0 / self.n_slots
+                        self._target_weights[code] = 1.0 / max(_actual_n, 1)
                         cap = self._current_cap(code, date)
                         if not np.isnan(cap):
                             self._entry_cap_ratios[code] = cap
@@ -2060,6 +2430,8 @@ class MarketCapStrategy(BaseStrategy):
                         continue
                     if not self._ma30_entry_ok(code, date):
                         continue
+                    if not self._abs_mom_ok(code, date):
+                        continue
                     selected.append(code)
             else:
                 # 选股池: MA30 上升 + 市值/财务过滤 (已由 _filter_market_cap_universe 内置)
@@ -2067,7 +2439,8 @@ class MarketCapStrategy(BaseStrategy):
                     snap, feat=self.feat, **self._selection_kwargs(date))
                 # 排除已持有 + 已卖出的
                 selected = [c for c in selected
-                            if c not in portfolio.positions and c not in sell_codes]
+                            if c not in portfolio.positions and c not in sell_codes
+                            and self._abs_mom_ok(c, date)]
             candidates = selected[:need_fill]
 
             # 对 sell_codes 也清理 _target_weights (可能已在上一步清)
@@ -2077,12 +2450,18 @@ class MarketCapStrategy(BaseStrategy):
             # 计算: 卖出后回笼资金 + 现有持仓市值 → 均分
             # 等比例目标: 总持有标的 (remaining + candidates) 均分 weight_fraction * total_value
             held_plus_new = remaining + candidates
-            if held_plus_new:
-                # 先卖出 sell_codes (全仓卖) — 走标准 sells 通道
-                # 再用 rebalance_orders 对 remaining + candidates 等比例建仓
-                # 卖单和买单在不同 pending queue, 但都是 T+1 执行
-                # 我们用 buys 通道传新候选 → 引擎会自动计算数量
-                buys = candidates
+            # 只有真正要新建仓时才重算等权; 否则 (无候选可补) 不要每天对存量持仓做精确对齐,
+            # 否则会产生每天几百股的碎单 (偏离度调仓由第 3 步的阈值逻辑负责)
+            if held_plus_new and candidates:
+                # 换标的时的资金闭环: 先卖出 sell_codes 回笼资金,
+                # 再用「现金 + 卖出回款」按等权目标买入 remaining + candidates。
+                # 卖单由 sells 通道排队, 引擎按「卖出阶段 → 买入阶段」执行。
+                proceeds = 0.0
+                for code in sell_codes:
+                    pos = portfolio.positions.get(code)
+                    px = self._current_price(code, date)
+                    if pos is not None and px and not np.isnan(px):
+                        proceeds += px * pos.quantity * 0.998
 
                 # 同时维护 _target_weights (等比例)
                 for code in held_plus_new:
@@ -2096,55 +2475,92 @@ class MarketCapStrategy(BaseStrategy):
                         if px and not np.isnan(px):
                             self._entry_prices[code] = px
 
-                # 空仓建仓走 rebalance_orders (精确控制数量)
-                if not remaining and candidates:
-                    target_each = total_value * self.weight_fraction / len(candidates)
-                    targets = {code: target_each for code in candidates}
-                    rebalance_orders = self._build_rebalance(date, targets)
-                    buys = []  # 已由 rebalance_orders 处理
+                # 统一走 rebalance_orders 精确控制数量 (含卖出回款)
+                target_each = total_value * self.weight_fraction / len(held_plus_new)
+                targets = {code: target_each for code in held_plus_new}
+                rebalance_orders = self._build_rebalance(
+                    date, targets, extra_cash=proceeds)
+                buys = []  # 已由 rebalance_orders 处理
 
         # =========================================
-        # 3. 动态调仓: 各标的按自身偏离补仓/减仓 (单只目标恒定, 保持仓位比例)
-        #    价格/市值下跌 → 补仓; 上涨 → 减仓
-        #    只调整自身偏离超阈值的标的, 不会因其他标的涨跌而被连带卖出
+        # 3. 动态调仓 (等权再平衡 + 仓位维持):
+        #    a) 总持仓市值 < weight_fraction * 总资产 且差额超阈值 → 买入补足
+        #    b) 多标的时, 个股市值偏离等权目标超阈值 → 卖高买低, 拉平仓位
+        #    手续费感知: 预计交易金额 < 往返手续费则不调 (避免摩擦损耗)
         # =========================================
         held_codes = [c for c in portfolio.positions.keys() if c in self._target_weights]
-        # 排除当日要卖出的
         held_codes = [c for c in held_codes if c not in sell_codes]
 
-        # 指定标的池时没有"排名"概念, topk_drop 退化为偏离度再平衡;
-        # 否则 universe + topk_drop 会既不换股也不调仓 (一路持有到 MA30 走弱)
-        _deviation_rebal = (self.rebalance_mode != "topk_drop") or bool(self.universe)
+        _deviation_rebal = ((self.rebalance_mode != "topk_drop")
+                            or bool(self.universe)
+                            or self.pool_type == "etf")
         if _deviation_rebal and held_codes and not rebalance_orders:
-            # 单只目标市值: 账户总市值 × 目标仓位 / 持仓数
-            # 用 total_value 而非持仓总市值 → 现金与持仓的比例也保持不变
-            target_each = total_value * self.weight_fraction / max(len(held_codes), 1)
-            targets = {}
+            # 当前总持仓市值
+            cur_total_mv = 0.0
+            code_mv = {}
             for code in held_codes:
                 pos = portfolio.positions.get(code)
-                if pos is None:
+                px = self._current_price(code, date)
+                if pos is None or not px or np.isnan(px):
                     continue
-                cur_price = self._current_price(code, date)
-                if not cur_price or np.isnan(cur_price):
-                    continue
-                cur_mv = cur_price * pos.quantity
-                # a) 自身价格/市值相对建仓基准的偏离: 跌 ≥ 阈值 → 补仓, 涨 ≥ 阈值 → 减仓
-                #    优先用市值 (个股); ETF 无市值数据 → 用价格
-                base_cap = self._entry_cap_ratios.get(code)
-                cur_cap = self._current_cap(code, date)
-                if base_cap and not np.isnan(cur_cap) and base_cap > 0:
-                    cap_dev = cur_cap / base_cap - 1.0
-                else:
+                mv = px * pos.quantity
+                code_mv[code] = (px, mv)
+                cur_total_mv += mv
+
+            if cur_total_mv > 0:
+                n = len(code_mv)
+                # 目标总持仓 = 总资产 × 仓位比例
+                target_total = total_value * self.weight_fraction
+                # 等权目标 = 目标总持仓 / 持仓数
+                target_each = target_total / max(n, 1)
+
+                # 阈值: 统一使用「持仓偏离阈值」(默认 5%), 不再混用市值变化阈值
+                mv_thresh = max(0.0, float(self.rebalance_threshold))
+                # 往返手续费率估算 (佣金+印花税+过户费, 约 0.25%)
+                fee_rate = 0.0025
+
+                targets = {}
+                for code, (px, cur_mv) in code_mv.items():
+                    dev = cur_mv / target_each - 1.0 if target_each > 0 else 0.0
+                    # 价格触发: 相对上次建仓/调仓价涨跌超 4% → 视为需要调回目标权重
                     base_px = self._entry_prices.get(code)
-                    cap_dev = (cur_price / base_px - 1.0) if base_px else 0.0
-                # b) 自身市值相对目标仓位的偏离
-                mv_dev = (cur_mv / target_each - 1.0) if target_each > 0 else 0.0
-                if abs(cap_dev) >= self.cap_change_threshold or \
-                        abs(mv_dev) >= self.rebalance_threshold:
+                    dev_px = (px / base_px - 1.0) if (base_px and base_px > 0) else 0.0
+                    # 触发条件:
+                    #   股票: 权重偏离超阈值 或 价格涨跌超 4% (严格执行低买高卖)
+                    #   ETF : 下跌 ≥4% 补仓, 或权重偏离 ≥5% 再平衡;
+                    #         上涨未达权重阈值时不因 +4% 削赢 (2026-11-23 确认)
+                    if self.pool_type == "etf":
+                        if not (dev_px <= -PRICE_REBAL_THRESHOLD
+                                or abs(dev) >= mv_thresh):
+                            continue
+                    elif abs(dev) < mv_thresh and abs(dev_px) < PRICE_REBAL_THRESHOLD:
+                        continue
+                    # 手续费感知: 调整金额不足以覆盖往返手续费则不调
+                    adj_amount = abs(cur_mv - target_each)
+                    if adj_amount < target_each * fee_rate:
+                        continue
+                    # 100 股整数倍约束: 调整量不足 100 股则不调
+                    if adj_amount < px * 100:
+                        continue
                     targets[code] = target_each
 
-            if targets:
-                rebalance_orders = self._build_rebalance(date, targets)
+                # 总仓位不足: 以「个体调仓后的预计总市值」判断是否仍低于阈值。
+                # 避免单标的偏离时连带触发其他处于阈值内的标的 (测试: 单标的偏离不得连带调仓)。
+                proj_total = cur_total_mv
+                for code, tgt in targets.items():
+                    proj_total += (tgt - code_mv[code][1])
+                total_dev = proj_total / target_total - 1.0 if target_total > 0 else 0.0
+                if total_dev < -mv_thresh and targets:
+                    # 差额仅分摊给已触发调仓的标的, 不再新增处于阈值内的标的
+                    shortfall = (target_total - proj_total) / len(targets)
+                    for code in list(targets.keys()):
+                        px, cur_mv = code_mv[code]
+                        tgt = min(targets[code] + shortfall, target_each * (1 + mv_thresh))
+                        if (tgt - cur_mv) >= px * 100:
+                            targets[code] = tgt
+
+                if targets:
+                    rebalance_orders = self._build_rebalance(date, targets)
 
         if buys or sells or rebalance_orders:
             return SignalEvent(date, buys=buys, sells=sells,
@@ -2309,7 +2725,20 @@ class EventDrivenBacktest:
                             self.portfolio.positions[code].quantity)
                         order.reason = sell_reasons.get(code, "rebalance")
                         self._pending_orders.append(order)
-                per = self.portfolio.cash / self.top_n
+                per = self.portfolio.cash / max(self.top_n, 1)
+                # 买入预算必须包含当日卖出回款 (T+1 先卖后买), 否则换标的时
+                # 只能用剩余现金建仓, 造成仓位不足或异常缩量。
+                if signal.sells:
+                    est_proceeds = 0.0
+                    for _c in signal.sells:
+                        _pos = self.portfolio.positions.get(_c)
+                        if _pos is None:
+                            continue
+                        _row = self.bars.row(_c, current_date)
+                        _px = _row["close"] if _row is not None else None
+                        if _px and _px > 0:
+                            est_proceeds += _pos.quantity * _px * 0.998
+                    per = (self.portfolio.cash + est_proceeds) / max(self.top_n, 1)
                 for code in signal.buys:
                     if code in self.portfolio.positions:
                         continue  # 已持有, 不动
@@ -2320,9 +2749,11 @@ class EventDrivenBacktest:
                     if not ref_px or ref_px <= 0:
                         continue
                     qty = int(per / ref_px / 100) * 100
-                    qty = max(qty, 100)
+                    if qty < 100:
+                        continue   # 资金不足一手 → 不下单, 避免强行买入
                     self._pending_orders.append(OrderEvent(
                         current_date, code, "buy", qty))
+
 
             # === 5. 记录净值 + 每日持仓明细 ===
             pv = self.portfolio.total_value(current_date, self.bars)
@@ -2370,6 +2801,9 @@ class EventDrivenBacktest:
             "holdings_log": self.holdings_log,
             "fills": self.portfolio.fills,
             "fill_blocks": dict(self.fill_blocks),
+            # 资金实时校验结果: 正常应为 0 (无拒单 / 无负现金兜底)
+            "rejected_buys": self.portfolio.rejected_buys,
+            "cash_floor_hits": self.portfolio.cash_floor_hits,
         }
 
     def _do_fill(self, order, date, row):
@@ -2383,7 +2817,8 @@ class EventDrivenBacktest:
         fill = FillEvent(date, order.code, order.direction, order.quantity,
                          fp, comm, stamp, trans, slip, impact,
                          reason=getattr(order, "reason", "rebalance"))
-        self.portfolio.apply_fill(fill)
+        if not self.portfolio.apply_fill(fill):
+            return False
         self.strategy.on_trade(fill)
         return True
 
@@ -2400,6 +2835,8 @@ class EventDrivenBacktest:
         if not enforce:
             self._deferred_sells.clear()
         executed = False
+        # 碎单过滤门槛: 避免因微小偏离反复买卖 (默认 1 万元本金 → 1000 元, 100 万 → 3000 元)
+        _dust = max(500.0, min(3000.0, self.initial_capital * 0.003))
 
         # 1) 先重试此前被跌停/停牌拦住的卖单
         for code, order in list(self._deferred_sells.items()):
@@ -2420,26 +2857,48 @@ class EventDrivenBacktest:
                 self._deferred_sells.pop(code, None)
                 executed = True
 
-        # 2) 处理昨日新产生的订单
-        for order in self._pending_orders:
-            if order.direction == "sell" and order.code in self._deferred_sells:
+        # 2) 拆分为「卖出阶段」与「买入阶段」: 严格先卖后买
+        #    ETF/股票调仓换标的时, 卖出回笼的资金必须先入账, 再用于买入;
+        #    同一交易日不允许先买后卖 (否则可用资金不足会透支)。
+        pending = self._pending_orders
+        sell_orders = [o for o in pending if o.direction == "sell"]
+        buy_orders = [o for o in pending if o.direction == "buy"]
+
+        # 2a) 卖出阶段 (09:30): 回笼资金
+        for order in sell_orders:
+            if order.code in self._deferred_sells:
                 continue  # 同一标的已有更早的顺延卖单, 以它为准
             row = self.bars.row(order.code, date)
             if row is None:
-                if enforce and order.direction == "sell" and order.code in self.portfolio.positions:
+                if enforce and order.code in self.portfolio.positions:
                     self._deferred_sells[order.code] = order
                     self.fill_blocks["sell_suspended"] += 1
-                elif order.direction == "buy":
-                    self.fill_blocks["buy_suspended"] += 1
                 continue
             block = _order_block_reason(self.bars, order, date, self.limit_rules)
             if block:
-                if order.direction == "sell":
-                    self._deferred_sells[order.code] = order
-                    self.fill_blocks[f"sell_{block}"] += 1
-                else:
-                    self.fill_blocks[f"buy_{block}"] += 1
+                self._deferred_sells[order.code] = order
+                self.fill_blocks[f"sell_{block}"] += 1
                 continue
+            _pos = self.portfolio.positions.get(order.code)
+            _px = row.get("open", row["close"]) or 0
+            if _pos is not None and order.quantity * _px < _dust and order.quantity < _pos.quantity:
+                continue  # 碎单不卖 (清仓单不受限制)
+            if self._do_fill(order, date, row):
+                executed = True
+
+        # 2b) 买入阶段 (09:31): 只使用卖出后已到账的现金
+        for order in buy_orders:
+            row = self.bars.row(order.code, date)
+            if row is None:
+                self.fill_blocks["buy_suspended"] += 1
+                continue
+            block = _order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                self.fill_blocks[f"buy_{block}"] += 1
+                continue
+            _px = row.get("open", row["close"]) or 0
+            if order.quantity * _px < _dust:
+                continue  # 碎单不买
             if self._do_fill(order, date, row):
                 executed = True
 

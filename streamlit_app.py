@@ -93,6 +93,7 @@ FILL_REASON_LABELS = {
     "mc_rebalance": "市值调仓",
     "rebalance": "调仓换股",
     "ma30_exit": "MA30走弱清仓",
+    "abs_mom_exit": "绝对动量清仓",
     "rank_drop": "排名跌出换股",
     "hold_expire": "持有到期",
     "limit_up": "涨停卖出",
@@ -1103,6 +1104,500 @@ st.markdown("""
             min-height: 2rem !important;
         }
     }
+
+    /* ================================================================ */
+    /* ============ 赛博朋克主题 (CYBERPUNK THEME OVERRIDE) ============ */
+    /* ================================================================ */
+
+    /* ---- 设计 Token: 最小色板 (霓虹青 + 电光蓝紫) ---- */
+    :root {
+        /* 背景色阶 (深→浅) */
+        --cp-bg-0: #05050f;              /* 全局底色 深空黑 */
+        --cp-bg-1: #0a0a1f;              /* 侧边栏/容器底 深紫黑 */
+        --cp-bg-2: #141430;              /* 卡片/面板底 */
+        --cp-bg-3: #1c1c3e;              /* 悬浮/高亮底 */
+        /* 主色: 霓虹青 (统一主色调) */
+        --cp-primary: #00e5ff;           /* 主霓虹青 */
+        --cp-primary-dim: #00b8cc;       /* 暗青 (边框/次要) */
+        --cp-primary-glow: rgba(0, 229, 255, 0.5);
+        /* 强调色: 电光蓝紫 (点缀) */
+        --cp-accent: #7c6cff;            /* 电光蓝紫 */
+        /* 语义色 (去艳化, A股红涨绿跌) */
+        --cp-up: #ff4d6d;                /* 涨: 柔红 */
+        --cp-down: #3ddc84;              /* 跌: 柔绿 */
+        /* 文字 (高对比) */
+        --cp-text: #f5f8ff;              /* 主文字 亮冷白 */
+        --cp-text-dim: #c0cbe8;          /* 次要文字 (提亮保证可读) */
+        --cp-text-faint: #6b7596;        /* 辅助文字 (仅标签/说明) */
+        /* 边框 */
+        --cp-border: rgba(0, 229, 255, 0.22);
+        --cp-border-strong: rgba(0, 229, 255, 0.5);
+        /* 发光 */
+        --cp-glow: 0 0 8px rgba(0, 229, 255, 0.5), 0 0 20px rgba(0, 229, 255, 0.25);
+
+        /* ---- 覆盖 Streamlit 原生主题变量 (使 st.success/tabs/info 等走暗色) ---- */
+        --primary-50: rgba(0, 229, 255, 0.10);
+        --primary-100: rgba(0, 229, 255, 0.18);
+        --primary-200: rgba(0, 229, 255, 0.30);
+        --primary-300: rgba(0, 229, 255, 0.50);
+        --primary-400: rgba(0, 229, 255, 0.70);
+        --primary-500: #00e5ff;
+        --primary-600: #00b8cc;
+        --primary-700: #008a99;
+        --bg-page: #05050f;
+        --bg-card: #141430;
+        --bg-elevated: #1c1c3e;
+        --border-subtle: rgba(0, 229, 255, 0.22);
+        --border-default: rgba(0, 229, 255, 0.35);
+        --text-primary: #f5f8ff;
+        --text-secondary: #c0cbe8;
+        --text-tertiary: #8b95b5;
+        --text-quaternary: #6b7596;
+    }
+
+    /* ---- 全局背景: 深空黑 + 淡网格 ---- */
+    .stApp {
+        background:
+            radial-gradient(ellipse at 15% 0%, rgba(124, 108, 255, 0.12) 0%, transparent 45%),
+            radial-gradient(ellipse at 85% 100%, rgba(0, 229, 255, 0.08) 0%, transparent 45%),
+            linear-gradient(180deg, var(--cp-bg-0) 0%, var(--cp-bg-1) 100%) !important;
+        background-attachment: fixed !important;
+    }
+    .stApp::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background-image:
+            linear-gradient(rgba(0, 229, 255, 0.025) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(0, 229, 255, 0.025) 1px, transparent 1px);
+        background-size: 40px 40px;
+        pointer-events: none;
+        z-index: 0;
+    }
+    /* 扫描线: 极淡质感, 不挡字 */
+    .stApp::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background: repeating-linear-gradient(
+            0deg, transparent, transparent 3px,
+            rgba(0, 0, 0, 0.05) 3px, rgba(0, 0, 0, 0.05) 4px
+        );
+        pointer-events: none;
+        z-index: 9998;
+        opacity: 0.10;
+    }
+
+    /* ---- 文字 (高对比, 仅文本节点) ---- */
+    html, body, p, span, li, label, td, th {
+        color: var(--cp-text) !important;
+    }
+    h1, h2, h3, h4 {
+        color: var(--cp-primary) !important;
+        text-shadow: 0 0 10px var(--cp-primary-glow) !important;
+        letter-spacing: 0.05em !important;
+    }
+    h1, h2 { font-family: 'Courier New', 'Consolas', monospace !important; }
+    h2 { border-bottom: 1px solid var(--cp-border); padding-bottom: 0.3rem; }
+
+    /* ---- 侧边栏 ---- */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, var(--cp-bg-1) 0%, var(--cp-bg-0) 100%) !important;
+        border-right: 1px solid var(--cp-border) !important;
+        box-shadow: 2px 0 20px rgba(0, 229, 255, 0.08) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stRadioGroup"] > div[data-selected="true"] {
+        background: rgba(0, 229, 255, 0.10) !important;
+        border-left: 2px solid var(--cp-primary) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stRadioGroup"] > div[data-selected="true"] p {
+        color: var(--cp-primary) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stRadioGroup"] p {
+        color: var(--cp-text-dim) !important;
+    }
+    section[data-testid="stSidebar"] label { color: var(--cp-text-dim) !important; }
+    /* 侧边栏品牌按钮 */
+    section[data-testid="stSidebar"] button[kind="secondary"]:first-of-type {
+        color: var(--cp-primary) !important;
+        text-shadow: 0 0 10px var(--cp-primary-glow) !important;
+        font-family: 'Courier New', monospace !important;
+    }
+
+    /* ---- Metric 卡片 ---- */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, var(--cp-bg-2) 0%, var(--cp-bg-1) 100%) !important;
+        border: 1px solid var(--cp-border) !important;
+        border-radius: 8px !important;
+        padding: 0.75rem 1rem !important;
+        box-shadow: 0 0 10px rgba(0, 229, 255, 0.06) !important;
+        transition: all 0.25s ease !important;
+    }
+    div[data-testid="stMetric"]:hover {
+        border-color: var(--cp-primary) !important;
+        box-shadow: var(--cp-glow) !important;
+    }
+    /* Metric 标签 (覆盖所有可能结构, 高优先级强制亮色) */
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"],
+    div[data-testid="stMetric"] [data-testid="stMetricLabel"] *,
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] > div:first-child,
+    div[data-testid="stMetric"] div[class*="label"],
+    div[data-testid="stMetric"] div[class*="Label"] {
+        color: var(--cp-text) !important;
+        opacity: 1 !important;
+        font-size: 0.85rem !important;
+    }
+    /* Metric 数值 (加强发光) */
+    div[data-testid="stMetric"] [data-testid="stMetricValue"],
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] * {
+        color: var(--cp-primary) !important;
+        font-family: 'Courier New', 'Consolas', monospace !important;
+        font-weight: 700 !important;
+        text-shadow: 0 0 12px var(--cp-primary-glow), 0 0 4px var(--cp-primary-glow) !important;
+    }
+    /* Metric 涨跌 (A股红涨绿跌, 去艳化) */
+    div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+        color: var(--cp-up) !important;
+    }
+    [data-testid="stMetricDelta"] svg { display: none; }
+
+    /* ---- 表格 (st.dataframe) ---- */
+    .stDataFrame, [data-testid="stDataFrame"] {
+        border: 1px solid var(--cp-border) !important;
+        border-radius: 8px !important;
+        overflow: hidden !important;
+        background: var(--cp-bg-2) !important;
+    }
+    /* streamlit 已切换 dark 主题, dataframe canvas 自带暗色, 此处仅统一容器色 */
+    [data-testid="stDataFrame"] div[role="grid"],
+    [data-testid="stDataFrame"] [data-testid="stDataFrameGlideDataEditor"] {
+        background: var(--cp-bg-2) !important;
+    }
+    [data-testid="stDataFrame"] table { background: var(--cp-bg-2) !important; }
+    [data-testid="stDataFrame"] th,
+    [data-testid="stDataFrame"] [role="columnheader"] {
+        background: linear-gradient(180deg, rgba(0, 229, 255, 0.12) 0%, rgba(0, 229, 255, 0.04) 100%) !important;
+        color: var(--cp-primary) !important;
+        border-bottom: 1px solid var(--cp-border-strong) !important;
+        font-family: 'Courier New', monospace !important;
+    }
+    [data-testid="stDataFrame"] td,
+    [data-testid="stDataFrame"] [role="gridcell"] {
+        border-bottom: 1px solid rgba(0, 229, 255, 0.06) !important;
+        color: var(--cp-text) !important;
+    }
+    [data-testid="stDataFrame"] tr:hover td,
+    [data-testid="stDataFrame"] [role="row"]:hover [role="gridcell"] {
+        background: rgba(0, 229, 255, 0.05) !important;
+    }
+
+    /* ---- 按钮 (兼容 .stButton 与 [data-testid="stButton"]) ---- */
+    .stButton > button,
+    [data-testid="stButton"] > button,
+    button[kind="primary"],
+    button[kind="secondary"] {
+        background: linear-gradient(135deg, rgba(0, 229, 255, 0.12) 0%, rgba(124, 108, 255, 0.12) 100%) !important;
+        border: 1px solid var(--cp-primary) !important;
+        color: var(--cp-primary) !important;
+        border-radius: 4px !important;
+        font-family: 'Courier New', monospace !important;
+        letter-spacing: 0.05em !important;
+        font-size: 0.8rem !important;
+        transition: all 0.2s ease !important;
+        box-shadow: 0 0 6px rgba(0, 229, 255, 0.15) !important;
+    }
+    .stButton > button:hover,
+    [data-testid="stButton"] > button:hover,
+    button[kind="primary"]:hover,
+    button[kind="secondary"]:hover {
+        background: linear-gradient(135deg, rgba(0, 229, 255, 0.25) 0%, rgba(124, 108, 255, 0.25) 100%) !important;
+        box-shadow: var(--cp-glow) !important;
+    }
+    /* 选中/禁用态的策略胶囊 */
+    .stButton > button:disabled,
+    [data-testid="stButton"] > button:disabled,
+    button[kind="primary"]:disabled,
+    button[kind="secondary"]:disabled {
+        background: linear-gradient(135deg, rgba(0, 229, 255, 0.25) 0%, rgba(124, 108, 255, 0.25) 100%) !important;
+        color: var(--cp-primary) !important;
+        border-color: var(--cp-primary) !important;
+        opacity: 1 !important;
+    }
+
+    /* ---- 输入框 / 选择器 ---- */
+    .stTextInput input, .stNumberInput input, .stTextArea textarea,
+    .stSelectbox [data-baseweb="select"], .stMultiSelect [data-baseweb="select"] {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        color: var(--cp-text) !important;
+        border-radius: 4px !important;
+    }
+    .stTextInput input:focus, .stNumberInput input:focus, .stTextArea textarea:focus {
+        border-color: var(--cp-primary) !important;
+        box-shadow: var(--cp-glow) !important;
+    }
+    /* 数字输入框的 +/- 按钮 */
+    .stNumberInput button {
+        background: var(--cp-bg-3) !important;
+        color: var(--cp-primary) !important;
+        border-color: var(--cp-border) !important;
+    }
+    .stNumberInput button:hover {
+        background: rgba(0, 229, 255, 0.15) !important;
+    }
+    /* 日期输入框 */
+    .stDateInput input {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        color: var(--cp-text) !important;
+        border-radius: 4px !important;
+    }
+    /* 滑块 (range input) —— 原生控件需要单独覆盖 */
+    input[type="range"] {
+        background: var(--cp-bg-3) !important;
+        border-radius: 4px !important;
+    }
+    input[type="range"]::-webkit-slider-runnable-track {
+        background: linear-gradient(90deg, var(--cp-primary), var(--cp-accent)) !important;
+        border-radius: 4px !important;
+        height: 6px !important;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+        background: var(--cp-primary) !important;
+        border: 2px solid var(--cp-bg-0) !important;
+        border-radius: 50% !important;
+        box-shadow: 0 0 6px var(--cp-primary) !important;
+        margin-top: -5px !important;
+    }
+    input[type="range"]::-moz-range-track {
+        background: linear-gradient(90deg, var(--cp-primary), var(--cp-accent)) !important;
+        border-radius: 4px !important;
+        height: 6px !important;
+    }
+    input[type="range"]::-moz-range-thumb {
+        background: var(--cp-primary) !important;
+        border: 2px solid var(--cp-bg-0) !important;
+        border-radius: 50% !important;
+        box-shadow: 0 0 6px var(--cp-primary) !important;
+    }
+    /* 弹窗 (st.dialog) 暗色 */
+    [data-testid="stDialog"] {
+        background: var(--cp-bg-1) !important;
+        border: 1px solid var(--cp-border) !important;
+    }
+    /* 弹窗内所有 DIV 默认透明 (避免 Streamlit 内部白底透出) */
+    [data-testid="stDialog"] div {
+        background: transparent !important;
+    }
+    [data-testid="stDialog"] [data-testid="stVerticalBlock"] {
+        background: transparent !important;
+    }
+    [data-testid="stDialog"] header,
+    [data-testid="stDialogTitle"] {
+        color: var(--cp-primary) !important;
+        background: var(--cp-bg-1) !important;
+    }
+    /* 弹窗关闭按钮 (X) */
+    [data-testid="stDialog"] button[aria-label="Close"] {
+        background: var(--cp-bg-3) !important;
+        color: var(--cp-text-dim) !important;
+    }
+    [data-testid="stDialog"] button[aria-label="Close"]:hover {
+        background: rgba(0, 229, 255, 0.15) !important;
+        color: var(--cp-primary) !important;
+    }
+    /* 下拉选项 */
+    [data-baseweb="popover"] ul {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+    }
+    [data-baseweb="popover"] li {
+        color: var(--cp-text) !important;
+    }
+    [data-baseweb="popover"] li[aria-selected="true"],
+    [data-baseweb="popover"] li:hover {
+        background: rgba(0, 229, 255, 0.12) !important;
+        color: var(--cp-primary) !important;
+    }
+
+    /* ---- 滑块 ---- */
+    [data-testid="stSlider"] [role="slider"] {
+        background: var(--cp-primary) !important;
+        box-shadow: 0 0 8px var(--cp-primary) !important;
+    }
+    [data-testid="stSlider"] > div > div > div > div {
+        background: linear-gradient(90deg, var(--cp-primary), var(--cp-accent)) !important;
+    }
+
+    /* ---- 选项卡 (Tabs) ---- */
+    .stTabs [data-baseweb="tab-list"] {
+        background: var(--cp-bg-2) !important;
+        border-bottom: 1px solid var(--cp-border) !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        color: var(--cp-text-dim) !important;
+        font-family: 'Courier New', monospace !important;
+    }
+    .stTabs [aria-selected="true"] {
+        color: var(--cp-primary) !important;
+        border-bottom: 2px solid var(--cp-primary) !important;
+    }
+
+    /* ---- 展开器 / 容器 ---- */
+    .streamlit-expanderHeader, [data-testid="stExpander"] {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        border-radius: 6px !important;
+    }
+    .streamlit-expanderHeader:hover {
+        border-color: var(--cp-primary) !important;
+    }
+
+    /* ---- 原生提示框 (success/info/warning/error) ---- */
+    [data-testid="stAlert"] {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        border-radius: 6px !important;
+    }
+    [data-testid="stAlert"] p, [data-testid="stAlert"] div {
+        color: var(--cp-text) !important;
+    }
+    /* success 绿框 */
+    [data-testid="stAlert"][data-testid*="success"],
+    .stAlert[data-testid*="success"] {
+        border-color: rgba(61, 220, 132, 0.4) !important;
+    }
+
+    /* ---- 列容器 (防止 st.columns 透出白底) ---- */
+    [data-testid="column"], [data-testid="stColumn"] {
+        background: transparent !important;
+    }
+    [data-testid="stHorizontalBlock"] {
+        gap: 1rem !important;
+    }
+
+    /* ---- 代码块 ---- */
+    code, pre {
+        font-family: 'Courier New', 'Consolas', monospace !important;
+        background: var(--cp-bg-2) !important;
+        color: var(--cp-down) !important;
+        border: 1px solid rgba(61, 220, 132, 0.25) !important;
+        border-radius: 4px !important;
+    }
+
+    /* ---- 顶部 Header ---- */
+    header[data-testid="stHeader"] {
+        background: rgba(5, 5, 15, 0.8) !important;
+        backdrop-filter: blur(8px);
+        border-bottom: 1px solid var(--cp-border) !important;
+    }
+
+    /* ---- 滚动条 ---- */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--cp-bg-1); }
+    ::-webkit-scrollbar-thumb {
+        background: linear-gradient(180deg, var(--cp-primary), var(--cp-accent));
+        border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--cp-primary);
+        box-shadow: 0 0 8px var(--cp-primary);
+    }
+
+    /* ---- 主内容区 ---- */
+    .block-container, [data-testid="stAppViewContainer"] {
+        background: transparent !important;
+    }
+
+    /* ---- Markdown 表格 ---- */
+    .stMarkdown table {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        border-radius: 6px !important;
+        overflow: hidden !important;
+    }
+    .stMarkdown th {
+        background: rgba(0, 229, 255, 0.10) !important;
+        color: var(--cp-primary) !important;
+        border-bottom: 1px solid var(--cp-border-strong) !important;
+    }
+    .stMarkdown td {
+        border-bottom: 1px solid rgba(0, 229, 255, 0.08) !important;
+        color: var(--cp-text) !important;
+    }
+
+    /* ---- 进度条 ---- */
+    [data-testid="stProgress"] > div > div > div {
+        background: linear-gradient(90deg, var(--cp-primary), var(--cp-accent)) !important;
+        box-shadow: 0 0 8px var(--cp-primary) !important;
+    }
+
+    /* ---- Spinner ---- */
+    [data-testid="stSpinner"] svg circle {
+        stroke: var(--cp-primary) !important;
+    }
+
+    /* ---- 图表文字 (Plotly/Altair SVG) 提亮 ---- */
+    [data-testid="stPlotlyChart"] svg text,
+    [data-testid="stVegaLiteChart"] svg text,
+    [data-testid="stArrowVegaLiteChart"] svg text {
+        fill: var(--cp-text) !important;
+        font-weight: 500 !important;
+    }
+    /* 图表坐标轴/网格线 (只作用于轴与网格, 绝不能碰数据线 trace) */
+    [data-testid="stPlotlyChart"] svg .gridlayer path,
+    [data-testid="stPlotlyChart"] svg .axislayer-above path,
+    [data-testid="stPlotlyChart"] svg .zerolinelayer path {
+        stroke: rgba(168, 180, 212, 0.22) !important;
+    }
+    /* 图表容器背景 */
+    [data-testid="stPlotlyChart"], [data-testid="stArrowVegaLiteChart"],
+    [data-testid="stVegaLiteChart"] {
+        background: var(--cp-bg-2) !important;
+        border-radius: 8px !important;
+    }
+    /* Plotly 内部白底覆盖 (SVG rect fill) */
+    .js-plotly-plot .bg,
+    .js-plotly-plot .bgplot,
+    .js-plotly-plot rect[fill="white"],
+    .js-plotly-plot rect[fill="#fff"],
+    .js-plotly-plot rect[fill="#ffffff"],
+    .js-plotly-plot rect[fill="rgb(255,255,255)"] {
+        fill: var(--cp-bg-2) !important;
+    }
+    .js-plotly-plot .plot-container,
+    .js-plotly-plot .svg-container {
+        background: var(--cp-bg-2) !important;
+    }
+
+    /* ---- 覆盖内联白底卡片组件 (市场卡片/新闻/稳健性等) ---- */
+    .card, .m, .news-card {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+        color: var(--cp-text) !important;
+    }
+    .card .nm, .card .gp, .card .meta,
+    .m .nm, .m .gp, .m .meta {
+        color: var(--cp-text-dim) !important;
+    }
+    .card .px, .m .px {
+        color: var(--cp-primary) !important;
+    }
+    /* 新闻卡片文字 */
+    .news-card-title { color: var(--cp-text) !important; }
+    .news-card-content { color: var(--cp-text-dim) !important; }
+    .news-card-meta .src { color: var(--cp-primary) !important; }
+    .news-card-meta .time { color: var(--cp-text-faint) !important; }
+    .chart {
+        background: var(--cp-bg-2) !important;
+        border: 1px solid var(--cp-border) !important;
+    }
+    /* 内联表格白底覆盖 */
+    table[style*="background:#fff"], table[style*="background: #fff"] {
+        background: var(--cp-bg-2) !important;
+    }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -1135,19 +1630,24 @@ BT_PARAM_DEFAULTS = {
     "ret_20_min": 5, "cap_max": 200, "require_ma20": True,
     "mc_cap_min": 15, "mc_cap_max": 200, "mc_weight_frac": 0.75,
     "mc_cap_chg_th": 0.04, "mc_rebal_th": 0.05, "mc_listed_yrs": 3.0,
-    "mc_ma30_lookback": 5, "mc_universe": "", "mc_ma30_exit": True,
+    "mc_ma30_lookback": 5, "mc_ma30_exit": True,
     "mc_entry_weeks": 2,
     "mc_ex_st": True, "mc_ex_ocf": True, "mc_ex_nonop": True,
     "mc_ex_nodiv": True, "mc_div_years": 3,
-    "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_universe_list": [],
+    "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop",
     # ETF 策略 (池选品: 动量排名 + 流动性/趋势门槛, 无财务/分红参数)
     "etf_mom_days": 60, "etf_min_amount": 0.5, "etf_min_history": 120,
-    "etf_weight_frac": 0.95, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
+    "etf_weight_frac": 0.75, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
     "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
     "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_check_freq": "weekly",
     # ETF 风控因子 (华泰柏瑞增强数据: 溢价率 / 资金流 / 全市场资金流)
-    "etf_premium_cap": 1.0, "etf_flow_on": False, "etf_flow_min": -3.0,
+    "etf_premium_cap": 0.0, "etf_flow_on": True, "etf_flow_min": -3.0,
     "etf_mkt_flow_guard": False, "etf_mkt_flow_days": 5,
+    # 绝对动量过滤 (池选品时的强弱过滤): 60日涨幅 < 阈值则不买/强制卖出
+    "etf_abs_mom_days": 60, "etf_abs_mom_min": 3.0,
+    # ETF 优质标的过滤 (中长期向上趋势 + 低回撤, 对标纳指科技ETF 159509 周K形态)
+    "etf_max_dd_th": 30, "etf_ma60_up": True,
+    "etf_ret20_min": 0, "etf_ret60_min": 0,
 }
 for _k, _v in BT_PARAM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -1184,6 +1684,10 @@ def _load_bt_settings():
                 saved[k] = pd.to_datetime(saved[k])
             except Exception:
                 saved.pop(k, None)
+    # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
+    _mdd = saved.get("etf_max_dd_th")
+    if isinstance(_mdd, (int, float)) and _mdd < 1:
+        saved["etf_max_dd_th"] = int(round(_mdd * 100))
     for k in _BT_PERSIST_KEYS:
         if k in saved:
             st.session_state[k] = saved[k]
@@ -1212,7 +1716,7 @@ _APPLY_KEYS = {
     "小市值轮动·戴维斯双击": ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
                                "sd_turn_min", "sd_turn_max"),
     "动量+均线+小市值": ("ret_20_min", "cap_max", "require_ma20"),
-    "市值策略": ("mc_universe_list", "mc_cap_min", "mc_cap_max", "mc_listed_yrs",
+    "市值策略": ("mc_cap_min", "mc_cap_max", "mc_listed_yrs",
                  "mc_div_years", "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop",
                  "mc_ex_nodiv", "mc_ma30_exit", "mc_ma30_lookback",
                  "mc_entry_weeks",
@@ -1224,7 +1728,9 @@ _APPLY_KEYS = {
                  "etf_cap_chg_th", "etf_rebal_th", "etf_ma30_exit",
                  "etf_ma30_lookback", "etf_entry_weeks",
                  "etf_premium_cap", "etf_flow_on", "etf_flow_min",
-                 "etf_mkt_flow_guard", "etf_mkt_flow_days"),
+                 "etf_mkt_flow_guard", "etf_mkt_flow_days",
+                 "etf_max_dd_th", "etf_ma60_up",
+                 "etf_ret20_min", "etf_ret60_min"),
 }
 
 # 函数式策略: 引擎参数名 -> 界面 session_state 键
@@ -1308,8 +1814,14 @@ def get_feat_data(fingerprint: str = ""):
 
 def require_data() -> dict:
     """需要计算的页面调用: 首次加载时提示, 无数据则中止"""
-    with st.spinner("📚 加载行情与因子..." if lang() == "zh" else "📚 Loading bars & factors..."):
+    # 同一会话内已加载过 → 直接走 cache, 不再闪 spinner
+    if st.session_state.get("_feat_ready"):
         feat = get_feat_data(DATA_FINGERPRINT)
+    else:
+        with st.spinner("📚 加载行情与因子..." if lang() == "zh" else "📚 Loading bars & factors..."):
+            feat = get_feat_data(DATA_FINGERPRINT)
+        if feat:
+            st.session_state["_feat_ready"] = True
     if not feat:
         st.warning("📭 数据库正在初始化，Worker 已在后台自动自举全A股 + ETF 日线（首次约 20-40 分钟）。请稍后刷新页面，或到「💾 数据管理」页查看任务进度。"
                    if lang() == "zh" else
@@ -1389,10 +1901,18 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
+BACKTEST_LOGIC_VERSION = 9  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+# v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
+# v8: ETF 启用 Topk-Drop 排名换出；ETF 上涨不再因 +4% 削赢（仅下跌补仓 / 权重偏离≥5%）
+# v9: ETF 绝对动量阈值默认 0% → 3%（top_n=5, 2024-01~2026-11: 收益 +22.0%→+53.8%,
+#     最大回撤 -14.7%→-13.3%, 夏普 0.74→1.19; K=4 稳健分 0.17→0.45）
+
+
 def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
     """当前回测参数 (含成本/撮合指纹)。参数不变 → 直接复用库内最近结果"""
     ss = st.session_state
     p = {
+        "logic_v": BACKTEST_LOGIC_VERSION,
         "initial_capital": int(float(initial)),
         "hold_days": int(hold),
         "top_n": int(top),
@@ -1402,10 +1922,9 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
         "cost": _cost_str(),
     }
     if strategy_key == "市值策略":
-        uni = sorted(str(c) for c in (ss.get("mc_universe_list") or []))
         p.update({
-            "universe": uni,
-            "top_n": len(uni) if uni else int(top),
+            "universe": None,
+            "top_n": int(top),
             "cap_min": float(ss["mc_cap_min"]),
             "cap_max": float(ss["mc_cap_max"]),
             "weight_fraction": float(ss["mc_weight_frac"]),
@@ -1426,6 +1945,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
     elif strategy_key == "ETF策略":
         p.update({
             "pool_type": "etf",
+            "universe": None,
             "top_n": int(top),
             "etf_mom_days": int(ss["etf_mom_days"]),
             "etf_min_amount": float(ss["etf_min_amount"]),
@@ -1443,6 +1963,12 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "etf_flow_min": float(ss["etf_flow_min"]) if ss["etf_flow_on"] else None,
             "etf_mkt_flow_guard": bool(ss["etf_mkt_flow_guard"]),
             "etf_mkt_flow_days": int(ss["etf_mkt_flow_days"]),
+            "etf_abs_mom_days": int(ss.get("etf_abs_mom_days", 60)),
+            "etf_abs_mom_min": float(ss.get("etf_abs_mom_min", 3.0)),
+            "etf_max_dd_threshold": float(ss.get("etf_max_dd_th", 30)) / 100.0,
+            "etf_require_ma60_up": bool(ss.get("etf_ma60_up", True)),
+            "etf_ret20_min": float(ss.get("etf_ret20_min", 0)),
+            "etf_ret60_min": float(ss.get("etf_ret60_min", 0)),
         })
     elif strategy_key in _FN_PARAM_MAP:
         p["params"] = {k: ss.get(v) for k, v in _FN_PARAM_MAP[strategy_key].items()}
@@ -1487,6 +2013,12 @@ def _run_backtest_params(strategy_key, params, feat_data):
             etf_flow_min=params.get("etf_flow_min"),
             etf_mkt_flow_guard=params.get("etf_mkt_flow_guard", False),
             etf_mkt_flow_days=params.get("etf_mkt_flow_days", 5),
+            etf_abs_mom_days=params.get("etf_abs_mom_days", 60),
+            etf_abs_mom_min=params.get("etf_abs_mom_min", 0.0),
+            etf_max_dd_threshold=params.get("etf_max_dd_threshold", 0.30),
+            etf_require_ma60_up=params.get("etf_require_ma60_up", True),
+            etf_ret20_min=params.get("etf_ret20_min", 0.0),
+            etf_ret60_min=params.get("etf_ret60_min", 0.0),
         )
         return run_backtest(
             feat_data, mc, strategy_params={},
@@ -1563,7 +2095,7 @@ _CFG_KEYS = ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
              "sd_turn_min", "sd_turn_max",
              "ret_20_min", "cap_max", "require_ma20",
              "mc_cap_min", "mc_cap_max", "mc_weight_frac", "mc_cap_chg_th",
-             "mc_rebal_th", "mc_listed_yrs", "mc_ma30_lookback", "mc_universe",
+             "mc_rebal_th", "mc_listed_yrs", "mc_ma30_lookback",
              "mc_ma30_exit", "mc_entry_weeks",
              "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop", "mc_ex_nodiv", "mc_div_years")
 
@@ -1597,21 +2129,21 @@ def _render_top_nav(cur_page: str, subtitle: str = None, cfg_toggle=None):
 _MARKET_CARDS_HTML = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
   * { box-sizing: border-box; }
-  body { margin:0; font-family: 'Inter', -apple-system, BlinkMacSystemFont,
+  body { margin:0; background:#0a0a1f; font-family: 'Inter', -apple-system, BlinkMacSystemFont,
                    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; }
   .grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; }
-  .card { background:#fff; border:1px solid #e8ecf1; border-radius:12px;
-          padding:8px 12px; box-shadow:0 1px 2px rgba(17,24,39,.04);
+  .card { background:#141430; border:1px solid rgba(0,229,255,0.22); border-radius:12px;
+          padding:8px 12px; box-shadow:0 0 8px rgba(0,229,255,0.06);
           transition: box-shadow 0.15s ease, border-color 0.15s ease; }
-  .card:hover { box-shadow:0 2px 8px rgba(17,24,39,.08); border-color:#d9dee6; }
-  .nm { font-size:12px; color:#475569; font-weight:500;
+  .card:hover { box-shadow:0 0 12px rgba(0,229,255,0.2); border-color:#00e5ff; }
+  .nm { font-size:12px; color:#c0cbe8; font-weight:500;
         white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
         display:flex; align-items:center; gap:2px; }
-  .gp { color:#94a3b8; font-size:10px; margin-left:auto; font-weight:400; }
-  .px { font-size:17px; font-weight:700; line-height:1.35; color:#1a1f2e;
+  .gp { color:#6b7596; font-size:10px; margin-left:auto; font-weight:400; }
+  .px { font-size:17px; font-weight:700; line-height:1.35; color:#00e5ff;
         font-variant-numeric: tabular-nums; letter-spacing:-0.01em; }
   .pc { font-size:11.5px; font-weight:600; margin-left:2px; }
-  .meta { margin-top:8px; font-size:11px; color:#94a3b8; font-variant-numeric: tabular-nums; }
+  .meta { margin-top:8px; font-size:11px; color:#6b7596; font-variant-numeric: tabular-nums; }
   /* 响应式 */
   @media (max-width: 1024px) { .grid { grid-template-columns:repeat(3, 1fr); } }
   @media (max-width: 768px) {
@@ -1626,31 +2158,112 @@ _MARKET_CARDS_HTML = r"""
     .px { font-size:14px; }
     .gp { display:none; }
   }
+  /* 世界地图区域筛选 */
+  .mapwrap { position:relative; border:1px solid rgba(0,229,255,0.16); border-radius:12px;
+             background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; margin-bottom:8px; }
+  svg.ww { width:100%; height:auto; max-height:190px; display:block; }
+  .rg { fill:#1b2750; stroke:#2c3c66; stroke-width:1.2; cursor:pointer;
+        transition:fill 0.15s ease, stroke 0.15s ease; }
+  .rg:hover { fill:#24406e; }
+  .rg.live { animation: breathe 1.8s ease-in-out infinite alternate; }
+  @keyframes breathe {
+    from { fill:#123a37; stroke:#0a7f6b; }
+    to   { fill:#127a5c; stroke:#00ffa3; }
+  }
+  .legend { margin-top:4px; font-size:10.5px; color:#6b7596; display:flex; gap:12px; align-items:center; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#00ffa3;
+         box-shadow:0 0 6px #00ffa3; margin-right:4px; animation:blink 1.8s ease-in-out infinite alternate; }
+  @keyframes blink { from { opacity:0.35; } to { opacity:1; } }
+  .gl { fill:#7b86a8; font-size:12px; pointer-events:none; }
+  .tip { position:absolute; right:10px; top:6px; font-size:10.5px; color:#6b7596; }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 8px; }
+  .tab { font-size:11.5px; padding:3px 10px; border-radius:999px; cursor:pointer;
+         border:1px solid #2c3c66; color:#c0cbe8; user-select:none; }
+  .tab:hover { border-color:#4b5f8f; }
+  .tab.on { background:rgba(0,229,255,0.14); border-color:#00e5ff; color:#7fe9ff; }
 </style></head><body>
+<div class="mapwrap">
+  <svg class="ww" viewBox="0 0 800 340" aria-label="世界主要市场区域图">
+    <g class="rg" data-r="美洲">
+      <path d="M70,62 L180,42 L300,50 L318,92 L286,120 L250,132 L236,168 L206,186 L180,160 L140,150 L96,120 Z"/>
+      <path d="M238,196 L292,190 L308,232 L300,282 L272,322 L252,296 L244,252 L228,222 Z"/>
+    </g>
+    <g class="rg" data-r="欧洲">
+      <path d="M372,52 L452,42 L470,66 L462,104 L430,126 L396,112 L378,84 Z"/>
+    </g>
+    <path d="M392,140 L470,132 L492,168 L482,222 L450,276 L416,280 L396,232 L384,184 Z" fill="#16203f" stroke="#26324f" stroke-width="1.2"/>
+    <path d="M452,124 L510,120 L516,150 L470,160 L448,144 Z" fill="#16203f" stroke="#26324f" stroke-width="1.2"/>
+    <g class="rg" data-r="亚太">
+      <path d="M492,58 L640,46 L742,58 L768,104 L742,152 L700,196 L640,210 L576,186 L534,142 L506,100 Z"/>
+    </g>
+    <g class="rg" data-r="中国">
+      <circle cx="666" cy="120" r="18"/>
+    </g>
+    <g class="rg" data-r="港股">
+      <circle cx="701" cy="152" r="9"/>
+    </g>
+    <text class="gl" x="180" y="120">北美洲</text>
+    <text class="gl" x="258" y="268">南美洲</text>
+    <text class="gl" x="404" y="92">欧洲</text>
+    <text class="gl" x="418" y="212">非洲</text>
+    <text class="gl" x="612" y="110">亚太</text>
+    <text class="gl" x="654" y="124" style="font-size:10.5px;fill:#7fe9ff;">中国</text>
+    <text class="gl" x="694" y="170" style="font-size:9.5px;fill:#9fb0d0;">香港</text>
+  </svg>
+  <div class="tip">点击区域筛选行情</div>
+  <div class="legend"><span><span class="dot"></span>闪烁 = 该市场正在交易</span><span>时间按北京时间</span></div>
+</div>
+<div class="tabs" id="tabs"></div>
 <div class="grid" id="grid"></div>
 <div class="meta" id="meta">连接行情中...</div>
 <script>
 const ITEMS = __ITEMS__;
 const UP="#dc2626", DOWN="#16a34a", FLAT="#64748b";
+let ACTIVE = "全部";
 function fmtPrice(v){ return v>=10000 ? v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : v.toFixed(2); }
 function arrow(p){ return p>0?"🔺":(p<0?"🔻":"➖"); }
 function colorOf(p){ return p>0?UP:(p<0?DOWN:FLAT); }
-function init(){
+function groups(){
+  const seen = [];
+  ITEMS.forEach(function(it){ if(seen.indexOf(it.group) < 0) seen.push(it.group); });
+  return ["全部"].concat(seen);
+}
+function renderTabs(){
+  const box = document.getElementById('tabs');
+  box.innerHTML = '';
+  groups().forEach(function(g){
+    const t = document.createElement('div');
+    t.className = 'tab' + (g === ACTIVE ? ' on' : '');
+    t.textContent = g;
+    t.onclick = function(){ setActive(g); };
+    box.appendChild(t);
+  });
+  document.querySelectorAll('.rg').forEach(function(el){
+    if (el.dataset.r === ACTIVE) el.classList.add('on'); else el.classList.remove('on');
+  });
+}
+function setActive(g){
+  ACTIVE = g;
+  renderTabs();
+  renderGrid();
+}
+function renderGrid(){
   const g = document.getElementById('grid');
   g.innerHTML = '';
-  ITEMS.forEach(function(it){
-    const d = document.createElement('div');
-    d.className = 'card';
-    d.innerHTML = '<div class="nm">'+it.flag+' '+it.name+'<span class="gp">'+it.group+'</span></div>'+
-                  '<div class="px" id="px_'+it.code+'">'+
-                  '<span class="v">'+(it.price?fmtPrice(it.price):'-')+'</span> '+
-                  '<span class="pc">'+(it.price?arrow(it.pct)+Math.abs(it.pct).toFixed(2)+'%':'-')+'</span></div>';
-    if(it.price){
-      d.querySelector('.v').style.color = colorOf(it.pct);
-      d.querySelector('.pc').style.color = colorOf(it.pct);
-    }
-    g.appendChild(d);
-  });
+  ITEMS.filter(function(it){ return ACTIVE === '全部' || it.group === ACTIVE; })
+    .forEach(function(it){
+      const d = document.createElement('div');
+      d.className = 'card';
+      d.innerHTML = '<div class="nm">'+it.flag+' '+it.name+'<span class="gp">'+it.group+'</span></div>'+
+                    '<div class="px" id="px_'+it.code+'">'+
+                    '<span class="v">'+(it.price?fmtPrice(it.price):'-')+'</span> '+
+                    '<span class="pc">'+(it.price?arrow(it.pct)+Math.abs(it.pct).toFixed(2)+'%':'-')+'</span></div>';
+      if(it.price){
+        d.querySelector('.v').style.color = colorOf(it.pct);
+        d.querySelector('.pc').style.color = colorOf(it.pct);
+      }
+      g.appendChild(d);
+    });
 }
 function apply(code, price, pct){
   const box = document.getElementById('px_'+code);
@@ -1663,13 +2276,26 @@ function apply(code, price, pct){
   pc.style.color = c;
 }
 function setMeta(txt){ document.getElementById('meta').textContent = txt; }
+/* 东财 push2 接口用 JSONP 方式请求: 绕过浏览器 CORS 限制(fetch 会报 net::ERR_FAILED) */
+function emLoad(url){
+  return new Promise(function(res){
+    var n='__emcb'+((emLoad._i=(emLoad._i||0)+1));
+    var s=document.createElement('script');
+    window[n]=function(d){res(d);try{delete window[n];}catch(e){}s.remove();};
+    s.onerror=function(){res(null);try{delete window[n];}catch(e){}s.remove();};
+
+    s.src=url+(url.indexOf('?')>=0?'&':'?')+'cb='+n;
+    document.head.appendChild(s);
+    setTimeout(function(){if(window[n]){res(null);try{delete window[n];}catch(e){}s.remove();}},6000);
+  });
+}
 function pull(){
-  const ids = ITEMS.map(function(i){return i.code;}).join(',');
+  const ids = ITEMS.filter(function(i){ return i.code.indexOf('.') > 0; })
+                   .map(function(i){ return i.code; }).join(',');
   if(!ids) return;
   const url = 'https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
               '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now();
-  fetch(url, {cache:'no-store'})
-    .then(function(r){ return r.json(); })
+  emLoad(url)
     .then(function(j){
       const rows = (j && j.data && j.data.diff) || [];
       if(!rows.length){ setMeta('⚠️ 行情暂无数据，自动重试中'); return; }
@@ -1681,12 +2307,55 @@ function pull(){
         apply(q.f13 + '.' + q.f12, p, pct);
       });
       const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-      setMeta('🕒 '+t+' 更新 · 每秒自动刷新（与东方财富同一数据源）');
+      setMeta('🕒 '+t+' 更新 · 指数/商品/汇率 2 秒刷新（东方财富）· 比特币 5 秒刷新（OKX）');
     })
     .catch(function(){ setMeta('⚠️ 行情接口连接失败，自动重试中'); });
 }
-init(); pull();
-setInterval(pull, 1000);
+/* 比特币: OKX 公共行情, 失败静默保留服务端兜底值 */
+function pullBtc(){
+  fetch('https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT')
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      const d = j && j.data && j.data[0];
+      if(!d) return;
+      const p = Number(d.last), o = Number(d.open24h);
+      if(p && o) apply('BTC', p, (p / o - 1) * 100);
+    })
+    .catch(function(){});
+}
+/* 各市场交易时段(北京时间, 分钟): 中国 9:30-11:30/13:00-15:00, 港股 9:30-12:00/13:00-16:00,
+   亚太 7:00-14:30, 欧洲 15:00-23:30, 美洲 21:30-次日4:00 */
+const SESSIONS = {
+  "中国": [[570,690],[780,900]],
+  "港股": [[570,720],[780,960]],
+  "亚太": [[420,870]],
+  "欧洲": [[900,1410]],
+  "美洲": [[1290,1440],[0,240]]
+};
+function bjClock(){
+  const d = new Date(Date.now() + 8*3600*1000);
+  return { dow: d.getUTCDay(), min: d.getUTCHours()*60 + d.getUTCMinutes() };
+}
+function isOpen(region){
+  const s = SESSIONS[region];
+  if(!s) return false;
+  const c = bjClock();
+  if(c.dow === 0 || c.dow === 6) return false;
+  if(region === "美洲" && c.dow === 1 && c.min < 240) return false;
+  return s.some(function(w){ return c.min >= w[0] && c.min < w[1]; });
+}
+function paintSessions(){
+  document.querySelectorAll(".rg").forEach(function(el){
+    if(isOpen(el.dataset.r)) el.classList.add("live"); else el.classList.remove("live");
+  });
+}
+document.querySelectorAll('.rg').forEach(function(el){
+  el.addEventListener('click', function(){ setActive(el.dataset.r); });
+});
+renderTabs(); renderGrid(); pull(); pullBtc(); paintSessions();
+setInterval(pull, 2000);
+setInterval(pullBtc, 5000);
+setInterval(paintSessions, 30000);
 </script></body></html>
 """
 
@@ -1762,27 +2431,44 @@ function build(){
 
   const t = new Date().toLocaleTimeString('zh-CN',{hour12:false});
   document.getElementById('meta').textContent = rt
-    ? '🟢 '+rt+' 只实时行情 · '+t+' 更新 · 每秒自动刷新（与东方财富同一数据源）'
+    ? '🟢 '+rt+' 只实时行情 · '+t+' 更新 · 每 2 秒自动刷新（与东方财富同一数据源）'
     : '⚪ 非交易时段或行情未连接 · 显示最新收盘价';
 }
+/* 东财 push2 接口用 JSONP 方式请求: 绕过浏览器 CORS 限制(fetch 会报 net::ERR_FAILED) */
+function emLoad(url){
+  return new Promise(function(res){
+    var n='__emcb'+((emLoad._i=(emLoad._i||0)+1));
+    var s=document.createElement('script');
+    window[n]=function(d){res(d);try{delete window[n];}catch(e){}s.remove();};
+    s.onerror=function(){res(null);try{delete window[n];}catch(e){}s.remove();};
+    s.src=url+(url.indexOf('?')>=0?'&':'?')+'cb='+n;
+    document.head.appendChild(s);
+    setTimeout(function(){if(window[n]){res(null);try{delete window[n];}catch(e){}s.remove();}},6000);
+  });
+}
 function pull(){
-  const ids = ROWS.map(function(r){return r.q;}).join(',');
-  if(!ids) return;
-  fetch('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
-        '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now(), {cache:'no-store'})
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      const rows = (j && j.data && j.data.diff) || [];
+  var ids = ROWS.map(function(r){return r.q;});
+  if(!ids.length) return;
+  // 分片请求: 每片最多 50 个 secid, 避免 URL 过长
+  var chunks = [];
+  for(var i=0;i<ids.length;i+=50) chunks.push(ids.slice(i,i+50));
+  Promise.all(chunks.map(function(g){
+    return emLoad('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+g.join(',')+
+      '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now())
+      .then(function(j){ return (j && j.data && j.data.diff) || []; })
+      .catch(function(){ return []; });
+  })).then(function(groups){
+    groups.forEach(function(rows){
       rows.forEach(function(q){
         if(q.f2 === '-' || q.f2 === undefined) return;
-        const dec = Number(q.f1) || 2;
+        var dec = Number(q.f1) || 2;
         RT[q.f13 + '.' + q.f12] = Number(q.f2) / Math.pow(10, dec);
       });
-      try { build(); } catch(e) {}
-    })
-    .catch(function(){});
+    });
+    try { build(); } catch(e) {}
+  });
 }
-build(); pull(); setInterval(pull, 1000);
+build(); pull(); setInterval(pull, 2000);
 </script></body></html>
 """
 
@@ -1841,6 +2527,7 @@ _PICKS_HTML = r"""
 const ROWS = __ROWS__;
 const RT = {};
 const KL = {};                 // K线缓存: secid|klt -> {name, arr}
+const PRELOAD = __KLINES__;    // 预置 K 线 (来自本地库, 避免东财 push2his 在 iframe 内被拒)
 let SEL = null, KLT = 101, CUR = null, HOV = -1;
 
 function money(v){ return (v==null||!isFinite(v)) ? '-' : v.toFixed(2); }
@@ -1869,16 +2556,27 @@ function build(){
   document.getElementById('tbl').innerHTML = hdr+'<tbody>'+body+'</tbody>';
   const t = new Date().toLocaleTimeString('zh-CN',{hour12:false});
   document.getElementById('meta').textContent = (rt
-    ? '🟢 '+rt+' 只实时报价 · '+t+' 更新 · 每秒自动刷新（与东方财富同一数据源）'
+    ? '🟢 '+rt+' 只实时报价 · '+t+' 更新 · 每 2 秒自动刷新（与东方财富同一数据源）'
     : '⚪ 非交易时段或行情未连接 · 现价显示选股日收盘价') + ' · 点击行看K线';
 }
 
+/* 东财 push2 接口用 JSONP 方式请求: 绕过浏览器 CORS 限制(fetch 会报 net::ERR_FAILED) */
+function emLoad(url){
+  return new Promise(function(res){
+    var n='__emcb'+((emLoad._i=(emLoad._i||0)+1));
+    var s=document.createElement('script');
+    window[n]=function(d){res(d);try{delete window[n];}catch(e){}s.remove();};
+    s.onerror=function(){res(null);try{delete window[n];}catch(e){}s.remove();};
+    s.src=url+(url.indexOf('?')>=0?'&':'?')+'cb='+n;
+    document.head.appendChild(s);
+    setTimeout(function(){if(window[n]){res(null);try{delete window[n];}catch(e){}s.remove();}},6000);
+  });
+}
 function pull(){
   const ids = ROWS.map(function(r){return r.q;}).join(',');
   if(!ids) return;
-  fetch('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
-        '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now(), {cache:'no-store'})
-    .then(function(r){ return r.json(); })
+  emLoad('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
+        '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now())
     .then(function(j){
       const rows = (j && j.data && j.data.diff) || [];
       rows.forEach(function(q){
@@ -1907,12 +2605,17 @@ function loadKline(){
   if(!SEL) return;
   const key = SEL.q + '|' + KLT;
   if(KL[key]){ CUR = KL[key]; renderTitle(); draw(); return; }
+  // 优先使用本地预置 K 线 (东财 push2his 接口在 Streamlit iframe 内会被拒)
+  if(PRELOAD[key] && PRELOAD[key].arr && PRELOAD[key].arr.length){
+    KL[key] = PRELOAD[key];
+    CUR = KL[key]; renderTitle(); draw();
+    return;
+  }
   setTitle('⏳ ' + PERIODS[KLT] + ' K线加载中 · ' + SEL.c + ' ...');
   const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid='+SEL.q+
     '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt='+KLT+
     '&fqt=1&end=20500101&lmt=260&_='+Date.now();
-  fetch(url, {cache:'no-store'})
-    .then(function(r){ return r.json(); })
+  emLoad(url)
     .then(function(j){
       const d = j && j.data;
       if(!d || !d.klines || !d.klines.length){
@@ -2167,33 +2870,56 @@ function build(){
   document.getElementById('tbl').innerHTML = hdr+'<tbody>'+body+'</tbody>';
   const t = new Date().toLocaleTimeString('zh-CN',{hour12:false});
   document.getElementById('meta').textContent = rt
-    ? '🟢 '+rt+' 只实时报价 · '+t+' 更新 · 每秒自动刷新（与东方财富同一数据源）'
+    ? '🟢 '+rt+' 只实时报价 · '+t+' 更新 · 每 2 秒自动刷新（与东方财富同一数据源）'
     : '⚪ 非交易时段或行情未连接 · 显示选股日收盘价';
 }
+/* 东财 push2 接口用 JSONP 方式请求: 绕过浏览器 CORS 限制(fetch 会报 net::ERR_FAILED) */
+function emLoad(url){
+  return new Promise(function(res){
+    var n='__emcb'+((emLoad._i=(emLoad._i||0)+1));
+    var s=document.createElement('script');
+    window[n]=function(d){res(d);try{delete window[n];}catch(e){}s.remove();};
+    s.onerror=function(){res(null);try{delete window[n];}catch(e){}s.remove();};
+    s.src=url+(url.indexOf('?')>=0?'&':'?')+'cb='+n;
+    document.head.appendChild(s);
+    setTimeout(function(){if(window[n]){res(null);try{delete window[n];}catch(e){}s.remove();}},6000);
+  });
+}
 function pull(){
-  const ids = ROWS.map(function(r){return r.q;}).join(',');
-  if(!ids) return;
-  fetch('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
-        '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now(), {cache:'no-store'})
-    .then(function(r){ return r.json(); })
-    .then(function(j){
-      const rows = (j && j.data && j.data.diff) || [];
+  var ids = ROWS.map(function(r){return r.q;});
+  if(!ids.length) return;
+  // 分片请求: 每片最多 50 个 secid, 避免 URL 过长
+  var chunks = [];
+  for(var i=0;i<ids.length;i+=50) chunks.push(ids.slice(i,i+50));
+  Promise.all(chunks.map(function(g){
+    return emLoad('https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+g.join(',')+
+      '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now())
+      .then(function(j){ return (j && j.data && j.data.diff) || []; })
+      .catch(function(){ return []; });
+  })).then(function(groups){
+    groups.forEach(function(rows){
       rows.forEach(function(q){
         if(q.f2 === '-' || q.f2 === undefined) return;
-        const dec = Number(q.f1) || 2;
+        var dec = Number(q.f1) || 2;
         RT[q.f13 + '.' + q.f12] = Number(q.f2) / Math.pow(10, dec);
       });
-      try { build(); } catch(e) {}
-    })
-    .catch(function(){});
+    });
+    try { build(); } catch(e) {}
+  });
 }
-build(); pull(); setInterval(pull, 1000);
+build(); pull(); setInterval(pull, 2000);
 </script></body></html>
 """
 
 
 def _em_secid(code) -> str:
-    """代码 → 东方财富 secid (沪 1. / 深与北 0.), 与东财网页数据源一致"""
+    """代码 → 东方财富 secid (沪 1. / 深与北 0.), 与东财网页数据源一致
+
+    A股市场代码前缀:
+      沪市(1.): 6xxxxx(主板) / 9xxxxx(B股) / 5xxxxx(ETF·基金, 含510/511/512/513/515/518/56/588)
+      深市(0.): 0xxxxx(主板) / 3xxxxx(创业板) / 1xxxxx(ETF·LOF, 含15/16/18) / 2xxxxx(B股)
+      北市(0.): 4xxxxx / 8xxxxx
+    """
     c = str(code).strip().lower()
     if "." in c:
         return c
@@ -2201,7 +2927,7 @@ def _em_secid(code) -> str:
         return "1." + c[2:]
     if c.startswith(("sz", "bj")):
         return "0." + c[2:]
-    if c.startswith(("6", "9")):
+    if c.startswith(("6", "9", "5")):        # 5xxxxx = 沪市 ETF/基金
         return "1." + c
     return "0." + c
 
@@ -2209,10 +2935,10 @@ def _em_secid(code) -> str:
 # ==================== 回测结果展示 (参考掘金量化: 左图右指标 + 双 Tab) ====================
 
 def _pc(v):
-    """涨红跌绿"""
+    """涨红跌绿 (赛博朋克去艳化)"""
     if v is None:
-        return "#64748b"
-    return "#dc2626" if v > 0 else ("#16a34a" if v < 0 else "#64748b")
+        return "#8b95b5"
+    return "#ff4d6d" if v > 0 else ("#3ddc84" if v < 0 else "#8b95b5")
 
 
 def _benchmark_align(curve):
@@ -2289,66 +3015,68 @@ def _metric_panel(p, e):
         treynor = cagr / beta
     excess = None if (ret is None or bench_ret is None) else ret - bench_ret
 
+    # 赛博朋克暗色面板: 深空黑底 + 霓虹青数值 + 次要文字提亮
     rows = [
-        ("期初资产", _m(init_v), "#1f2430"),
-        ("期末资金", _m(final_v), "#1f2430"),
+        ("期初资产", _m(init_v), "#f5f8ff"),
+        ("期末资金", _m(final_v), "#f5f8ff"),
         ("累计盈亏", _m(pnl), _pc(pnl)),
-        ("累计手续费", _m(p.get("total_cost", 0)), "#7b8494"),
+        ("累计手续费", _m(p.get("total_cost", 0)), "#c0cbe8"),
         ("基准收益率", _p(bench_ret), _pc(bench_ret)),
         ("策略收益率", _p(ret), _pc(ret)),
         ("年化收益率", _p(cagr), _pc(cagr)),
         ("超额收益率", _p(excess), _pc(excess)),
-        ("最大回撤", _p(p.get("max_drawdown")), "#16a34a"),
-        ("基准最大回撤", _p(e.get("bench_mdd")), "#16a34a"),
-        ("胜率", "-" if p.get("win_rate") is None else f"{float(p['win_rate']):.2f}%", "#1f2430"),
-        ("盈亏比", "-" if not p.get("profit_factor") else f"{float(p['profit_factor']):.2f}", "#1f2430"),
-        ("夏普比率", "-" if p.get("sharpe") is None else f"{float(p['sharpe']):.2f}", "#1f2430"),
-        ("索提诺比率", "-" if p.get("sortino") is None else f"{float(p['sortino']):.2f}", "#1f2430"),
-        ("卡玛比率", "-" if p.get("calmar") is None else f"{float(p['calmar']):.2f}", "#1f2430"),
-        ("收益波动率", _p(e.get("vol")), "#1f2430"),
-        ("贝塔 Beta", "-" if beta is None else f"{beta:.2f}", "#1f2430"),
+        ("最大回撤", _p(p.get("max_drawdown")), "#3ddc84"),
+        ("基准最大回撤", _p(e.get("bench_mdd")), "#3ddc84"),
+        ("胜率", "-" if p.get("win_rate") is None else f"{float(p['win_rate']):.2f}%", "#f5f8ff"),
+        ("盈亏比", "-" if not p.get("profit_factor") else f"{float(p['profit_factor']):.2f}", "#f5f8ff"),
+        ("夏普比率", "-" if p.get("sharpe") is None else f"{float(p['sharpe']):.2f}", "#f5f8ff"),
+        ("索提诺比率", "-" if p.get("sortino") is None else f"{float(p['sortino']):.2f}", "#f5f8ff"),
+        ("卡玛比率", "-" if p.get("calmar") is None else f"{float(p['calmar']):.2f}", "#f5f8ff"),
+        ("收益波动率", _p(e.get("vol")), "#f5f8ff"),
+        ("贝塔 Beta", "-" if beta is None else f"{beta:.2f}", "#f5f8ff"),
         ("阿尔法 Alpha", _p(alpha), _pc(alpha)),
-        ("信息比率", "-" if e.get("ir") is None else f"{e['ir']:.2f}", "#1f2430"),
+        ("信息比率", "-" if e.get("ir") is None else f"{e['ir']:.2f}", "#f5f8ff"),
         ("特雷诺比率", _p(treynor), _pc(treynor)),
-        ("交易天数", f"{int(p.get('days', 0) or 0)}", "#1f2430"),
-        ("成交笔数", f"{int(p.get('trades_count', 0) or 0)}", "#1f2430"),
+        ("交易天数", f"{int(p.get('days', 0) or 0)}", "#f5f8ff"),
+        ("成交笔数", f"{int(p.get('trades_count', 0) or 0)}", "#f5f8ff"),
     ]
     html = "".join(
         '<div style="display:flex;justify-content:space-between;align-items:baseline;'
-        'padding:5px 4px;border-bottom:1px solid #f1f5f9;font-size:12.5px;'
+        'padding:5px 4px;border-bottom:1px solid rgba(0,229,255,0.10);font-size:12.5px;'
         'font-family:Inter,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif">'
-        f'<span style="color:#64748b;font-weight:500">{k}</span>'
+        f'<span style="color:#c0cbe8;font-weight:500">{k}</span>'
         f'<span style="font-weight:600;color:{c};font-variant-numeric:tabular-nums;'
         f'letter-spacing:-0.005em">{v}</span></div>'
         for k, v, c in rows)
     st.markdown(
-        '<div style="background:#fff;border:1px solid #e8ecf1;border-radius:12px;'
-        'padding:10px 14px;box-shadow:0 1px 2px rgba(17,24,39,.04)">' + html + '</div>',
+        '<div style="background:linear-gradient(135deg,#141430 0%,#0a0a1f 100%);'
+        'border:1px solid rgba(0,229,255,0.22);border-radius:12px;'
+        'padding:10px 14px;box-shadow:0 0 10px rgba(0,229,255,0.06)">' + html + '</div>',
         unsafe_allow_html=True)
 
 
 def _chart_equity(m):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=m["date"], y=m["strat"], name="策略收益",
-                             line=dict(width=2.2, color="#1FA879")))
+                             line=dict(width=2.8, color="#00e5ff")))
     if "bench" in m.columns:
         fig.add_trace(go.Scatter(x=m["date"], y=m["bench"], name="沪深300",
-                                 line=dict(width=1.6, color="#3b82f6")))
+                                 line=dict(width=1.7, color="#ffb020")))
         fig.add_trace(go.Scatter(x=m["date"], y=m["strat"] - m["bench"], name="超额收益",
-                                 line=dict(width=1.3, color="#f59e0b", dash="dot")))
+                                 line=dict(width=1.4, color="#a78bfa", dash="dot")))
     fig.update_layout(
         height=260, margin=dict(l=10, r=10, t=30, b=10),
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        yaxis_title=dict(text="累计收益 (起点=100)", font=dict(size=11, color="#64748b")),
+        paper_bgcolor="#141430", plot_bgcolor="#141430",
+        yaxis_title=dict(text="累计收益 (起点=100)", font=dict(size=11, color="#c0cbe8")),
         font=dict(family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif",
-                  size=11, color="#475569"),
+                  size=11, color="#f5f8ff"),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="#1a1f2e", font_size=12, font_family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif"),
-        legend=dict(orientation="h", y=1.18, x=0, font=dict(size=11, color="#475569")),
-        xaxis=dict(showgrid=False, showline=True, linecolor="#e8ecf1",
-                   tickfont=dict(size=10, color="#94a3b8")),
-        yaxis=dict(showgrid=True, gridcolor="#f1f5f9", showline=False, zeroline=False,
-                   tickfont=dict(size=10, color="#94a3b8")),
+        legend=dict(orientation="h", y=1.18, x=0, font=dict(size=11, color="#c0cbe8")),
+        xaxis=dict(showgrid=False, showline=True, linecolor="rgba(0,229,255,0.22)",
+                   tickfont=dict(size=10, color="#c0cbe8")),
+        yaxis=dict(showgrid=True, gridcolor="rgba(0,229,255,0.08)", showline=False, zeroline=False,
+                   tickfont=dict(size=10, color="#c0cbe8")),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -2357,25 +3085,25 @@ def _chart_drawdown(m):
     fig = go.Figure()
     ds = (m["strat"] / m["strat"].cummax() - 1) * 100
     fig.add_trace(go.Scatter(x=m["date"], y=ds, name="策略回撤",
-                             line=dict(width=1.6, color="#dc2626"),
-                             fill="tozeroy", fillcolor="rgba(220,38,38,0.10)"))
+                             line=dict(width=2.0, color="#ff4d6d"),
+                             fill="tozeroy", fillcolor="rgba(255,77,109,0.12)"))
     if "bench" in m.columns:
         db = (m["bench"] / m["bench"].cummax() - 1) * 100
         fig.add_trace(go.Scatter(x=m["date"], y=db, name="沪深300回撤",
-                                 line=dict(width=1.4, color="#3b82f6")))
+                                 line=dict(width=1.5, color="#ffb020")))
     fig.update_layout(
         height=200, margin=dict(l=10, r=10, t=30, b=10),
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        yaxis_title=dict(text="回撤 %", font=dict(size=11, color="#64748b")),
+        paper_bgcolor="#141430", plot_bgcolor="#141430",
+        yaxis_title=dict(text="回撤 %", font=dict(size=11, color="#c0cbe8")),
         font=dict(family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif",
-                  size=11, color="#475569"),
+                  size=11, color="#f5f8ff"),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="#1a1f2e", font_size=12, font_family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif"),
-        legend=dict(orientation="h", y=1.22, x=0, font=dict(size=11, color="#475569")),
-        xaxis=dict(showgrid=False, showline=True, linecolor="#e8ecf1",
-                   tickfont=dict(size=10, color="#94a3b8")),
-        yaxis=dict(showgrid=True, gridcolor="#f1f5f9", showline=False, zeroline=False,
-                   tickfont=dict(size=10, color="#94a3b8"), tickformat=".1f"),
+        legend=dict(orientation="h", y=1.22, x=0, font=dict(size=11, color="#c0cbe8")),
+        xaxis=dict(showgrid=False, showline=True, linecolor="rgba(0,229,255,0.22)",
+                   tickfont=dict(size=10, color="#c0cbe8")),
+        yaxis=dict(showgrid=True, gridcolor="rgba(0,229,255,0.08)", showline=False, zeroline=False,
+                   tickfont=dict(size=10, color="#c0cbe8"), tickformat=".1f"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
@@ -2384,24 +3112,24 @@ def _chart_daily(m):
     rs = m["strat"].pct_change() * 100
     fig = go.Figure()
     fig.add_trace(go.Bar(x=m["date"], y=rs, name="策略日收益",
-                         marker_color=["#dc2626" if v > 0 else "#16a34a" for v in rs.fillna(0)],
+                         marker_color=["#ff4d6d" if v > 0 else "#3ddc84" for v in rs.fillna(0)],
                          marker_line_width=0))
     if "bench" in m.columns:
         rb = m["bench"].pct_change() * 100
         fig.add_trace(go.Scatter(x=m["date"], y=rb, name="沪深300日收益",
-                                 line=dict(width=1.2, color="#3b82f6")))
+                                 line=dict(width=1.5, color="#ffb020")))
     fig.update_layout(
         height=200, margin=dict(l=10, r=10, t=30, b=10),
-        paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
-        yaxis_title=dict(text="日收益 %", font=dict(size=11, color="#64748b")),
+        paper_bgcolor="#141430", plot_bgcolor="#141430",
+        yaxis_title=dict(text="日收益 %", font=dict(size=11, color="#c0cbe8")),
         font=dict(family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif",
-                  size=11, color="#475569"),
+                  size=11, color="#f5f8ff"),
         hovermode="x unified",
         hoverlabel=dict(bgcolor="#1a1f2e", font_size=12, font_family="Inter,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif"),
         bargap=0.15,
-        legend=dict(orientation="h", y=1.22, x=0, font=dict(size=11, color="#475569")),
-        xaxis=dict(showgrid=False, showline=True, linecolor="#e8ecf1",
-                   tickfont=dict(size=10, color="#94a3b8")),
+        legend=dict(orientation="h", y=1.22, x=0, font=dict(size=11, color="#c0cbe8")),
+        xaxis=dict(showgrid=False, showline=True, linecolor="rgba(0,229,255,0.22)",
+                   tickfont=dict(size=10, color="#c0cbe8")),
         yaxis=dict(showgrid=True, gridcolor="#f1f5f9", showline=False, zeroline=True,
                    zerolinecolor="#e8ecf1", zerolinewidth=1,
                    tickfont=dict(size=10, color="#94a3b8"), tickformat=".1f"),
@@ -2442,6 +3170,7 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
         return MarketCapStrategy(
             top_n=int(o.pop("top_n", 0)) or int(ss.get("top_n", 5)),
             pool_type="etf",
+            universe=None,
             etf_mom_days=int(ss.get("etf_mom_days", 60)),
             etf_min_amount=o.get("etf_min_amount", ss.get("etf_min_amount", 0.5)),
             etf_min_history=int(ss.get("etf_min_history", 120)),
@@ -2459,11 +3188,16 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
                           if ss.get("etf_flow_on") else None),
             etf_mkt_flow_guard=bool(ss.get("etf_mkt_flow_guard", False)),
             etf_mkt_flow_days=int(ss.get("etf_mkt_flow_days", 5)),
+            etf_abs_mom_days=int(ss.get("etf_abs_mom_days", 60)),
+            etf_abs_mom_min=float(ss.get("etf_abs_mom_min", 3.0)),
+            etf_max_dd_threshold=float(ss.get("etf_max_dd_th", 30)) / 100.0,
+            etf_require_ma60_up=bool(ss.get("etf_ma60_up", True)),
+            etf_ret20_min=float(ss.get("etf_ret20_min", 0)),
+            etf_ret60_min=float(ss.get("etf_ret60_min", 0)),
         )
-    uni = list(ss.get("mc_universe_list") or [])
-    top = int(o.pop("top_n", 0)) or (len(uni) if uni else int(ss.get("top_n", 3)))
+    top = int(o.pop("top_n", 0)) or int(ss.get("top_n", 3))
     return MarketCapStrategy(
-        top_n=top, universe=uni or None,
+        top_n=top, universe=None,
         cap_min=ss["mc_cap_min"], cap_max=o.get("cap_max", ss["mc_cap_max"]),
         weight_fraction=o.get("weight_fraction", ss["mc_weight_frac"]),
         cap_change_threshold=ss["mc_cap_chg_th"],
@@ -2694,18 +3428,25 @@ if page == "home":
     import streamlit.components.v1 as _comp
 
     _JS_MARKETS = [
-        ("上证指数", "A股", "🇨🇳", "1.000001"),
-        ("深证成指", "A股", "🇨🇳", "0.399001"),
-        ("沪深300", "A股", "🇨🇳", "1.000300"),
-        ("创业板指", "A股", "🇨🇳", "0.399006"),
+        ("上证指数", "中国", "🇨🇳", "1.000001"),
+        ("深证成指", "中国", "🇨🇳", "0.399001"),
+        ("沪深300", "中国", "🇨🇳", "1.000300"),
+        ("创业板指", "中国", "🇨🇳", "0.399006"),
+        ("标普500", "美洲", "🇺🇸", "100.SPX"),
+        ("纳斯达克", "美洲", "🇺🇸", "100.NDX"),
+        ("道琼斯", "美洲", "🇺🇸", "100.DJIA"),
+        ("德国DAX", "欧洲", "🇩🇪", "100.GDAXI"),
+        ("英国富时100", "欧洲", "🇬🇧", "100.FTSE"),
+        ("法国CAC40", "欧洲", "🇫🇷", "100.FCHI"),
+        ("日经225", "亚太", "🇯🇵", "100.N225"),
+        ("韩国KOSPI", "亚太", "🇰🇷", "100.KS11"),
+        ("澳洲标普200", "亚太", "🇦🇺", "100.AS51"),
         ("恒生指数", "港股", "🇭🇰", "100.HSI"),
         ("恒生科技", "港股", "🇭🇰", "124.HSTECH"),
-        ("标普500", "美股", "🇺🇸", "100.SPX"),
-        ("纳斯达克", "美股", "🇺🇸", "100.NDX"),
-        ("道琼斯", "美股", "🇺🇸", "100.DJIA"),
         ("COMEX黄金", "商品", "🥇", "101.GC00Y"),
         ("WTI原油", "商品", "🛢️", "102.CL00Y"),
         ("美元/人民币", "汇率", "💱", "133.USDCNH"),
+        ("比特币", "加密", "₿", "BTC"),
     ]
     _fb_map = {}
     try:
@@ -2725,7 +3466,7 @@ if page == "home":
     st.markdown(f"### {t('global_markets')}")
     _comp.html(
         _MARKET_CARDS_HTML.replace("__ITEMS__", json.dumps(_items, ensure_ascii=False)),
-        height=252, scrolling=False)
+        height=700, scrolling=True)
 
     st.divider()
 
@@ -2889,10 +3630,12 @@ if page == "home":
             curve_norm = curve["value"] / init_val * 100
             fig.add_trace(go.Scatter(
                 x=curve["date"], y=curve_norm, mode="lines", name=name, line=dict(width=2)))
-        fig.update_layout(template="plotly_white", height=350, margin=dict(l=0, r=20, t=20, b=0),
-                          yaxis_title=t("equity_axis"), xaxis_title="", hovermode="x unified")
-        fig.update_xaxes(showgrid=False)
-        fig.update_yaxes(showgrid=True, gridcolor="#eef0f4")
+        fig.update_layout(paper_bgcolor="#141430", plot_bgcolor="#141430",
+                          height=350, margin=dict(l=0, r=20, t=20, b=0),
+                          yaxis_title=t("equity_axis"), xaxis_title="", hovermode="x unified",
+                          font=dict(color="#f5f8ff"), legend=dict(font=dict(color="#c0cbe8")))
+        fig.update_xaxes(showgrid=False, tickfont=dict(color="#c0cbe8"))
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(0,229,255,0.08)", tickfont=dict(color="#c0cbe8"))
         st.plotly_chart(fig, use_container_width=True)
 
 
@@ -2974,6 +3717,8 @@ elif page == "backtest":
         if not _pk.empty:
             _ld = _pk["pick_date"].iloc[0]
             _h = _pk[_pk["pick_date"] == _ld]
+            # 同一交易日多个策略会重复记录同一标的 → 按代码去重, 避免行情请求 URL 过长
+            _h = _h.drop_duplicates(subset=["symbol"], keep="first")
             _rows = [{"c": str(_r["symbol"]), "q": _em_secid(_r["symbol"]),
                       "date": str(_r["pick_date"])[:10],
                       "buy": round(float(_r["close"]), 2)} for _, _r in _h.iterrows()]
@@ -2985,17 +3730,16 @@ elif page == "backtest":
     except Exception:
         pass
 
-    # ---------- 策略概览: 参数未变 → 直接用库内最近一次结果 ----------
+    # ---------- 策略概览: 参数未变 → 直接用库内最近一次结果 (只查库, 不重算) ----------
     _all_names = list(STRATEGY_NAMES)
-    with st.spinner("加载策略概览..."):
-        _cached = {}
-        for name in _all_names:
-            try:
-                _cached[name] = load_or_run_backtest(
-                    name, feat_data, initial_capital, hold_days, top_n,
-                    limit_up_pct, backtest_start, backtest_end, allow_run=False)
-            except Exception:
-                _cached[name] = None
+    _cached = {}
+    for name in _all_names:
+        try:
+            _cached[name] = load_or_run_backtest(
+                name, feat_data, initial_capital, hold_days, top_n,
+                limit_up_pct, backtest_start, backtest_end, allow_run=False)
+        except Exception:
+            _cached[name] = None
 
     # ---------- 扁平 toolbar (一行: 策略胶囊 + 摘要chip + ⚙️设置 + 🚀开始回测) ----------
     _pill_cols = st.columns(len(_all_names) + 3)
@@ -3025,23 +3769,27 @@ elif page == "backtest":
             _summary_parts.append(f"溢价≤{_cap:.1f}%")
         if st.session_state.get("etf_flow_on"):
             _summary_parts.append(f"净申购≥{st.session_state.get('etf_flow_min', -3)}%")
+        _am_days = int(st.session_state.get("etf_abs_mom_days", 60))
+        _am_min = float(st.session_state.get("etf_abs_mom_min", 0.0))
+        if _am_min != 0.0:
+            _summary_parts.append(f"绝对动量{_am_days}日{'≥' if _am_min >= 0 else '<'}{_am_min:.1f}%")
         if st.session_state.get("etf_mkt_flow_guard"):
             _summary_parts.append("全市场资金流风控")
     elif strategy_choice != "市值策略":
         _summary_parts.append(f"{top_n}只")
         _summary_parts.append(f"持有{hold_days}天·涨停{limit_up_pct:.1f}%")
     else:
-        _mc_uni = list(st.session_state.get("mc_universe_list") or [])
-        _summary_parts.append(f"标的池 {len(_mc_uni)} 只" if _mc_uni else "全市场选股")
+        _summary_parts.append("全市场选股")
     _summary_parts.append(
         f"{pd.Timestamp(backtest_start):%Y/%m/%d}~{pd.Timestamp(backtest_end):%Y/%m/%d}")
     _param_summary = " · ".join(_summary_parts)
 
     with _pill_cols[len(_all_names)]:
         st.markdown(
-            f'<div style="background:#f1f5f9;border:1px solid #e2e8f0;'
+            f'<div style="background:linear-gradient(135deg,rgba(0,229,255,0.08) 0%,rgba(124,108,255,0.08) 100%);'
+            f'border:1px solid rgba(0,229,255,0.22);'
             f'border-radius:6px;padding:6px 10px;font-size:.78rem;'
-            f'color:#475569;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
+            f'color:#c0cbe8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'
             f'height:36px;display:flex;align-items:center;">🛠️ {_param_summary}</div>',
             unsafe_allow_html=True)
 
@@ -3089,9 +3837,9 @@ elif page == "backtest":
         initial_capital = _r1[0].number_input(
             "初始资金(万)", 10, 10000, _cur_initial // 10000, 10,
             format="%d", key="di_initial") * 10000
-        if strategy_choice == "市值策略":
-            _mc_uni2 = list(st.session_state.get("mc_universe_list") or [])
-            _r1[1].metric("持仓数", len(_mc_uni2) if _mc_uni2 else "按选股")
+        if strategy_choice in CLASS_STRATEGIES:
+            top_n = _r1[1].slider("持仓数", 1, 30, _cur_top_n, key="di_topn",
+                                  help="目标仓位数；清仓后自动在该日标的池中买入排名第一的标的，不会留空仓")
         else:
             top_n = _r1[1].slider("持仓数", 1, 30, _cur_top_n, key="di_topn")
             hold_days = _r1[2].slider("持有天数", 1, 30, _cur_hold, key="di_hold")
@@ -3120,7 +3868,7 @@ elif page == "backtest":
             _a[1].slider("市值上限(亿)", 50, 500, key=_draft("cap_max", 200))
             _a[2].checkbox("MA20 以上", key=_draft("require_ma20", True))
         elif strategy_choice == "ETF策略":
-            st.caption("ETF 没有财务/分红/市值数据：用「动量排名 + 成交额流动性 + 周K MA30 趋势」选品。")
+            st.caption("ETF 没有财务/分红/市值数据：用「动量排名 + 成交额流动性 + 周K MA30 趋势」选品；持仓数决定仓位个数，清仓后自动买入当日排名第一的标的。")
             _a = st.columns(4)
             _a[0].radio("动量窗口", options=[20, 60], horizontal=True,
                         format_func=lambda v: f"近{v}日涨幅",
@@ -3154,9 +3902,9 @@ elif page == "backtest":
                          step=0.01)
             st.caption("风控因子（需先同步华泰柏瑞增强数据；无数据时自动不拦截）")
             _e = st.columns(4)
-            _e[0].slider("溢价率上限(%)", 0.0, 3.0, key=_draft("etf_premium_cap", 1.0),
+            _e[0].slider("溢价率上限(%)", 0.0, 3.0, key=_draft("etf_premium_cap", 0.0),
                          step=0.1, help="当日溢价率超过该值则剔除，0=关闭；QDII 建议 1.5~2")
-            _e[1].checkbox("资金流过滤", key=_draft("etf_flow_on", False),
+            _e[1].checkbox("资金流过滤", key=_draft("etf_flow_on", True),
                            help="启用后按「近5日净申购/规模」剔除持续净赎回的 ETF")
             _e[2].slider("净申购下限(%)", -10.0, 0.0, key=_draft("etf_flow_min", -3.0),
                          step=0.5, help="近5日净申购额占规模比例低于该值则剔除")
@@ -3164,18 +3912,23 @@ elif page == "backtest":
                            help="全市场股票型 ETF 资金持续净流出时清仓/不开新仓")
             st.slider("市场资金流观察窗(交易日)", 2, 10, key=_draft("etf_mkt_flow_days", 5),
                       help="上述窗口内的净流入均值 < 0 视为风险")
+            st.caption("绝对动量过滤（强弱过滤，默认 3% 阈值；0=关闭）")
+            _f = st.columns(2)
+            _f[0].slider("动量窗口(日)", 5, 120, key=_draft("etf_abs_mom_days", 60),
+                         step=5, help="绝对动量计算窗口，推荐 20/60/120")
+            _f[1].slider("动量阈值(%)", -10.0, 10.0, key=_draft("etf_abs_mom_min", 3.0),
+                         step=0.5, help="近 N 日涨幅低于该值则不买/强制卖出，0=仅拦截下跌，负值=更严格")
+            st.caption("优质标的过滤（对标纳指科技ETF 159509 周K：中长期向上 + 回撤可控，剔除震荡/下行/深跌标的）")
+            _g = st.columns(4)
+            _g[0].slider("最大回撤上限(%)", 10, 50, key=_draft("etf_max_dd_th", 30),
+                         step=5, help="近250日高点回撤超过该值则剔除")
+            _g[1].checkbox("MA60 上行确认", key=_draft("etf_ma60_up", True),
+                           help="要求收盘价站上 MA60 且 MA60 斜率为正（中长期趋势向上）")
+            _g[2].slider("20日涨幅下限(%)", -10, 20, key=_draft("etf_ret20_min", 0),
+                         step=1, help="近20日涨幅低于该值则剔除，0=仅要求不跌")
+            _g[3].slider("60日涨幅下限(%)", -10, 20, key=_draft("etf_ret60_min", 0),
+                         step=1, help="近60日涨幅低于该值则剔除，0=仅要求不跌")
         elif strategy_choice == "市值策略":
-            if "_mc_symbols" not in st.session_state:
-                _all = sorted(feat_data.keys())
-                # 股票池不含 ETF/LOF (引擎层也会再次显式排除)
-                _ETF_PRE = ("sz159", "sh51", "sh52", "sh56", "sh58")
-                st.session_state["_mc_symbols"] = [
-                    s for s in _all if not s.startswith(_ETF_PRE)]
-            st.multiselect(
-                "标的池（留空 = 全市场选股）",
-                options=st.session_state["_mc_symbols"],
-                key=_draft("mc_universe_list", []),
-                placeholder="从库内已有行情的标的中选，支持搜索")
             _a = st.columns(4)
             _a[0].slider("市值下限(亿)", 5, 50, key=_draft("mc_cap_min", 15))
             _a[1].slider("市值上限(亿)", 100, 500, key=_draft("mc_cap_max", 200))
@@ -3201,7 +3954,7 @@ elif page == "backtest":
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
                      key=_draft("mc_rebal_mode", "topk_drop"), horizontal=True)
-            st.caption("指定标的池时没有排名概念，Topk-Drop 自动退化为偏离度调仓。")
+            st.caption("持仓数决定仓位个数，清仓后自动在当日候选池中补足排名靠前的标的，不会留空仓。")
             _d = st.columns(4)
             _d[0].slider("市值变化阈值(%)", 0.01, 0.15, key=_draft("mc_cap_chg_th", 0.04),
                          step=0.01)
@@ -3221,11 +3974,9 @@ elif page == "backtest":
                          key="bt_dlg_ok"):
                 st.session_state["initial_capital"] = initial_capital
                 if strategy_choice not in CLASS_STRATEGIES:
-                    st.session_state["top_n"] = top_n
                     st.session_state["hold_days"] = hold_days
                     st.session_state["limit_up_pct"] = limit_up_pct
-                elif strategy_choice != "市值策略":
-                    st.session_state["top_n"] = top_n
+                st.session_state["top_n"] = top_n
                 st.session_state["backtest_start"] = pd.Timestamp(_dr)
                 st.session_state["backtest_end"] = pd.Timestamp(_de)
                 for _pk in _APPLY_KEYS.get(strategy_choice, ()):
@@ -3258,22 +4009,30 @@ elif page == "backtest":
         sp = {"top_n": top_n}
 
     if run_btn:
-        with st.spinner("🔄 运行回测..."):
-            _t_bt = time.perf_counter()
-            result = load_or_run_backtest(
-                strategy_choice, feat_data, initial_capital, hold_days, top_n,
-                limit_up_pct, backtest_start, backtest_end, force=True)
-        _elapsed = time.perf_counter() - _t_bt
-        _n_tr = result["performance"].get("trades_count", 0)
-        if _elapsed >= 60:
-            _t_str = f"{int(_elapsed // 60)} 分 {_elapsed % 60:.0f} 秒"
+        # 参数 + 行情指纹都未变 → 直接调出最近一次结果, 不重算 (避免无谓转圈)
+        _sig_now = _bt_sig(_bt_params(strategy_choice, initial_capital, hold_days,
+                                      top_n, limit_up_pct, backtest_start, backtest_end))
+        _rec_now = data_store.get_backtest_result(strategy_choice, _sig_now)
+        if _rec_now is not None and str(_rec_now["fingerprint"]) == DATA_FINGERPRINT:
+            result = _bt_result_from_rec(_rec_now)
+            st.caption("⚡ 参数与行情均未变化，已直接载入最近一次回测结果")
         else:
-            _t_str = f"{_elapsed:.1f} 秒"
-        st.success(f"✅ 回测完成! {_n_tr} 笔交易 · 回测计算耗时 {_t_str}")
-        try:
-            data_store.save_run("backtest", strategy_choice, sp, result["performance"])
-        except Exception:
-            pass
+            with st.spinner("🔄 运行回测..."):
+                _t_bt = time.perf_counter()
+                result = load_or_run_backtest(
+                    strategy_choice, feat_data, initial_capital, hold_days, top_n,
+                    limit_up_pct, backtest_start, backtest_end, force=True)
+            _elapsed = time.perf_counter() - _t_bt
+            _n_tr = result["performance"].get("trades_count", 0)
+            if _elapsed >= 60:
+                _t_str = f"{int(_elapsed // 60)} 分 {_elapsed % 60:.0f} 秒"
+            else:
+                _t_str = f"{_elapsed:.1f} 秒"
+            st.success(f"✅ 回测完成! {_n_tr} 笔交易 · 回测计算耗时 {_t_str}")
+            try:
+                data_store.save_run("backtest", strategy_choice, sp, result["performance"])
+            except Exception:
+                pass
     else:
         result = _cached.get(strategy_choice)
 
@@ -3319,12 +4078,32 @@ elif page == "backtest":
                     st.info("本次回测没有成交记录")
                 else:
                     fills_df = pd.DataFrame(fills)
-                    col_order = ["date", "code", "direction", "price", "qty",
-                                 "amount", "cost", "pnl", "cash_after", "reason"]
+                    # 总资产 = 成交后现金 + 当日全部持仓市值 (从 holdings_log 按日汇总)
+                    _holds = result.get("holdings_log") or []
+                    if _holds:
+                        _hdf = pd.DataFrame(_holds)
+                        _hdf["date"] = pd.to_datetime(_hdf["date"]).dt.normalize()
+                        _mv = _hdf.groupby("date")["market_value"].sum().rename("_mv_sum")
+                    else:
+                        _mv = pd.Series(dtype=float)
+                    fills_df["date"] = pd.to_datetime(fills_df["date"]).dt.normalize()
+                    fills_df = fills_df.merge(
+                        _mv.reset_index(), on="date", how="left")
+                    fills_df["_mv_sum"] = fills_df["_mv_sum"].fillna(0.0)
+                    fills_df["_total_assets"] = (fills_df["cash_after"]
+                                                 + fills_df["_mv_sum"]).round(2)
+                    col_order = ["date", "time", "code", "direction", "price", "qty",
+                                 "amount", "cost", "pnl", "cash_after",
+                                 "_total_assets", "reason"]
                     col_order = [c for c in col_order if c in fills_df.columns]
-                    fills_show = fills_df[col_order].copy()
-                    fills_show.columns = ["日期", "代码", "操作", "价格", "数量",
-                                          "金额", "成本", "盈亏", "账户余额", "原因"]
+                    _col_names = {
+                        "date": "日期", "time": "时间", "code": "代码",
+                        "direction": "操作", "price": "价格", "qty": "数量",
+                        "amount": "金额", "cost": "成本", "pnl": "盈亏",
+                        "cash_after": "账户余额", "_total_assets": "总资产",
+                        "reason": "原因",
+                    }
+                    fills_show = fills_df[col_order].rename(columns=_col_names)
                     fills_show["操作"] = fills_show["操作"].apply(
                         lambda d: f"{'买入' if d=='buy' else '卖出'}")
                     fills_show["原因"] = fills_show["原因"].apply(
@@ -3336,6 +4115,13 @@ elif page == "backtest":
                     fills_show["盈亏"] = fills_show["盈亏"].apply(
                         lambda v: f"{v:+,.2f}" if v != 0 else "-")
                     fills_show["账户余额"] = fills_show["账户余额"].apply(lambda v: f"{v:,.2f}")
+                    fills_show["总资产"] = fills_show["总资产"].apply(lambda v: f"{v:,.2f}")
+                    # 日期只显示年月日 (去掉 00:00:00); 时间全为 0 点则整列隐藏
+                    fills_show["日期"] = pd.to_datetime(fills_show["日期"]).dt.strftime("%Y-%m-%d")
+                    if "时间" in fills_show.columns:
+                        _tcol = fills_show["时间"].astype(str)
+                        if _tcol.str.startswith("00:00").all():
+                            fills_show = fills_show.drop(columns=["时间"])
                     fills_show = fills_show.sort_values("日期").reset_index(drop=True)
                     st.dataframe(fills_show, use_container_width=True,
                                  hide_index=True, height=440)
@@ -3346,6 +4132,18 @@ elif page == "backtest":
                     st.info("本次回测没有持仓记录")
                 else:
                     holds_df = pd.DataFrame(holds)
+                    holds_df["date"] = pd.to_datetime(holds_df["date"]).dt.normalize()
+                    # 总资产 = 当日现金 (curve) + 当日全部持仓市值
+                    if curve is not None and len(curve) > 0:
+                        _cur = curve[["date", "cash"]].copy()
+                        _cur["date"] = pd.to_datetime(_cur["date"]).dt.normalize()
+                        holds_df = holds_df.merge(_cur, on="date", how="left")
+                        holds_df["cash"] = holds_df["cash"].fillna(0.0)
+                    else:
+                        holds_df["cash"] = 0.0
+                    _mv_sum = holds_df.groupby("date")["market_value"].sum().rename("_mv_sum")
+                    holds_df = holds_df.merge(_mv_sum.reset_index(), on="date", how="left")
+                    holds_df["总资产"] = (holds_df["cash"] + holds_df["_mv_sum"]).round(2)
                     holds_df = holds_df.sort_values(
                         ["date", "market_value"], ascending=[False, False])
                     holds_df = holds_df.rename(columns={
@@ -3353,6 +4151,13 @@ elif page == "backtest":
                         "cost_price": "成本价", "close": "收盘价",
                         "market_value": "市值", "pnl": "浮盈"})
                     holds_df["浮盈"] = holds_df["浮盈"].apply(lambda v: f"{v:+,.2f}")
+                    holds_df["总资产"] = holds_df["总资产"].apply(lambda v: f"{v:,.2f}")
+                    holds_df["日期"] = pd.to_datetime(holds_df["日期"]).dt.strftime("%Y-%m-%d")
+                    # 展示列: 日期 / 代码 / 持股量 / 成本价 / 收盘价 / 市值 / 浮盈 / 总资产
+                    _show_cols = ["日期", "代码", "持股量", "成本价", "收盘价",
+                                  "市值", "浮盈", "总资产"]
+                    holds_df = holds_df[[c for c in _show_cols
+                                         if c in holds_df.columns]]
                     st.dataframe(holds_df, use_container_width=True,
                                  hide_index=True, height=500)
                     st.caption(f"共 {len(holds_df)} 条持仓快照 · 按日期倒序排列")
@@ -3402,12 +4207,13 @@ elif page == "picks":
     _render_top_nav("picks", subtitle=t("picks_sub"))
     feat_data = require_data()
 
-    # 今日选股只支持函数式策略 (ETF 池为回测口径, 不走这里的函数式选股链)
+    # 今日选股支持函数式策略 (含 ETF 策略, 复用 _filter_etf_universe 全套过滤)
     _pick_strategies = [k for k in STRATEGY_NAMES if k in STRATEGIES]
     if st.session_state.get("today_strategy") not in _pick_strategies:
         st.session_state["today_strategy"] = _pick_strategies[0]
     strategy_choice = st.selectbox("选择选股策略", _pick_strategies, index=0, key="today_strategy")
     select_fn = STRATEGIES[strategy_choice]
+    _is_etf = (strategy_choice == "ETF策略")
 
     # 策略触发: 该策略需要但库内缺失的数据, 交给后台 Worker 补
     _need = request_strategy_data(strategy_choice, list(feat_data.keys()),
@@ -3418,8 +4224,23 @@ elif page == "picks":
             + (" · 财务季报回填" if _need["fundamental"] else "")
             + " —— Worker 补完后刷新页面生效")
 
+    # ETF 策略传入优质标的过滤参数 (与回测默认一致)
+    if _is_etf:
+        _pick_params = {
+            "top_n": 50,
+            "mom_days": int(st.session_state.get("etf_mom_days", 60)),
+            "min_amount": float(st.session_state.get("etf_min_amount", 0.5)),
+            "min_history": int(st.session_state.get("etf_min_history", 120)),
+            "max_dd_threshold": float(st.session_state.get("etf_max_dd_th", 30)) / 100.0,
+            "require_ma60_up": bool(st.session_state.get("etf_ma60_up", True)),
+            "ret20_min": float(st.session_state.get("etf_ret20_min", 0)),
+            "ret60_min": float(st.session_state.get("etf_ret60_min", 0)),
+        }
+    else:
+        _pick_params = {"top_n": 50}
+
     with st.spinner("🔍 筛选中..."):
-        picks = get_today_picks(feat_data, select_fn, strategy_params={"top_n": 50}, top_n=15)
+        picks = get_today_picks(feat_data, select_fn, strategy_params=_pick_params, top_n=15)
 
     # 选股记录落库 (SQLite pick_record, 供后续跟踪胜率)
     if not picks.empty:
@@ -3431,56 +4252,111 @@ elif page == "picks":
             pass
 
     if picks.empty:
-        st.warning("⚠️ 当前条件下没有找到符合要求的股票。试试调整策略参数或策略类型。")
+        _hint = "ETF" if _is_etf else "股票"
+        st.warning(f"⚠️ 当前条件下没有找到符合要求的{_hint}。试试调整策略参数或策略类型。")
     else:
         latest_date = picks["date"].iloc[0]
         st.info(f"📅 数据截止: {latest_date}  |  共找到 {len(picks)} 只候选")
 
-        # 带样式的表格
+        # 带样式的表格 (ETF 无财务/市值字段, 只展示行情相关列)
         display = picks.copy()
-        display = display[["code", "close", "ret_5", "ret_20", "turnover_pct", "cap_yi",
-                          "above_ma20", "vol_expand", "industry", "pe_ttm",
-                          "profit_yoy", "roe"]]
-        display.columns = ["代码", "收盘", "5日涨幅%", "20日涨幅%", "换手%", "市值(亿)",
-                          "MA20上方", "量能放大", "行业", "PE", "净利同比%", "ROE%"]
+        if _is_etf:
+            display = display[["code", "close", "ret_5", "ret_20",
+                               "turnover_pct", "above_ma20", "vol_expand"]]
+            display.columns = ["代码", "收盘", "5日涨幅%", "20日涨幅%",
+                               "换手%", "MA20上方", "量能放大"]
+            _fmt_cols = ["5日涨幅%", "20日涨幅%", "换手%"]
+        else:
+            display = display[["code", "close", "ret_5", "ret_20", "turnover_pct", "cap_yi",
+                              "above_ma20", "vol_expand", "industry", "pe_ttm",
+                              "profit_yoy", "roe"]]
+            display.columns = ["代码", "收盘", "5日涨幅%", "20日涨幅%", "换手%", "市值(亿)",
+                              "MA20上方", "量能放大", "行业", "PE", "净利同比%", "ROE%"]
+            _fmt_cols = ["5日涨幅%", "20日涨幅%", "换手%", "PE", "净利同比%", "ROE%"]
+            display["市值(亿)"] = display["市值(亿)"].round(1)
 
         # 格式化数值
-        for col in ["5日涨幅%", "20日涨幅%", "换手%", "PE", "净利同比%", "ROE%"]:
+        for col in _fmt_cols:
             display[col] = pd.to_numeric(display[col], errors="coerce").round(2)
-        display["市值(亿)"] = display["市值(亿)"].round(1)
         display["MA20上方"] = display["MA20上方"].map({1: "✅", 0: "—"})
         display["量能放大"] = display["量能放大"].map({1: "🔥", 0: "—"})
 
         # 实时行情表 (浏览器直连腾讯行情, 2 秒刷新; 涨红跌绿)
         _rows = []
+        _kl = {}  # 预置 K 线数据: {secid|klt: {name, arr}}, 避免浏览器直连东财 K 线接口被拒
         for _, _r in display.iterrows():
             def _num(_v):
                 return None if pd.isna(_v) else float(_v)
-            _rows.append({
+            _row = {
                 "c": str(_r["代码"]), "q": _em_secid(_r["代码"]), "c0": _num(_r["收盘"]),
                 "r5": _num(_r["5日涨幅%"]), "r20": _num(_r["20日涨幅%"]),
-                "to": _num(_r["换手%"]), "cap": _num(_r["市值(亿)"]),
-                "pe": _num(_r["PE"]), "roe": _num(_r["ROE%"]),
-                "ind": str(_r["行业"]) if pd.notna(_r["行业"]) else "-",
+                "to": _num(_r["换手%"]),
+                "cap": None, "pe": None, "roe": None, "ind": "-",
                 "sig": (str(_r["MA20上方"]) + str(_r["量能放大"])).strip(),
-            })
+            }
+            if not _is_etf:
+                _row.update({
+                    "cap": _num(_r["市值(亿)"]), "pe": _num(_r["PE"]),
+                    "roe": _num(_r["ROE%"]),
+                    "ind": str(_r["行业"]) if pd.notna(_r["行业"]) else "-",
+                })
+            _rows.append(_row)
+            # 从本地 feat_data 预置日/周/月 K 线 (东财 push2his 接口在 iframe 内会被拒)
+            _sc = picks.loc[picks["code"] == str(_r["代码"]), "sina_code"]
+            if len(_sc):
+                _df = feat_data.get(_sc.iloc[0])
+                if _df is not None and len(_df) >= 2:
+                    _q = _row["q"]
+                    for _klt, _tail, _rule in [(101, 260, None), (102, 120, "W-FRI"), (103, 60, "ME")]:
+                        if _rule:
+                            _sub = _df.set_index("date").resample(_rule).agg({
+                                "open": "first", "close": "last", "high": "max",
+                                "low": "min", "volume": "sum"
+                            }).dropna(subset=["close"]).tail(_tail)
+                            _arr = [{"d": _t.strftime("%Y-%m-%d"), "o": float(b["open"]),
+                                     "c": float(b["close"]), "h": float(b["high"]),
+                                     "l": float(b["low"]), "v": float(b["volume"])}
+                                    for _t, b in _sub.iterrows()]
+                        else:
+                            _sub = _df.tail(_tail)
+                            _arr = [{"d": b["date"].strftime("%Y-%m-%d"), "o": float(b["open"]),
+                                     "c": float(b["close"]), "h": float(b["high"]),
+                                     "l": float(b["low"]), "v": float(b["volume"])}
+                                    for _, b in _sub.iterrows()]
+                        if _arr:
+                            _kl[f"{_q}|{_klt}"] = {"name": "", "arr": _arr}
         import streamlit.components.v1 as _comp
         # 表格 + K线面板 (点击行在下方就地显示K线)
-        _comp.html(_PICKS_HTML.replace("__ROWS__", json.dumps(_rows, ensure_ascii=False)),
-                   height=48 + 29 * len(_rows) + 390, scrolling=False)
+        _html = _PICKS_HTML.replace("__ROWS__", json.dumps(_rows, ensure_ascii=False))
+        _html = _html.replace("__KLINES__", json.dumps(_kl, ensure_ascii=False))
+        _comp.html(_html, height=48 + 29 * len(_rows) + 390, scrolling=False)
 
-        # 市值分布可视化
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("📊 市值分布")
-            fig_cap = go.Figure(go.Bar(
-                x=display["代码"], y=display["市值(亿)"],
-                marker_color="#3b82f6",
-            ))
-            fig_cap.update_layout(template="plotly_white", height=300, margin=dict(l=0, r=20, t=20, b=0))
-            st.plotly_chart(fig_cap, use_container_width=True)
-
-        with col2:
+        # 可视化: ETF 只画动量分布; 股票额外画市值分布
+        if not _is_etf:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("📊 市值分布")
+                fig_cap = go.Figure(go.Bar(
+                    x=display["代码"], y=display["市值(亿)"],
+                    marker_color="#3b82f6",
+                ))
+                fig_cap.update_layout(paper_bgcolor="#141430", plot_bgcolor="#141430",
+                                      height=300, margin=dict(l=0, r=20, t=20, b=0),
+                                      font=dict(color="#f5f8ff"))
+                st.plotly_chart(fig_cap, use_container_width=True)
+            with col2:
+                st.subheader("📊 动量分布 (20日涨幅)")
+                colors = ["#ef4444" if v > 20 else "#f59e0b" if v > 0 else "#22c55e" for v in display["20日涨幅%"]]
+                fig_ret = go.Figure(go.Bar(
+                    x=display["代码"], y=display["20日涨幅%"],
+                    marker_color=colors, text=[f"{v:.1f}%" for v in display["20日涨幅%"]],
+                    textposition="outside",
+                ))
+                fig_ret.update_layout(paper_bgcolor="#141430", plot_bgcolor="#141430",
+                                      height=300, margin=dict(l=0, r=20, t=20, b=0),
+                                      font=dict(color="#f5f8ff"))
+                st.plotly_chart(fig_ret, use_container_width=True)
+        else:
             st.subheader("📊 动量分布 (20日涨幅)")
             colors = ["#ef4444" if v > 20 else "#f59e0b" if v > 0 else "#22c55e" for v in display["20日涨幅%"]]
             fig_ret = go.Figure(go.Bar(
@@ -3488,7 +4364,9 @@ elif page == "picks":
                 marker_color=colors, text=[f"{v:.1f}%" for v in display["20日涨幅%"]],
                 textposition="outside",
             ))
-            fig_ret.update_layout(template="plotly_white", height=300, margin=dict(l=0, r=20, t=20, b=0))
+            fig_ret.update_layout(paper_bgcolor="#141430", plot_bgcolor="#141430",
+                                  height=300, margin=dict(l=0, r=20, t=20, b=0),
+                                  font=dict(color="#f5f8ff"))
             st.plotly_chart(fig_ret, use_container_width=True)
 
 
@@ -3505,6 +4383,7 @@ elif page == "portfolio":
         # 最新一次选股 = 当前模拟持仓 (等权分配资金)
         latest_date = picks_df["pick_date"].iloc[0]
         holdings = picks_df[picks_df["pick_date"] == latest_date].copy()
+        holdings = holdings.drop_duplicates(subset=["symbol"], keep="first")
         latest_strategy = holdings["strategy"].iloc[0] if "strategy" in holdings else "-"
 
         st.markdown(f"#### 📌 当前模拟持仓  `选股日: {latest_date}`  ·  策略: `{latest_strategy}`")
@@ -3895,13 +4774,15 @@ elif page == "data":
         quota_txt = f"今日已用 {qs['used']}/{qs['limit']}" if ok else why
     except Exception as e:
         quota_txt = f"数据源未就绪: {e}"
-    g1, g2, g3, g4 = st.columns(4)
+    g1, g2, g3, g4, g5 = st.columns(5)
     g1.metric("ETF 资金流天", f"{ex['flow_bars']:,}", delta=f"最新 {ex['flow_last']}")
     g2.metric("ETF 规模份额", f"{ex['capital_symbols']:,} 只",
               delta=f"{ex['capital_bars']:,} 条 / {ex['capital_last']}")
     g3.metric("ETF 行情增强", f"{ex['quote_symbols']:,} 只",
               delta=f"{ex['quote_bars']:,} 条 / {ex['quote_last']}")
     g4.metric("华泰柏瑞配额", quota_txt, delta=f"两融 {ex['margin_bars']:,} 条")
+    g5.metric("沪市官方份额", f"{ex['share_symbols']:,} 只",
+              delta=f"{ex['share_bars']:,} 条 / {ex['share_last']}")
 
     import data_manager
     req_lines = "\n".join(
@@ -4150,7 +5031,7 @@ elif page == "help":
     st.subheader("📖 功能页说明")
     hc1, hc2, hc3 = st.columns(3)
     with hc1:
-        st.markdown('<div class="help-card"><h4>🏠 量化大师</h4><p>首页聚合全球主要市场（A股/港股/美股/商品/汇率）实时行情与涨跌，带国旗图标与红绿箭头；Top 资讯以可展开摘要呈现；顶部快捷入口直达选股/回测/组合等模块；策略绩效概览可折叠查看。</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="help-card"><h4>🏠 量化大师</h4><p>首页聚合全球主要经济体（中国/美洲/欧洲/亚太/商品/汇率/加密）实时行情与涨跌，带国旗图标与红绿箭头，并支持在世界地图上点击区域筛选；Top 资讯以可展开摘要呈现；顶部快捷入口直达选股/回测/组合等模块；策略绩效概览可折叠查看。</p></div>', unsafe_allow_html=True)
     with hc2:
         st.markdown('<div class="help-card"><h4>🔬 策略回测</h4><p>可微调单个策略的专属参数（如市值上限、换手率阈值）。回测完成后展示逐笔交易明细和按月交易日历——红=涨停命中日、橙=有交易、蓝=选股日。</p></div>', unsafe_allow_html=True)
     with hc3:
@@ -4160,10 +5041,25 @@ elif page == "help":
     with hc4:
         st.markdown('<div class="help-card"><h4>💼 投资组合</h4><p>以最新一次选股结果作为模拟持仓，等权分配资金（100 股取整），用库内最新收盘价计算浮盈浮亏。未计手续费/滑点，仅供研究。</p></div>', unsafe_allow_html=True)
     with hc5:
-        st.markdown('<div class="help-card"><h4>🌍 全球市场</h4><p>首页自动抓取上证/深证/创业板/沪深300/恒生/恒生科技/道琼斯/纳斯达克/标普500/黄金/原油/美元人民币等 12 个标的，10 分钟缓存，单源失败不影响整体。</p></div>', unsafe_allow_html=True)
+        st.markdown('<div class="help-card"><h4>🌍 全球市场</h4><p>首页自动抓取上证/深证/创业板/沪深300/道琼斯/纳斯达克/标普500/德国DAX/英国富时100/法国CAC40/日经225/韩国KOSPI/澳洲标普200/恒生指数/恒生科技/黄金/原油/美元人民币/比特币等 19 个标的，指数与商品 2 秒刷新（东财）、比特币 5 秒刷新（OKX），服务端另有 10 分钟缓存兜底，单源失败不影响整体；世界地图可点区域筛选，正在交易的市场会闪烁提示（北京时间）。</p></div>', unsafe_allow_html=True)
 
     st.divider()
     st.subheader("🧠 策略原理")
+    with st.expander("🧭 核心原则：低买高卖（所有策略必须遵守）", expanded=True):
+        st.markdown("""
+**仓位管理维持目标仓位占比（默认 75%）基本稳定，通过「跌了补、涨了卖」实现：**
+
+| 场景 | 正确动作 |
+|---|---|
+| 价格较上次成交价**跌 ≥ 4%** | 买入补足到目标权重（摊低成本） |
+| 价格较上次成交价**涨 ≥ 4%** | 卖出超出部分（兑现盈利） |
+| 权重偏离 **≥ 5%** | 卖高买低，回到等权 |
+| 小偏离 / 碎单 | **不交易**（成交额 < max(3000 元, 持仓 0.5%) 跳过） |
+
+关键认知：75% 仓位下标的涨 4%，权重只变化约 +0.8%。因此**价格触发（4%）是主触发，权重偏离（5%）只是补充**；只用权重阈值会导致标的涨 20% 以上才调仓，长期"坐过山车"。
+
+任何策略逻辑若与该原则冲突（追涨选品、下跌止损与补仓方向相反、排名换股追涨杀跌等），必须先登记冲突并讨论后再修改。
+        """)
     with st.expander("💎 小市值轮动·戴维斯双击（基本面增强）", expanded=True):
         st.markdown("""
 **戴维斯双击** = 盈利(EPS)提升 × 估值(PE)扩张，两者同时发生带来股价戴维斯双击。
@@ -4196,6 +5092,32 @@ elif page == "help":
         """)
     with st.expander("📉 随机对照"):
         st.markdown("随机买入同数量股票作为基准线（命中率约 7%）。任何策略都必须显著跑赢它才有意义。")
+    with st.expander("📈 ETF 轮动策略（动量选品 + 周K MA30 趋势）"):
+        st.markdown("""
+**选品**（每日/每周检查，按动量排序取前 N）
+- 流动性：近 20 日日均成交额 ≥ 门槛；数据长度 ≥ 120 根 K 线
+- 趋势：周K MA30 向上
+- 优质标的过滤：近 250 日最大回撤 < 30%、站上 MA60 且 MA60 上行、近 20/60 日涨幅非负
+- 溢价/资金流：可选过滤，数据缺失视为无信号
+
+**建仓确认（过滤草率建仓，2026-11-22 新增·四重门槛）**
+- 周K MA30 连续上升 ≥ N 周（界面「建仓确认(周)」，默认 2）
+- 最近 2 个**已完成周**均为阳线（周收盘 > 周开盘）
+- **长期趋势向上**：价格站上最长可用周均线（优先周 MA120，不足 120 周降级到周 MA60），且周 MA30 在长均线之上——过滤下跌趋势中的死猫反弹
+- 当前价相对周 MA30 溢价 ≤ 10%（不追高）
+- 四道门槛任一不满足则不建仓；只拦买入，不延迟存量持仓的调仓与清仓；数据不足时放行
+
+**持仓数与补位（2026-11-22 修订）**
+- 设置里的「持仓数」= 目标仓位数（如 1 就始终持有 1 个仓位）；界面已取消「标的列表」，全部标的来自当日标的池
+- 持仓被清仓后，**当日**即按当日排名补位买入排名第一的标的，不会留空仓（仅当无标的通过选品+建仓确认时才防御性空仓）
+
+**持仓与调仓（2026-11-23 修订）**
+- 按排名换出：持仓跌出 `持仓数+排名缓冲` 名即换出，与股票一致；周K MA30 走弱同步清仓，先触发者为准
+- 下跌 ≥ 4% 补仓；权重偏离 ≥ 5% 再平衡；**上涨不因 +4% 削赢**，让强势 ETF 利润奔跑
+- 碎单不交易；严格先卖后买（09:30 卖、09:31 买）
+
+**卖出**：周K MA30 走弱 / 绝对动量转弱 / 全市场资金流风控
+        """)
 
     st.divider()
     st.subheader("❔ 常见问题")

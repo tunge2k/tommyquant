@@ -492,6 +492,91 @@ def backfill_etf_market_flow(start: str = "2020-01-01", end: str | None = None) 
     return {"rows": rows, "years": years}
 
 
+def _db_trade_dates(start: str, end: str) -> list[str]:
+    """库内已有行情的交易日 (回补份额时用它当交易日历, 不依赖外部日历)"""
+    conn = data_store.get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT date FROM daily_bar WHERE date BETWEEN ? AND ? ORDER BY date",
+        (start, end)).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def ensure_etf_shares(day: str | None = None) -> dict:
+    """盘后同步当日沪市 ETF 份额 (交易所官方, 1 次调用/日, 无配额)"""
+    import exchange_source as es
+    if not es.env_enabled():
+        return {"skipped": "官方源已关闭"}
+    day = day or last_trading_day()
+    if day in data_store.etf_share_dates():
+        return {"skipped": "已有数据", "date": day}
+    rows = es.fetch_sse_shares(day)
+    return {"date": day, "rows": data_store.upsert_etf_share_daily(rows)}
+
+
+def backfill_etf_shares(start: str = "2020-01-01", end: str | None = None,
+                        max_days: int = 250, progress_cb=None) -> dict:
+    """回补沪市 ETF 份额历史 (上交所官方, 任意历史日可回溯)
+
+    每个交易日 1 次调用、单次返回当日全市场, 因此 2020 年至今约 1500 次调用;
+    按已覆盖日期判断缺口, 未完成部分下次运行会继续。
+    """
+    import exchange_source as es
+    if not es.env_enabled():
+        return {"skipped": "官方源已关闭"}
+    end = end or last_trading_day()
+    have = data_store.etf_share_dates()
+    dates = [d for d in _db_trade_dates(start, end) if d not in have]
+    stats = {"days": 0, "rows": 0, "failed": [], "remaining": len(dates), "aborted": None}
+    for i, d in enumerate(dates[:max_days], 1):
+        try:
+            rows = es.fetch_sse_shares(d)
+        except es.SourceError as ex:
+            stats["failed"].append(f"{d}: {ex}")
+            if len(stats["failed"]) >= 5:
+                stats["aborted"] = "连续失败, 已停止"
+                break
+            continue
+        stats["rows"] += data_store.upsert_etf_share_daily(rows)
+        stats["days"] += 1
+        stats["remaining"] = len(dates) - i
+        if progress_cb:
+            progress_cb(i, min(max_days, len(dates)), f"{d} {len(rows)} 只")
+    return stats
+
+
+def backfill_etf_nav(symbols: list[str] | None = None, start: str = "2020-01-01",
+                     end: str | None = None, max_symbols: int = 60,
+                     progress_cb=None) -> dict:
+    """回补 ETF 单位净值历史 (东财), 供本地计算溢价率
+
+    只处理还没有净值数据的标的; 默认范围为已有份额数据的沪市 ETF。
+    """
+    import exchange_source as es
+    end = end or last_trading_day()
+    pool = symbols or [s for s in data_store.etf_share_symbols() if s.startswith("sh")]
+    conn = data_store.get_conn()
+    have = {r[0] for r in conn.execute(
+        "SELECT DISTINCT symbol FROM etf_share_daily WHERE nav IS NOT NULL")}
+    conn.close()
+    todo_all = [s for s in pool if s not in have]
+    todo = todo_all[:max_symbols]
+    stats = {"symbols": 0, "rows": 0, "failed": [], "remaining": len(todo_all) - len(todo)}
+    for i, sym in enumerate(todo, 1):
+        try:
+            rows = es.fetch_nav_history(sym[2:] if sym.startswith("sh") else sym, start, end)
+        except es.SourceError as ex:
+            stats["failed"].append(f"{sym}: {ex}")
+            continue
+        data_store.upsert_etf_share_daily(
+            [{"symbol": sym, "date": r["date"], "nav": r["nav"]} for r in rows])
+        stats["rows"] += len(rows)
+        stats["symbols"] += 1
+        if progress_cb:
+            progress_cb(i, len(todo), f"{sym} {len(rows)} 天")
+    return stats
+
+
 def _traded_etf_symbols() -> list[str]:
     """从历史 ETF 回测结果中提取「实际交易过的 ETF」, 用于定向回补溢价率
 
@@ -936,22 +1021,32 @@ def ensure_realtime(symbols: list[str] = None) -> int:
 # 目标指数清单: (名称, 匹配关键字, 国旗图标, 地区分组)
 _GLOBAL_TARGETS = [
     # A股
-    ("上证指数", "上证指数", "🇨🇳", "A股"),
-    ("深证成指", "深证成指", "🇨🇳", "A股"),
-    ("创业板指", "创业板指", "🇨🇳", "A股"),
-    ("沪深300", "沪深300", "🇨🇳", "A股"),
-    # 港股
-    ("恒生指数", "恒生指数", "🇭🇰", "港股"),
-    ("恒生科技", "恒生科技", "🇭🇰", "港股"),
+    ("上证指数", "上证指数", "🇨🇳", "中国"),
+    ("深证成指", "深证成指", "🇨🇳", "中国"),
+    ("创业板指", "创业板指", "🇨🇳", "中国"),
+    ("沪深300", "沪深300", "🇨🇳", "中国"),
     # 美股
-    ("道琼斯", "道琼斯", "🇺🇸", "美股"),
-    ("纳斯达克", "纳斯达克", "🇺🇸", "美股"),
-    ("标普500", "标普500", "🇺🇸", "美股"),
+    ("道琼斯", "道琼斯", "🇺🇸", "美洲"),
+    ("纳斯达克", "纳斯达克", "🇺🇸", "美洲"),
+    ("标普500", "标普500", "🇺🇸", "美洲"),
+    # 欧洲
+    ("德国DAX", "DAX", "🇩🇪", "欧洲"),
+    ("英国富时100", "富时", "🇬🇧", "欧洲"),
+    ("法国CAC40", "CAC", "🇫🇷", "欧洲"),
+    # 亚太
+    ("日经225", "日经", "🇯🇵", "亚太"),
+    ("韩国KOSPI", "韩国", "🇰🇷", "亚太"),
+    ("澳洲标普200", "澳大利亚", "🇦🇺", "亚太"),
+    # 港股
+    ("恒生指数", "恒生", "🇭🇰", "港股"),
+    ("恒生科技", "恒生科技", "🇭🇰", "港股"),
     # 商品
     ("COMEX黄金", "黄金", "🥇", "商品"),
     ("WTI原油", "原油", "🛢️", "商品"),
     # 汇率
     ("美元/人民币", "美元", "💱", "汇率"),
+    # 加密货币
+    ("比特币", "比特币", "₿", "加密"),
 ]
 _GLOBAL_CACHE = {"ts": 0.0, "data": None}
 
@@ -988,20 +1083,65 @@ def _try_zh_index_em() -> dict:
     return out
 
 
-def _try_hk_index_em() -> dict:
-    """港股指数快照: 新浪源"""
+def _try_global_index_em() -> dict:
+    """欧/日/韩/澳主要指数: 东财全球指数快照 (一次请求覆盖全部)"""
     out = {}
-    df = _ak_call(["stock_hk_index_spot_sina", "index_hk_spot_sina"])
-    if df is not None:
+    df = _ak_call(["index_global_spot_em", "index_global_spot_sina"])
+    if df is None or df.empty:
+        return out
+    # 目标名称 -> 匹配关键字 (按顺序取第一个命中)
+    want = [("德国DAX", ("DAX",)), ("英国富时100", ("富时100", "FTSE")),
+            ("法国CAC40", ("CAC",)), ("日经225", ("日经",)),
+            ("韩国KOSPI", ("韩国",)), ("澳洲标普200", ("澳大利亚", "澳洲")),
+            ("恒生指数", ("恒生指数",))]
+    try:
+        for _, r in df.iterrows():
+            nm = str(r.get("名称", ""))
+            price = _to_float(r.get("最新价"))
+            pct = _to_float(r.get("涨跌幅"))
+            if not price or price <= 0:
+                continue
+            for cn, kws in want:
+                if cn in out:
+                    continue
+                if any(k in nm for k in kws):
+                    out[cn] = {"price": price, "pct": pct}
+    except Exception:
+        pass
+    return out
+
+
+def _try_btc() -> dict:
+    """比特币现价: OKX -> Binance -> Coinbase 依次兜底"""
+    import json
+    import urllib.request
+    out = {}
+    sources = (
+        ("https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT", "okx"),
+        ("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT", "binance"),
+        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", "coinbase"),
+    )
+    for url, kind in sources:
         try:
-            for _, r in df.iterrows():
-                name = str(r.get("名称", ""))
-                price = _to_float(r.get("最新价"))
-                pct = _to_float(r.get("涨跌幅"))
-                if price and price > 0:
-                    out[name] = {"price": price, "pct": pct}
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            j = json.loads(urllib.request.urlopen(req, timeout=6).read().decode("utf-8"))
+            if kind == "okx" and j.get("data"):
+                d = j["data"][0]
+                price = float(d["last"])
+                pct = (price / float(d["open24h"]) - 1) * 100
+            elif kind == "binance":
+                price = float(j["lastPrice"])
+                pct = float(j["priceChangePercent"])
+            elif kind == "coinbase":
+                price = float(j["data"]["amount"])
+                pct = 0.0
+            else:
+                continue
+            if price > 0:
+                out["比特币"] = {"price": price, "pct": pct}
+                return out
         except Exception:
-            pass
+            continue
     return out
 
 
@@ -1113,8 +1253,8 @@ def _fetch_global_markets() -> list[dict]:
     """从各数据源并发拉取全球市场数据 (串行约 10s, 并发约 2s)"""
     from concurrent.futures import ThreadPoolExecutor
     pools = {}
-    fns = (_try_zh_index_em, _try_hk_index_em, _try_us_index,
-           _try_gold_oil, _try_fx)
+    fns = (_try_zh_index_em, _try_global_index_em, _try_us_index,
+           _try_gold_oil, _try_fx, _try_btc)
     with ThreadPoolExecutor(max_workers=len(fns)) as ex:
         for fut in [ex.submit(f) for f in fns]:
             try:
