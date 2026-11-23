@@ -31,6 +31,7 @@ import data_store
 import news_fetcher
 import perf_report
 import robust_backtest as rb
+from world_map_data import WORLD_MAP_SVG   # 首页世界地图 SVG 片段 (equirectangular)
 
 try:
     import fast_backtest as fastbt
@@ -2158,23 +2159,30 @@ _MARKET_CARDS_HTML = r"""
     .px { font-size:14px; }
     .gp { display:none; }
   }
-  /* 世界地图区域筛选 */
+  /* 世界地图区域筛选 (equirectangular, 真实大陆轮廓) */
   .mapwrap { position:relative; border:1px solid rgba(0,229,255,0.16); border-radius:12px;
              background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; margin-bottom:8px; }
-  svg.ww { width:100%; height:auto; max-height:190px; display:block; }
-  .rg { fill:#1b2750; stroke:#2c3c66; stroke-width:1.2; cursor:pointer;
-        transition:fill 0.15s ease, stroke 0.15s ease; }
-  .rg:hover { fill:#24406e; }
-  .rg.live { animation: breathe 1.8s ease-in-out infinite alternate; }
+  svg.ww { width:100%; height:auto; max-height:210px; display:block; }
+  .land { fill:#16203f; stroke:#26324f; stroke-width:0.6; stroke-linejoin:round; }
+  .rg.land { fill:#1b2750; stroke:#2c3c66; cursor:pointer;
+             transition:fill 0.15s ease, stroke 0.15s ease; }
+  .rg.land:hover { fill:#24406e; stroke:#4b5f8f; }
+  .rg.land.live { animation: breathe 1.8s ease-in-out infinite alternate; }
   @keyframes breathe {
     from { fill:#123a37; stroke:#0a7f6b; }
     to   { fill:#127a5c; stroke:#00ffa3; }
   }
+  .rg.mk { cursor:pointer; }
+  .rg.mk circle { fill:rgba(0,229,255,0.25); stroke:#00e5ff; stroke-width:1.2; transition:fill 0.15s; }
+  .rg.mk text { fill:#7fe9ff; font-size:10.5px; font-weight:600; pointer-events:none; }
+  .rg.mk:hover circle { fill:rgba(0,229,255,0.5); }
+  .rg.mk.live circle { animation: blinkDot 1.8s ease-in-out infinite alternate; }
+  @keyframes blinkDot { from { fill:#0a7f6b; stroke:#0a7f6b; } to { fill:#00ffa3; stroke:#00ffa3; } }
   .legend { margin-top:4px; font-size:10.5px; color:#6b7596; display:flex; gap:12px; align-items:center; }
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#00ffa3;
          box-shadow:0 0 6px #00ffa3; margin-right:4px; animation:blink 1.8s ease-in-out infinite alternate; }
   @keyframes blink { from { opacity:0.35; } to { opacity:1; } }
-  .gl { fill:#7b86a8; font-size:12px; pointer-events:none; }
+  .gl { fill:#7b86a8; font-size:11px; pointer-events:none; }
   .tip { position:absolute; right:10px; top:6px; font-size:10.5px; color:#6b7596; }
   .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 8px; }
   .tab { font-size:11.5px; padding:3px 10px; border-radius:999px; cursor:pointer;
@@ -2183,32 +2191,18 @@ _MARKET_CARDS_HTML = r"""
   .tab.on { background:rgba(0,229,255,0.14); border-color:#00e5ff; color:#7fe9ff; }
 </style></head><body>
 <div class="mapwrap">
-  <svg class="ww" viewBox="0 0 800 340" aria-label="世界主要市场区域图">
-    <g class="rg" data-r="美洲">
-      <path d="M70,62 L180,42 L300,50 L318,92 L286,120 L250,132 L236,168 L206,186 L180,160 L140,150 L96,120 Z"/>
-      <path d="M238,196 L292,190 L308,232 L300,282 L272,322 L252,296 L244,252 L228,222 Z"/>
+  <svg class="ww" viewBox="0 0 1000 500" aria-label="世界主要市场区域图">
+__WORLD_MAP__
+    <text class="gl" x="222" y="138">美洲</text>
+    <text class="gl" x="542" y="112">欧洲</text>
+    <text class="gl" x="556" y="238">非洲</text>
+    <text class="gl" x="778" y="86">亚太</text>
+    <g class="rg mk" data-r="中国">
+      <circle cx="789" cy="153" r="7"/><text x="800" y="148">中国</text>
     </g>
-    <g class="rg" data-r="欧洲">
-      <path d="M372,52 L452,42 L470,66 L462,104 L430,126 L396,112 L378,84 Z"/>
+    <g class="rg mk" data-r="港股">
+      <circle cx="817" cy="188" r="4.5"/><text x="826" y="192">香港</text>
     </g>
-    <path d="M392,140 L470,132 L492,168 L482,222 L450,276 L416,280 L396,232 L384,184 Z" fill="#16203f" stroke="#26324f" stroke-width="1.2"/>
-    <path d="M452,124 L510,120 L516,150 L470,160 L448,144 Z" fill="#16203f" stroke="#26324f" stroke-width="1.2"/>
-    <g class="rg" data-r="亚太">
-      <path d="M492,58 L640,46 L742,58 L768,104 L742,152 L700,196 L640,210 L576,186 L534,142 L506,100 Z"/>
-    </g>
-    <g class="rg" data-r="中国">
-      <circle cx="666" cy="120" r="18"/>
-    </g>
-    <g class="rg" data-r="港股">
-      <circle cx="701" cy="152" r="9"/>
-    </g>
-    <text class="gl" x="180" y="120">北美洲</text>
-    <text class="gl" x="258" y="268">南美洲</text>
-    <text class="gl" x="404" y="92">欧洲</text>
-    <text class="gl" x="418" y="212">非洲</text>
-    <text class="gl" x="612" y="110">亚太</text>
-    <text class="gl" x="654" y="124" style="font-size:10.5px;fill:#7fe9ff;">中国</text>
-    <text class="gl" x="694" y="170" style="font-size:9.5px;fill:#9fb0d0;">香港</text>
   </svg>
   <div class="tip">点击区域筛选行情</div>
   <div class="legend"><span><span class="dot"></span>闪烁 = 该市场正在交易</span><span>时间按北京时间</span></div>
@@ -3465,7 +3459,9 @@ if page == "home":
 
     st.markdown(f"### {t('global_markets')}")
     _comp.html(
-        _MARKET_CARDS_HTML.replace("__ITEMS__", json.dumps(_items, ensure_ascii=False)),
+        _MARKET_CARDS_HTML
+            .replace("__ITEMS__", json.dumps(_items, ensure_ascii=False))
+            .replace("__WORLD_MAP__", WORLD_MAP_SVG),
         height=700, scrolling=True)
 
     st.divider()
