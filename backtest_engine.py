@@ -2311,6 +2311,9 @@ class MarketCapStrategy(BaseStrategy):
             if qty >= 100:
                 order = OrderEvent(date, code, "buy", qty)
                 order.reason = "mc_new_entry" if is_new else "mc_rebalance"
+                # 附带目标市值: T+1 开盘撮合时按实际成交价重算股数,
+                # 避免「信号日收盘价 → 次日开盘价」跳空导致实际买入金额偏离目标 (建仓超配)
+                order.target_mv = float(targets[code])
                 buys.append(order)
                 avail -= qty * cur_price * 1.0015  # 含费用
         return sells + buys
@@ -2897,6 +2900,12 @@ class EventDrivenBacktest:
                 self.fill_blocks[f"buy_{block}"] += 1
                 continue
             _px = row.get("open", row["close"]) or 0
+            # 按 T+1 实际成交价重算股数: 信号用 T 日收盘价算目标, 撮合却在 T+1 开盘,
+            # 跳空会让实际买入金额偏离目标市值 (建仓超配 → 首次下跌触发变成减仓).
+            # 这里用「目标市值 / 开盘价」反算整手数; 现金不足仍由 apply_fill 收缩。
+            _tgt = getattr(order, "target_mv", 0.0)
+            if _tgt and _px > 0:
+                order.quantity = max(int(_tgt / _px // 100) * 100, 0)
             if order.quantity * _px < _dust:
                 continue  # 碎单不买
             if self._do_fill(order, date, row):

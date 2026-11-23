@@ -1959,11 +1959,12 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-BACKTEST_LOGIC_VERSION = 9  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+BACKTEST_LOGIC_VERSION = 10  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
 # v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
 # v8: ETF 启用 Topk-Drop 排名换出；ETF 上涨不再因 +4% 削赢（仅下跌补仓 / 权重偏离≥5%）
 # v9: ETF 绝对动量阈值默认 0% → 3%（top_n=5, 2024-01~2026-11: 收益 +22.0%→+53.8%,
 #     最大回撤 -14.7%→-13.3%, 夏普 0.74→1.19; K=4 稳健分 0.17→0.45）
+# v10: 买入按 T+1 实际开盘价重算股数, 建仓不再因跳空超配（跌 4% 触发后可正常补仓而非减仓）
 
 
 def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
