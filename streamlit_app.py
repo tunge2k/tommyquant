@@ -4145,20 +4145,44 @@ elif page == "backtest":
                     st.info("本次回测没有成交记录")
                 else:
                     fills_df = pd.DataFrame(fills)
-                    # 总资产 = 成交后现金 + 当日全部持仓市值 (从 holdings_log 按日汇总)
+                    # 总资产 = 该笔成交后的现金 + 该时点的持仓市值
+                    # 不能直接用「当日收盘持仓市值」: 同一天"先卖后买"时, cash_after 里还留着
+                    # 卖出回款(尚未买入), 而收盘持仓已包含用这笔钱买的新仓 → 会重复计算,
+                    # 出现"卖出那行 310 万、买入那行 177 万"的跳变.
+                    # 做法: 以当日收盘持仓为基准, 逆序撤销当天更晚的成交, 还原每笔成交刚完成时的持仓.
                     _holds = result.get("holdings_log") or []
-                    if _holds:
-                        _hdf = pd.DataFrame(_holds)
-                        _hdf["date"] = pd.to_datetime(_hdf["date"]).dt.normalize()
-                        _mv = _hdf.groupby("date")["market_value"].sum().rename("_mv_sum")
-                    else:
-                        _mv = pd.Series(dtype=float)
                     fills_df["date"] = pd.to_datetime(fills_df["date"]).dt.normalize()
-                    fills_df = fills_df.merge(
-                        _mv.reset_index(), on="date", how="left")
-                    fills_df["_mv_sum"] = fills_df["_mv_sum"].fillna(0.0)
-                    fills_df["_total_assets"] = (fills_df["cash_after"]
-                                                 + fills_df["_mv_sum"]).round(2)
+                    fills_df = fills_df.reset_index(drop=True)
+                    _eod_qty, _eod_px, _fill_px = {}, {}, {}
+                    if _holds:
+                        for _h in _holds:
+                            _d = pd.Timestamp(_h["date"]).normalize()
+                            _c = _h["code"]
+                            _eod_qty.setdefault(_d, {})[_c] = int(round(_h["qty"]))
+                            _eod_px[(_d, _c)] = float(_h["close"])
+                    for _i, _r in fills_df.iterrows():
+                        _fill_px[(_r["date"], _r["code"])] = float(_r["price"])
+                    _total = [0.0] * len(fills_df)
+                    for _d, _idx in fills_df.groupby("date", sort=False).groups.items():
+                        _qty = dict(_eod_qty.get(_d, {}))
+                        _after = {}
+                        for _i in reversed(list(_idx)):
+                            _after[_i] = dict(_qty)          # 这笔成交完成后的持仓
+                            _q = int(round(fills_df.at[_i, "qty"]))
+                            _c = fills_df.at[_i, "code"]
+                            if fills_df.at[_i, "direction"] == "buy":
+                                _qty[_c] = _qty.get(_c, 0) - _q
+                            else:
+                                _qty[_c] = _qty.get(_c, 0) + _q
+                        for _i in _idx:
+                            _mv = 0.0
+                            for _c, _q in _after[_i].items():
+                                if _q <= 0:
+                                    continue
+                                _px = _eod_px.get((_d, _c)) or _fill_px.get((_d, _c)) or 0.0
+                                _mv += _px * _q
+                            _total[_i] = float(fills_df.at[_i, "cash_after"]) + _mv
+                    fills_df["_total_assets"] = pd.Series(_total).round(2)
                     col_order = ["date", "time", "code", "direction", "price", "qty",
                                  "amount", "cost", "pnl", "cash_after",
                                  "_total_assets", "reason"]
