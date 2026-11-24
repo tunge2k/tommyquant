@@ -2203,12 +2203,13 @@ _MARKET_CARDS_HTML = r"""
   .ctx path { fill:#131a30; stroke:#1e2942; stroke-width:.45; stroke-linejoin:round; }
   .cty { fill:#2a3050; stroke:#41507a; stroke-width:.7; stroke-linejoin:round; cursor:pointer;
          transition:fill .3s ease, stroke .3s ease; }
-  .cty:hover { filter:brightness(1.55); }
+  .cty:hover { filter:brightness(1.6) !important; }
+  /* 开盘中: 整块国家明暗脉冲呼吸 (只调明度不调色相, 保留涨跌底色) */
   .cty.live { animation:breathe 1.9s ease-in-out infinite alternate; }
-  @keyframes breathe { from { stroke-width:.7; } to { stroke-width:3.4; } }
+  @keyframes breathe { from { filter:brightness(.72); } to { filter:brightness(1.5); } }
   .mk { cursor:pointer; }
   .mk circle { stroke:#ffc53d; fill:rgba(255,197,61,.45); stroke-width:1.2; transition:fill .25s; }
-  .mk:hover circle { filter:brightness(1.45); }
+  .mk:hover circle { filter:brightness(1.5) !important; }
   .mk.live circle { animation:breathe 1.9s ease-in-out infinite alternate; }
   .cname { position:absolute; transform:translate(-50%,-50%); font-size:11px; font-weight:600;
            color:#a9b8dc; pointer-events:none; text-shadow:0 1px 3px #000; letter-spacing:.2px; }
