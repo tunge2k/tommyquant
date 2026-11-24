@@ -172,11 +172,11 @@ update_worker 主循环
 
 ## 5. 数据库模型
 
-SQLite 单库 `data/stock.db`，WAL 模式。共 19 张业务表 + SQLite 内部表 `sqlite_sequence`。
+SQLite 单库 `data/stock.db`，WAL 模式。共 22 张业务表 + SQLite 内部表 `sqlite_sequence`。
 
 | 表 | 主键 | 用途 | 关键字段 |
 |---|---|---|---|
-| `daily_bar` | `(symbol, date)` | 前复权日线 | open/high/low/close/volume/amount/outstanding_share/turnover/asset_type |
+| `daily_bar` | `(symbol, date)` | 日线（股票前复权；ETF 存不复权原始价，因子层做后复权） | open/high/low/close/volume/amount/outstanding_share/turnover/asset_type |
 | `data_coverage` | `(dataset, symbol)` | 已同步区间索引，只补缺口 | start_date/end_date/rows |
 | `fundamental` | `(symbol, report_date)` | 季报 | ann_date/eps/bps/revenue/net_profit/revenue_yoy/profit_yoy/roe/gross_margin/debt_ratio/industry/pe_ttm/pb/market_cap/ocf_per_share/operating_profit/is_st |
 | `dividend` | `(symbol, report_date)` | 分红历史（6 财年） | cash_div_ps/ann_date |
@@ -195,6 +195,9 @@ SQLite 单库 `data/stock.db`，WAL 模式。共 19 张业务表 + SQLite 内部
 | `etf_market_flow` | `(date, category)` | 全市场 ETF 资金流（6 类） | buy_value/sell_value/net_value/etf_count |
 | `etf_share_daily` | `(symbol, date)` | 交易所官方份额 + 东财净值（免配额） | shares(份)/nav(元) |
 | `etf_valuation` | `(symbol, report_date)` | ETF 持仓加权估值（报告期） | pe_ttm/pb/dividend_ratio |
+| `etf_dividend` | `(symbol, date)` | ETF 分红记录，供后复权使用 | cum_div（累计分红，元/份） |
+| `etf_dividend_sync` | `symbol` | 分红同步进度（无分红标的也留痕） | events/updated_at |
+| `etf_name` | `symbol` | ETF 名称，用于「跨境/港股/境内」分类 | name |
 | `sqlite_sequence` | — | SQLite 自增序列 | — |
 
 ### 5.1 一致性约束

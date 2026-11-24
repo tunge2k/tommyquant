@@ -31,7 +31,7 @@ import data_store
 import news_fetcher
 import perf_report
 import robust_backtest as rb
-from world_map_data import WORLD_MAP_SVG   # 首页世界地图 SVG 片段 (equirectangular)
+from world_map_countries import COUNTRY_PATHS, TRACKED_COUNTRIES   # 国家轮廓 (equirectangular)
 
 try:
     import fast_backtest as fastbt
@@ -1706,6 +1706,8 @@ BT_PARAM_DEFAULTS = {
     # ETF 优质标的过滤 (中长期向上趋势 + 低回撤, 对标纳指科技ETF 159509 周K形态)
     "etf_max_dd_th": 30, "etf_ma60_up": True,
     "etf_ret20_min": 0, "etf_ret60_min": 0,
+    # 选品范围: 只做跨境(外盘)ETF, 剔除港股系 (恒生/港股通/H股/中概)
+    "etf_overseas_only": True,
 }
 for _k, _v in BT_PARAM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -1788,7 +1790,7 @@ _APPLY_KEYS = {
                  "etf_premium_cap", "etf_flow_on", "etf_flow_min",
                  "etf_mkt_flow_guard", "etf_mkt_flow_days",
                  "etf_max_dd_th", "etf_ma60_up",
-                 "etf_ret20_min", "etf_ret60_min"),
+                 "etf_ret20_min", "etf_ret60_min", "etf_overseas_only"),
 }
 
 # 函数式策略: 引擎参数名 -> 界面 session_state 键
@@ -1959,12 +1961,13 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-BACKTEST_LOGIC_VERSION = 10  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+BACKTEST_LOGIC_VERSION = 11  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
 # v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
 # v8: ETF 启用 Topk-Drop 排名换出；ETF 上涨不再因 +4% 削赢（仅下跌补仓 / 权重偏离≥5%）
 # v9: ETF 绝对动量阈值默认 0% → 3%（top_n=5, 2024-01~2026-11: 收益 +22.0%→+53.8%,
 #     最大回撤 -14.7%→-13.3%, 夏普 0.74→1.19; K=4 稳健分 0.17→0.45）
 # v10: 买入按 T+1 实际开盘价重算股数, 建仓不再因跳空超配（跌 4% 触发后可正常补仓而非减仓）
+# v11: ETF 数据改后复权（份额折算+分红）；ETF 选品池限定跨境(外盘)并剔除港股系
 
 
 def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
@@ -2028,6 +2031,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "etf_require_ma60_up": bool(ss.get("etf_ma60_up", True)),
             "etf_ret20_min": float(ss.get("etf_ret20_min", 0)),
             "etf_ret60_min": float(ss.get("etf_ret60_min", 0)),
+            "etf_overseas_only": bool(ss.get("etf_overseas_only", True)),
         })
     elif strategy_key in _FN_PARAM_MAP:
         p["params"] = {k: ss.get(v) for k, v in _FN_PARAM_MAP[strategy_key].items()}
@@ -2188,169 +2192,267 @@ def _render_top_nav(cur_page: str, subtitle: str = None, cfg_toggle=None):
 _MARKET_CARDS_HTML = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
   * { box-sizing: border-box; }
-  body { margin:0; background:#0a0a1f; font-family: 'Inter', -apple-system, BlinkMacSystemFont,
-                   'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif; }
-  .grid { display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; }
-  .card { background:#141430; border:1px solid rgba(0,229,255,0.22); border-radius:12px;
-          padding:8px 12px; box-shadow:0 0 8px rgba(0,229,255,0.06);
-          transition: box-shadow 0.15s ease, border-color 0.15s ease; }
-  .card:hover { box-shadow:0 0 12px rgba(0,229,255,0.2); border-color:#00e5ff; }
-  .nm { font-size:12px; color:#c0cbe8; font-weight:500;
-        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-        display:flex; align-items:center; gap:2px; }
-  .gp { color:#6b7596; font-size:10px; margin-left:auto; font-weight:400; }
-  .px { font-size:17px; font-weight:700; line-height:1.35; color:#00e5ff;
-        font-variant-numeric: tabular-nums; letter-spacing:-0.01em; }
-  .pc { font-size:11.5px; font-weight:600; margin-left:2px; }
-  .meta { margin-top:8px; font-size:11px; color:#6b7596; font-variant-numeric: tabular-nums; }
-  /* 响应式 */
-  @media (max-width: 1024px) { .grid { grid-template-columns:repeat(3, 1fr); } }
-  @media (max-width: 768px) {
-    .grid { grid-template-columns:repeat(2, 1fr); gap:6px; }
-    .card { padding:6px 8px; border-radius:10px; }
-    .nm { font-size:11px; }
-    .px { font-size:15px; }
-    .pc { font-size:10.5px; }
-  }
-  @media (max-width: 480px) {
-    .grid { grid-template-columns:1fr 1fr; gap:5px; }
-    .px { font-size:14px; }
-    .gp { display:none; }
-  }
-  /* 世界地图区域筛选 (equirectangular, 真实大陆轮廓) */
-  .mapwrap { position:relative; border:1px solid rgba(0,229,255,0.16); border-radius:12px;
-             background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; margin-bottom:8px; }
-  svg.ww { width:100%; height:175px; display:block; }   /* 横向拉伸填满 mapwrap, 两端不留白 */
-  .land { fill:#16203f; stroke:#26324f; stroke-width:0.6; stroke-linejoin:round; }  /* 静态陆地(非洲/中东/南极) */
-  /* 可点击区域各自配色, 便于区分; 交易中时由 .live 动画统一覆盖为绿色呼吸 */
-  .rg.land { cursor:pointer; transition:fill 0.15s ease, stroke 0.15s ease; }
-  .rg.land[data-r="美洲"] { fill:#1e2a5a; stroke:#33406e; }
-  .rg.land[data-r="欧洲"] { fill:#16304a; stroke:#23425e; }
-  .rg.land[data-r="亚太"] { fill:#1a2550; stroke:#2c3866; }
-  .rg.land[data-r="美洲"]:hover { fill:#2a3a72; stroke:#4b5f8f; }
-  .rg.land[data-r="欧洲"]:hover { fill:#1d4264; stroke:#3a5678; }
-  .rg.land[data-r="亚太"]:hover { fill:#24326a; stroke:#41507e; }
-  .rg.land.live { animation: breathe 1.8s ease-in-out infinite alternate; }
-  @keyframes breathe {
-    from { fill:#123a37; stroke:#0a7f6b; }
-    to   { fill:#127a5c; stroke:#00ffa3; }
-  }
-  /* 中国/香港 标记点各自配色 */
-  .rg.mk { cursor:pointer; }
-  .rg.mk circle { stroke-width:1.3; transition:fill 0.15s; }
-  .rg.mk text { font-size:10.5px; font-weight:600; pointer-events:none; }
-  .rg.mk[data-r="中国"] circle { stroke:#ff7a45; fill:rgba(255,122,69,.28); }
-  .rg.mk[data-r="中国"] text { fill:#ffb088; }
-  .rg.mk[data-r="港股"] circle { stroke:#ffc53d; fill:rgba(255,197,61,.28); }
-  .rg.mk[data-r="港股"] text { fill:#ffe08a; }
-  .rg.mk[data-r="中国"]:hover circle { fill:rgba(255,122,69,.55); }
-  .rg.mk[data-r="港股"]:hover circle { fill:rgba(255,197,61,.55); }
-  .rg.mk.live circle { animation: blinkDot 1.8s ease-in-out infinite alternate; }
+  body { margin:0; background:#0a0a1f; font-family:'Inter',-apple-system,BlinkMacSystemFont,
+                   'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif; }
+  /* ---- 世界地图: 按国家分色, equirectangular 拉伸填满 ---- */
+  .mapwrap { position:relative; border:1px solid rgba(0,229,255,.16); border-radius:12px;
+             background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; }
+  svg.ww { width:100%; height:300px; display:block; }
+  .ctx path { fill:#131a30; stroke:#1e2942; stroke-width:.45; stroke-linejoin:round; }
+  .cty { stroke-width:.6; stroke-linejoin:round; cursor:pointer;
+         transition:fill .15s ease, stroke .15s ease; }
+  .cty[data-c="中国"]     { fill:#4a2b26; stroke:#a8563f; }
+  .cty[data-c="美国"]     { fill:#20304f; stroke:#4a6fa5; }
+  .cty[data-c="日本"]     { fill:#33284a; stroke:#7a5aa5; }
+  .cty[data-c="韩国"]     { fill:#213c37; stroke:#3f8a74; }
+  .cty[data-c="澳大利亚"] { fill:#3a3122; stroke:#8a6a3a; }
+  .cty[data-c="德国"]     { fill:#22303f; stroke:#4a7a9a; }
+  .cty[data-c="英国"]     { fill:#33301f; stroke:#8a7d3a; }
+  .cty[data-c="法国"]     { fill:#26294a; stroke:#5a6aa5; }
+  .cty:hover { filter:brightness(1.55); stroke:#9fe8ff; }
+  .cty.live { animation:breathe 1.9s ease-in-out infinite alternate; }
+  @keyframes breathe { from { fill:#123a37; stroke:#0a7f6b; } to { fill:#127a5c; stroke:#00ffa3; } }
+  .mk { cursor:pointer; }
+  .mk circle { stroke:#ffc53d; fill:rgba(255,197,61,.3); stroke-width:1.2; transition:fill .15s; }
+  .mk:hover circle { fill:rgba(255,197,61,.65); }
+  .mk.live circle { animation:blinkDot 1.9s ease-in-out infinite alternate; }
   @keyframes blinkDot { from { fill:#0a7f6b; stroke:#0a7f6b; } to { fill:#00ffa3; stroke:#00ffa3; } }
-  .legend { margin-top:4px; font-size:10.5px; color:#6b7596; display:flex; gap:12px; align-items:center; }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#00ffa3;
-         box-shadow:0 0 6px #00ffa3; margin-right:4px; animation:blink 1.8s ease-in-out infinite alternate; }
-  @keyframes blink { from { opacity:0.35; } to { opacity:1; } }
-  .gl { fill:#7b86a8; font-size:11px; pointer-events:none; }
-  .tip { position:absolute; right:10px; top:6px; font-size:10.5px; color:#6b7596; }
-  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 8px; }
-  .tab { font-size:11.5px; padding:3px 10px; border-radius:999px; cursor:pointer;
-         border:1px solid #2c3c66; color:#c0cbe8; user-select:none; }
-  .tab:hover { border-color:#4b5f8f; }
-  .tab.on { background:rgba(0,229,255,0.14); border-color:#00e5ff; color:#7fe9ff; }
+  .cname { position:absolute; transform:translate(-50%,-50%); font-size:11px; font-weight:600;
+           color:#a9b8dc; pointer-events:none; text-shadow:0 1px 3px #000; letter-spacing:.2px; }
+  /* ---- 悬停浮层: 该国全部指数实时行情 ---- */
+  .tipbox { position:absolute; z-index:20; min-width:200px; display:none;
+            background:rgba(12,14,34,.97); border:1px solid rgba(0,229,255,.42);
+            border-radius:10px; padding:8px 10px; box-shadow:0 8px 24px rgba(0,0,0,.55);
+            pointer-events:none; font-variant-numeric:tabular-nums; }
+  .tbh { font-size:12px; font-weight:700; color:#7fe9ff; margin-bottom:5px;
+         display:flex; justify-content:space-between; gap:10px; }
+  .tbh span:last-child { font-weight:400; color:#6b7596; font-size:10px; }
+  .tbr { display:flex; justify-content:space-between; gap:14px; font-size:11.5px; line-height:1.7; }
+  .tbr .n { color:#c0cbe8; }
+  .hint { position:absolute; right:9px; bottom:4px; font-size:10px; color:#6b7596; }
+  /* ---- 商品/汇率/加密 胶囊 ---- */
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chip { display:flex; align-items:center; gap:6px; background:#141430; cursor:pointer;
+          border:1px solid rgba(0,229,255,.2); border-radius:999px; padding:4px 10px;
+          font-size:11.5px; color:#c0cbe8; font-variant-numeric:tabular-nums;
+          transition:border-color .15s, box-shadow .15s; }
+  .chip:hover { border-color:#00e5ff; box-shadow:0 0 10px rgba(0,229,255,.18); }
+  .chip b { font-weight:600; }
+  .foot { margin-top:6px; font-size:10.5px; color:#6b7596; }
+  /* ---- K线面板 (点击国家后就地展开, 不占额外高度) ---- */
+  .chartwrap { display:none; border:1px solid rgba(0,229,255,.3); border-radius:12px;
+               background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:6px 10px 2px; }
+  .chartwrap.on { display:block; }
+  .chead { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
+  .chead .t { font-size:13px; font-weight:700; color:#7fe9ff; }
+  .mx { cursor:pointer; color:#8b95b5; font-size:13px; padding:1px 7px; border-radius:6px; }
+  .mx:hover { background:#1b2140; color:#fff; }
+  .mbar { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:4px; }
+  .tg { font-size:11px; padding:2px 9px; border-radius:999px; cursor:pointer;
+        border:1px solid #2c3c66; color:#c0cbe8; user-select:none; }
+  .tg.on { background:rgba(0,229,255,.14); border-color:#00e5ff; color:#7fe9ff; }
+  canvas { width:100%; height:238px; display:block; }
+  .mfoot { font-size:10px; color:#5c6688; text-align:right; }
 </style></head><body>
-<div class="mapwrap">
-  <svg class="ww" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-label="世界主要市场区域图">
-__WORLD_MAP__
-    <text class="gl" x="222" y="138">美洲</text>
-    <text class="gl" x="542" y="112">欧洲</text>
-    <text class="gl" x="556" y="238">非洲</text>
-    <text class="gl" x="778" y="86">亚太</text>
-    <g class="rg mk" data-r="中国">
-      <circle cx="789" cy="153" r="7"/><text x="800" y="148">中国</text>
-    </g>
-    <g class="rg mk" data-r="港股">
-      <circle cx="817" cy="188" r="4.5"/><text x="826" y="192">香港</text>
-    </g>
+<div class="mapwrap" id="mapwrap">
+  <svg class="ww" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-label="世界主要市场国家分布图">
+    <g class="ctx">__CTX_PATHS__</g>
+    <g class="trk">__TRK_PATHS__</g>
+    <g class="mk" data-c="香港"><circle cx="817" cy="192" r="4.2"/></g>
   </svg>
-  <div class="tip">点击区域筛选行情</div>
-  <div class="legend"><span><span class="dot"></span>闪烁 = 该市场正在交易</span><span>时间按北京时间</span></div>
+__LABELS__
+  <div class="hint">悬停查看 · 点击看 K 线</div>
+  <div class="tipbox" id="tipbox"></div>
 </div>
-<div class="tabs" id="tabs"></div>
-<div class="grid" id="grid"></div>
-<div class="meta" id="meta">连接行情中...</div>
+<div class="chips" id="chips"></div>
+<div class="foot" id="meta">连接行情中...</div>
+<div class="chartwrap" id="chartwrap">
+  <div class="chead"><span class="t" id="mtitle">K 线</span><span class="mx" id="mclose">✕ 关闭</span></div>
+  <div class="mbar" id="mbar"></div>
+  <canvas id="mcv" width="1480" height="476"></canvas>
+  <div class="mfoot" id="mfoot"></div>
+</div>
 <script>
 const ITEMS = __ITEMS__;
 const UP="#dc2626", DOWN="#16a34a", FLAT="#64748b";
-let ACTIVE = "全部";
+const STATE = {};
 function fmtPrice(v){ return v>=10000 ? v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : v.toFixed(2); }
-function arrow(p){ return p>0?"🔺":(p<0?"🔻":"➖"); }
+function arrow(p){ return p>0?"▲":(p<0?"▼":"—"); }
 function colorOf(p){ return p>0?UP:(p<0?DOWN:FLAT); }
-function groups(){
-  const seen = [];
-  ITEMS.forEach(function(it){ if(seen.indexOf(it.group) < 0) seen.push(it.group); });
-  return ["全部"].concat(seen);
+function itemsOf(c){ return ITEMS.filter(function(it){ return it.group === c; }); }
+/* ---- 悬停浮层: 国家 -> 该国全部指数 ---- */
+function buildTip(c){
+  const rows = itemsOf(c).map(function(it){
+    const s = STATE[it.code];
+    const px = (s && s.price) ? fmtPrice(s.price) : '--';
+    const pct = (s && s.price) ? (arrow(s.pct)+Math.abs(s.pct).toFixed(2)+'%') : '--';
+    const col = (s && s.price) ? colorOf(s.pct) : '#5c6688';
+    return '<div class="tbr"><span class="n">'+it.name+'</span>'+
+           '<span><span style="color:#9fb0d6">'+px+'</span> '+
+           '<span style="color:'+col+';font-weight:600">'+pct+'</span></span></div>';
+  }).join('');
+  const t = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  return '<div class="tbh"><span>'+c+'</span><span>'+t+'</span></div>'+
+         (rows || '<div class="tbr"><span class="n">暂无行情</span></div>');
 }
-function renderTabs(){
-  const box = document.getElementById('tabs');
-  box.innerHTML = '';
-  groups().forEach(function(g){
-    const t = document.createElement('div');
-    t.className = 'tab' + (g === ACTIVE ? ' on' : '');
-    t.textContent = g;
-    t.onclick = function(){ setActive(g); };
-    box.appendChild(t);
+function showTip(c, ev){
+  const box = document.getElementById('tipbox');
+  if(!itemsOf(c).length) return;
+  box.dataset.c = c;
+  box.innerHTML = buildTip(c);
+  box.style.display = 'block';
+  const wrap = document.getElementById('mapwrap').getBoundingClientRect();
+  let x = ev.clientX - wrap.left + 14, y = ev.clientY - wrap.top + 10;
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  if(x + bw > wrap.width - 4) x = ev.clientX - wrap.left - bw - 12;
+  if(y + bh > wrap.height - 4) y = Math.max(2, wrap.height - bh - 6);
+  box.style.left = Math.max(2, x) + 'px';
+  box.style.top = Math.max(2, y) + 'px';
+}
+function hideTip(){ document.getElementById('tipbox').style.display = 'none'; }
+/* ---- K线面板 ---- */
+let CH = { code:'', name:'', group:'', klt:101, bars:[] };
+function barHtml(){
+  const ps = [['日K',101],['周K',102],['月K',103]];
+  let html = itemsOf(CH.group).map(function(x){
+    return '<span class="tg'+(x.code===CH.code?' on':'')+'" data-code="'+x.code+'">'+x.name+'</span>';
+  }).join('');
+  html += '<span style="width:8px"></span>';
+  html += ps.map(function(p){
+    return '<span class="tg'+(p[1]===CH.klt?' on':'')+'" data-klt="'+p[1]+'">'+p[0]+'</span>';
+  }).join('');
+  const box = document.getElementById('mbar');
+  box.innerHTML = html;
+  box.querySelectorAll('[data-code]').forEach(function(el){
+    el.onclick = function(){
+      const it = ITEMS.find(function(x){ return x.code === el.dataset.code; });
+      if(it) openChart(it.group, it);
+    };
   });
-  document.querySelectorAll('.rg').forEach(function(el){
-    if (el.dataset.r === ACTIVE) el.classList.add('on'); else el.classList.remove('on');
+  box.querySelectorAll('[data-klt]').forEach(function(el){
+    el.onclick = function(){ CH.klt = Number(el.dataset.klt); barHtml(); loadK(); };
   });
 }
-function setActive(g){
-  ACTIVE = g;
-  renderTabs();
-  renderGrid();
+function openChart(group, it){
+  CH = {code:it.code, name:it.name, group:group, klt:CH.klt||101, bars:[]};
+  document.getElementById('mtitle').textContent = group + ' · ' + it.name;
+  document.getElementById('mfoot').textContent = '加载中...';
+  document.getElementById('mapwrap').style.display = 'none';
+  document.getElementById('chips').style.display = 'none';
+  document.getElementById('chartwrap').classList.add('on');
+  barHtml(); loadK();
 }
-function renderGrid(){
-  const g = document.getElementById('grid');
-  g.innerHTML = '';
-  ITEMS.filter(function(it){ return ACTIVE === '全部' || it.group === ACTIVE; })
-    .forEach(function(it){
-      const d = document.createElement('div');
-      d.className = 'card';
-      d.innerHTML = '<div class="nm">'+it.flag+' '+it.name+'<span class="gp">'+it.group+'</span></div>'+
-                    '<div class="px" id="px_'+it.code+'">'+
-                    '<span class="v">'+(it.price?fmtPrice(it.price):'-')+'</span> '+
-                    '<span class="pc">'+(it.price?arrow(it.pct)+Math.abs(it.pct).toFixed(2)+'%':'-')+'</span></div>';
-      if(it.price){
-        d.querySelector('.v').style.color = colorOf(it.pct);
-        d.querySelector('.pc').style.color = colorOf(it.pct);
-      }
-      g.appendChild(d);
+function closeChart(){
+  document.getElementById('chartwrap').classList.remove('on');
+  document.getElementById('mapwrap').style.display = '';
+  document.getElementById('chips').style.display = '';
+}
+function loadK(){
+  const it = ITEMS.find(function(x){ return x.code === CH.code; });
+  if(!it) return;
+  if(it.btc){ loadBtcK(); return; }
+  const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid='+it.code+
+              '&fields1=f1,f2,f3,f4,f5&fields2=f51,f52,f53,f54,f55,f56,f57'+
+              '&klt='+CH.klt+'&fqt=1&end=20500101&lmt=180';
+  emLoad(url).then(function(j){
+    const kl = (j && j.data && j.data.klines) || [];
+    if(!kl.length){ document.getElementById('mfoot').textContent = '⚠️ K线数据获取失败'; return; }
+    CH.bars = kl.map(function(s){
+      const a = s.split(',');
+      return {d:a[0], o:+a[1], c:+a[2], h:+a[3], l:+a[4], v:+a[5]};
     });
+    drawK();
+  });
 }
-function apply(code, price, pct){
-  const box = document.getElementById('px_'+code);
-  if(!box || !price) return;
-  const c = colorOf(pct);
-  box.querySelector('.v').textContent = fmtPrice(price);
-  box.querySelector('.v').style.color = c;
-  const pc = box.querySelector('.pc');
-  pc.textContent = arrow(pct)+Math.abs(pct).toFixed(2)+'%';
-  pc.style.color = c;
+function loadBtcK(){
+  const bar = CH.klt===103 ? '1M' : (CH.klt===102 ? '1W' : '1D');
+  fetch('https://www.okx.com/api/v5/market/candles?instId=BTC-USDT&bar='+bar+'&limit=180')
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      const rows = (j && j.data) || [];
+      CH.bars = rows.map(function(a){
+        return {d:new Date(Number(a[0])).toISOString().slice(0,10),
+                o:+a[1], h:+a[2], l:+a[3], c:+a[4], v:+a[5]};
+      }).reverse();
+      drawK();
+    })
+    .catch(function(){ document.getElementById('mfoot').textContent = '⚠️ K线数据获取失败'; });
 }
+function drawK(){
+  const cv = document.getElementById('mcv'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height, PL = 62, PR = 8, PT = 10, PB = 26;
+  ctx.clearRect(0,0,W,H);
+  const bars = CH.bars;
+  if(!bars.length) return;
+  let hi = -Infinity, lo = Infinity;
+  bars.forEach(function(b){ if(b.h>hi)hi=b.h; if(b.l<lo)lo=b.l; });
+  const pad = (hi-lo)*0.06 || 1;
+  hi += pad; lo -= pad;
+  const y = function(v){ return PT + (hi-v)/(hi-lo)*(H-PT-PB); };
+  const cw = (W-PL-PR)/bars.length;
+  ctx.font = '19px Inter,"PingFang SC",sans-serif';
+  ctx.lineWidth = 1;
+  for(let i=0;i<=4;i++){
+    const v = lo + (hi-lo)*i/4, yy = y(v);
+    ctx.strokeStyle = 'rgba(120,140,180,.16)';
+    ctx.beginPath(); ctx.moveTo(PL, yy); ctx.lineTo(W-PR, yy); ctx.stroke();
+    ctx.fillStyle = '#5c6688'; ctx.fillText(v.toFixed(2), 5, yy+6);
+  }
+  const step = Math.max(1, Math.floor(bars.length/6));
+  bars.forEach(function(b,i){
+    if(i%step===0){ ctx.fillStyle = '#5c6688'; ctx.fillText(b.d.slice(2), PL+i*cw-16, H-6); }
+  });
+  bars.forEach(function(b,i){
+    const cx = PL + i*cw + cw/2;
+    const col = b.c >= b.o ? UP : DOWN;
+    ctx.strokeStyle = col; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.moveTo(cx, y(b.h)); ctx.lineTo(cx, y(b.l)); ctx.stroke();
+    const top = y(Math.max(b.o,b.c)), bot = y(Math.min(b.o,b.c));
+    const bw = Math.max(1.5, cw*0.62);
+    if(bot-top < 1){ ctx.fillRect(cx-bw/2, top, bw, 1); }
+    else if(b.c >= b.o){ ctx.strokeRect(cx-bw/2, top, bw, bot-top); }
+    else { ctx.fillRect(cx-bw/2, top, bw, bot-top); }
+  });
+  const last = bars[bars.length-1];
+  document.getElementById('mfoot').textContent =
+    last.d+'  开 '+last.o.toFixed(2)+'  高 '+last.h.toFixed(2)+
+    '  低 '+last.l.toFixed(2)+'  收 '+last.c.toFixed(2)+'  (共 '+bars.length+' 根)';
+}
+document.getElementById('mclose').onclick = closeChart;
+/* ---- 实时行情 ---- */
 function setMeta(txt){ document.getElementById('meta').textContent = txt; }
-/* 东财 push2 接口用 JSONP 方式请求: 绕过浏览器 CORS 限制(fetch 会报 net::ERR_FAILED) */
 function emLoad(url){
   return new Promise(function(res){
     var n='__emcb'+((emLoad._i=(emLoad._i||0)+1));
     var s=document.createElement('script');
     window[n]=function(d){res(d);try{delete window[n];}catch(e){}s.remove();};
     s.onerror=function(){res(null);try{delete window[n];}catch(e){}s.remove();};
-
     s.src=url+(url.indexOf('?')>=0?'&':'?')+'cb='+n;
     document.head.appendChild(s);
     setTimeout(function(){if(window[n]){res(null);try{delete window[n];}catch(e){}s.remove();}},6000);
   });
+}
+function renderChips(){
+  const others = ITEMS.filter(function(it){ return it.group === '其他'; });
+  const box = document.getElementById('chips');
+  box.innerHTML = others.map(function(it){
+    return '<div class="chip" data-code="'+it.code+'"><span>'+it.flag+' '+it.name+'</span>'+
+           '<b id="cp_'+it.code+'">--</b><span id="cc_'+it.code+'" style="color:#5c6688">--</span></div>';
+  }).join('');
+  box.querySelectorAll('.chip').forEach(function(el){
+    el.onclick = function(){
+      const it = ITEMS.find(function(x){ return x.code === el.dataset.code; });
+      if(it) openChart('其他', it);
+    };
+  });
+}
+function apply(code, price, pct){
+  STATE[code] = {price:price, pct:pct};
+  const v = document.getElementById('cp_'+code), c = document.getElementById('cc_'+code);
+  if(v){ v.textContent = fmtPrice(price); v.style.color = colorOf(pct); }
+  if(c){ c.textContent = arrow(pct)+Math.abs(pct).toFixed(2)+'%'; c.style.color = colorOf(pct); }
+  const tb = document.getElementById('tipbox');
+  if(tb.style.display === 'block' && tb.dataset.c) tb.innerHTML = buildTip(tb.dataset.c);
 }
 function pull(){
   const ids = ITEMS.filter(function(i){ return i.code.indexOf('.') > 0; })
@@ -2358,23 +2460,19 @@ function pull(){
   if(!ids) return;
   const url = 'https://push2.eastmoney.com/api/qt/ulist.np/get?secids='+ids+
               '&fields=f1,f2,f3,f12,f13,f14&_='+Date.now();
-  emLoad(url)
-    .then(function(j){
-      const rows = (j && j.data && j.data.diff) || [];
-      if(!rows.length){ setMeta('⚠️ 行情暂无数据，自动重试中'); return; }
-      rows.forEach(function(q){
-        if(q.f2 === '-' || q.f2 === undefined) return;
-        const dec = Number(q.f1) || 2;
-        const p = Number(q.f2) / Math.pow(10, dec);
-        const pct = (Number(q.f3) || 0) / 100;
-        apply(q.f13 + '.' + q.f12, p, pct);
-      });
-      const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
-      setMeta('🕒 '+t+' 更新 · 指数/商品/汇率 2 秒刷新（东方财富）· 比特币 5 秒刷新（OKX）');
-    })
-    .catch(function(){ setMeta('⚠️ 行情接口连接失败，自动重试中'); });
+  emLoad(url).then(function(j){
+    const rows = (j && j.data && j.data.diff) || [];
+    if(!rows.length){ setMeta('⚠️ 行情暂无数据，自动重试中'); return; }
+    rows.forEach(function(q){
+      if(q.f2 === '-' || q.f2 === undefined) return;
+      const dec = Number(q.f1) || 2;
+      const p = Number(q.f2) / Math.pow(10, dec);
+      apply(q.f13 + '.' + q.f12, p, (Number(q.f3) || 0) / 100);
+    });
+    const t = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+    setMeta('🕒 '+t+' 更新 · 悬停国家看行情 · 点击看 K 线 · 2 秒刷新（东方财富 / OKX）');
+  }).catch(function(){ setMeta('⚠️ 行情接口连接失败，自动重试中'); });
 }
-/* 比特币: OKX 公共行情, 失败静默保留服务端兜底值 */
 function pullBtc(){
   fetch('https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT')
     .then(function(r){ return r.json(); })
@@ -2386,36 +2484,46 @@ function pullBtc(){
     })
     .catch(function(){});
 }
-/* 各市场交易时段(北京时间, 分钟): 中国 9:30-11:30/13:00-15:00, 港股 9:30-12:00/13:00-16:00,
-   亚太 7:00-14:30, 欧洲 15:00-23:30, 美洲 21:30-次日4:00 */
+/* 各国交易时段 (北京时间, 分钟) */
 const SESSIONS = {
-  "中国": [[570,690],[780,900]],
-  "港股": [[570,720],[780,960]],
-  "亚太": [[420,870]],
-  "欧洲": [[900,1410]],
-  "美洲": [[1290,1440],[0,240]]
+  "中国":     [[570,690],[780,900]],
+  "香港":     [[570,720],[780,960]],
+  "日本":     [[480,690],[750,900]],
+  "韩国":     [[480,930]],
+  "澳大利亚": [[480,840]],
+  "德国":     [[900,1410]],
+  "法国":     [[900,1410]],
+  "英国":     [[960,1470]],
+  "美国":     [[1290,1440],[0,240]]
 };
 function bjClock(){
   const d = new Date(Date.now() + 8*3600*1000);
-  return { dow: d.getUTCDay(), min: d.getUTCHours()*60 + d.getUTCMinutes() };
+  return {dow:d.getUTCDay(), min:d.getUTCHours()*60+d.getUTCMinutes()};
 }
-function isOpen(region){
-  const s = SESSIONS[region];
+function isOpen(c){
+  const s = SESSIONS[c];
   if(!s) return false;
-  const c = bjClock();
-  if(c.dow === 0 || c.dow === 6) return false;
-  if(region === "美洲" && c.dow === 1 && c.min < 240) return false;
-  return s.some(function(w){ return c.min >= w[0] && c.min < w[1]; });
+  const k = bjClock();
+  if(k.dow === 0 || k.dow === 6) return false;
+  return s.some(function(w){ return k.min >= w[0] && k.min < w[1]; });
 }
 function paintSessions(){
-  document.querySelectorAll(".rg").forEach(function(el){
-    if(isOpen(el.dataset.r)) el.classList.add("live"); else el.classList.remove("live");
+  document.querySelectorAll('.cty,.mk').forEach(function(el){
+    if(isOpen(el.dataset.c)) el.classList.add('live'); else el.classList.remove('live');
   });
 }
-document.querySelectorAll('.rg').forEach(function(el){
-  el.addEventListener('click', function(){ setActive(el.dataset.r); });
+/* 绑定交互 */
+document.querySelectorAll('.cty,.mk').forEach(function(el){
+  el.addEventListener('mouseenter', function(e){ showTip(el.dataset.c, e); });
+  el.addEventListener('mousemove', function(e){ showTip(el.dataset.c, e); });
+  el.addEventListener('mouseleave', hideTip);
+  el.addEventListener('click', function(){
+    hideTip();
+    const its = itemsOf(el.dataset.c);
+    if(its.length) openChart(el.dataset.c, its[0]);
+  });
 });
-renderTabs(); renderGrid(); pull(); pullBtc(); paintSessions();
+renderChips(); pull(); pullBtc(); paintSessions();
 setInterval(pull, 2000);
 setInterval(pullBtc, 5000);
 setInterval(paintSessions, 30000);
@@ -3495,21 +3603,21 @@ if page == "home":
         ("深证成指", "中国", "🇨🇳", "0.399001"),
         ("沪深300", "中国", "🇨🇳", "1.000300"),
         ("创业板指", "中国", "🇨🇳", "0.399006"),
-        ("标普500", "美洲", "🇺🇸", "100.SPX"),
-        ("纳斯达克", "美洲", "🇺🇸", "100.NDX"),
-        ("道琼斯", "美洲", "🇺🇸", "100.DJIA"),
-        ("德国DAX", "欧洲", "🇩🇪", "100.GDAXI"),
-        ("英国富时100", "欧洲", "🇬🇧", "100.FTSE"),
-        ("法国CAC40", "欧洲", "🇫🇷", "100.FCHI"),
-        ("日经225", "亚太", "🇯🇵", "100.N225"),
-        ("韩国KOSPI", "亚太", "🇰🇷", "100.KS11"),
-        ("澳洲标普200", "亚太", "🇦🇺", "100.AS51"),
-        ("恒生指数", "港股", "🇭🇰", "100.HSI"),
-        ("恒生科技", "港股", "🇭🇰", "124.HSTECH"),
-        ("COMEX黄金", "商品", "🥇", "101.GC00Y"),
-        ("WTI原油", "商品", "🛢️", "102.CL00Y"),
-        ("美元/人民币", "汇率", "💱", "133.USDCNH"),
-        ("比特币", "加密", "₿", "BTC"),
+        ("标普500", "美国", "🇺🇸", "100.SPX"),
+        ("纳斯达克", "美国", "🇺🇸", "100.NDX"),
+        ("道琼斯", "美国", "🇺🇸", "100.DJIA"),
+        ("德国DAX", "德国", "🇩🇪", "100.GDAXI"),
+        ("英国富时100", "英国", "🇬🇧", "100.FTSE"),
+        ("法国CAC40", "法国", "🇫🇷", "100.FCHI"),
+        ("日经225", "日本", "🇯🇵", "100.N225"),
+        ("韩国KOSPI", "韩国", "🇰🇷", "100.KS11"),
+        ("澳洲标普200", "澳大利亚", "🇦🇺", "100.AS51"),
+        ("恒生指数", "香港", "🇭🇰", "100.HSI"),
+        ("恒生科技", "香港", "🇭🇰", "124.HSTECH"),
+        ("COMEX黄金", "其他", "🥇", "101.GC00Y"),
+        ("WTI原油", "其他", "🛢️", "102.CL00Y"),
+        ("美元/人民币", "其他", "💱", "133.USDCNH"),
+        ("比特币", "其他", "₿", "BTC"),
     ]
     _fb_map = {}
     try:
@@ -3522,9 +3630,28 @@ if page == "home":
         _fb = _fb_map.get(_nm) or {}
         _items.append({
             "name": _nm, "group": _gp, "flag": _fl, "code": _secid,
+            "btc": _secid == "BTC",
             "price": _fb.get("price") or 0,
             "pct": _fb.get("pct") if _fb.get("pct") is not None else 0,
         })
+
+    # 世界地图: 国家轮廓 (无行情的国家用中性色, 有行情的按国家分色)
+    _ctx_paths, _trk_paths = [], []
+    for _cn, _d in COUNTRY_PATHS.items():
+        _zh = TRACKED_COUNTRIES.get(_cn)
+        if _zh:
+            _trk_paths.append(f'<path class="cty" data-c="{_zh}" d="{_d}"/>')
+        else:
+            _ctx_paths.append(f'<path d="{_d}"/>')
+    # 国家名标签用 HTML 绝对定位 (SVG 被拉伸时文字不会变形)
+    _LABEL_POS = {
+        "美国": (20.5, 30.0), "英国": (46.8, 21.5), "法国": (50.2, 25.0),
+        "德国": (54.0, 20.0), "中国": (78.5, 33.0), "日本": (86.0, 30.5),
+        "韩国": (83.2, 26.8), "澳大利亚": (84.5, 66.0), "香港": (81.7, 41.5),
+    }
+    _labels = "".join(
+        f'<div class="cname" style="left:{_x}%;top:{_y}%">{_c}</div>'
+        for _c, (_x, _y) in _LABEL_POS.items())
 
     st.markdown(f"### {t('global_markets')}")
     _mc = market_colors()
@@ -3532,9 +3659,11 @@ if page == "home":
         paint_colors(
             _MARKET_CARDS_HTML
                 .replace("__ITEMS__", json.dumps(_items, ensure_ascii=False))
-                .replace("__WORLD_MAP__", WORLD_MAP_SVG),
+                .replace("__CTX_PATHS__", "".join(_ctx_paths))
+                .replace("__TRK_PATHS__", "".join(_trk_paths))
+                .replace("__LABELS__", _labels),
             _mc),
-        height=700, scrolling=True)
+        height=430, scrolling=False)
 
     st.divider()
 
@@ -3996,6 +4125,9 @@ elif page == "backtest":
                          step=1, help="近20日涨幅低于该值则剔除，0=仅要求不跌")
             _g[3].slider("60日涨幅下限(%)", -10, 20, key=_draft("etf_ret60_min", 0),
                          step=1, help="近60日涨幅低于该值则剔除，0=仅要求不跌")
+            st.checkbox("仅外盘 ETF（剔除港股系）", key=_draft("etf_overseas_only", True),
+                        help="选品池只保留跨境 ETF（纳指/标普/日经/欧洲/东南亚等），"
+                             "剔除恒生、港股通、H股、中概互联等港股相关标的")
         elif strategy_choice == "市值策略":
             _a = st.columns(4)
             _a[0].slider("市值下限(亿)", 5, 50, key=_draft("mc_cap_min", 15))

@@ -169,6 +169,12 @@ def after_close(fundamentals: bool = False):
         logger.info(f"ETF 增强数据: {r}")
     except Exception as e:
         logger.error(f"ETF 增强数据异常: {e}")
+    # 交易所官方份额 (免配额): 当日沪市 ETF 份额, 供资金流/溢价因子
+    try:
+        r = data_manager.ensure_etf_shares()
+        logger.info(f"ETF 官方份额: {r}")
+    except Exception as e:
+        logger.error(f"ETF 官方份额异常: {e}")
     try:
         symbols = data_store.list_symbols()[:10]
         logger.info(f"新闻: {news_fetcher.fetch_all_news(symbols=symbols)}")
@@ -217,6 +223,14 @@ def run_task(t: dict):
         elif ds == "etf_flow_backfill":
             r = data_manager.backfill_etf_market_flow(
                 start=params.get("start", "2020-01-01"))
+        elif ds == "etf_share_backfill":
+            r = data_manager.backfill_etf_shares(
+                start=params.get("start", "2020-01-01"),
+                max_days=params.get("max_days", 250))
+        elif ds == "etf_nav_backfill":
+            r = data_manager.backfill_etf_nav(
+                start=params.get("start", "2020-01-01"),
+                max_symbols=params.get("max_symbols", 60))
         elif ds == "realtime":
             n = data_manager.ensure_realtime(params.get("symbols"))
             r = {"rows": n}

@@ -25,7 +25,7 @@ FILES = ["streamlit_app.py", "backtest_engine.py", "fast_backtest.py",
          "data_store.py", "data_manager.py", "perf_report.py",
          "news_fetcher.py", "update_worker.py", "doh_patch.py",
          "htbr_source.py", "exchange_source.py",
-         "world_map_data.py",
+         "world_map_countries.py",
          "entrypoint.sh",
          "Dockerfile", "docker-compose.yml", "requirements.txt"]
 

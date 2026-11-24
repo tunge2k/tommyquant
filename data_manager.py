@@ -208,9 +208,12 @@ def ensure_etf_universe(start: str = "20200101", end: str = None,
     symbols = [s for s, _ in etfs]
     if not symbols:
         return {"error": "ETF 清单获取失败", "universe": 0}
+    # 名称 (跨境/港股分类) + 分红 (后复权除息事件): 供选品与因子层使用
+    n_name = data_store.sync_etf_names(use_cache=False)
+    div_stat = data_store.sync_etf_dividends(symbols)
     end = end or last_trading_day()
     r = ensure_bars(symbols, start, end, progress_cb=progress_cb)
-    return {"universe": len(symbols), **r}
+    return {"universe": len(symbols), "names": n_name, "dividends": div_stat, **r}
 
 
 # ==================== ETF 增强数据 (华泰柏瑞数据源) ====================

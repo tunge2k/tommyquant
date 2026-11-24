@@ -31,7 +31,7 @@ COPY perf_report.py .
 COPY doh_patch.py .
 COPY htbr_source.py .
 COPY exchange_source.py .
-COPY world_map_data.py .
+COPY world_map_countries.py .
 COPY vendor ./vendor
 COPY entrypoint.sh .
 COPY .streamlit ./.streamlit

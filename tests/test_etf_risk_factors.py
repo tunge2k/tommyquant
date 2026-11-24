@@ -107,8 +107,63 @@ class TestFactorLoading(unittest.TestCase):
         kw = st._selection_kwargs("2026-11-18")
         self.assertIsNone(kw.get("premium_map"))
         self.assertIsNone(kw.get("flow_map"))
+        # 本用例只验证「溢价/资金流缺数据时不改变选品」, 与选品范围(仅外盘)无关
+        kw.pop("overseas_only", None)
         got = be._filter_market_cap_universe(_snap(), **kw)
         self.assertEqual(len(got), 3)
+
+
+class TestUniverseRegion(unittest.TestCase):
+    """选品范围: 只做跨境(外盘)ETF, 剔除港股系"""
+
+    def test_overseas_kept(self):
+        for name in ("纳指ETF广发", "标普500ETF华夏", "日经225ETF华安",
+                     "德国ETF华安", "东南亚科技ETF华泰柏瑞", "美国50ETF易方达"):
+            self.assertTrue(be.is_overseas_etf(name), name)
+
+    def test_hk_excluded(self):
+        for name in ("恒生ETF华夏", "港股通互联网ETF富国", "H股ETF",
+                     "香港科技ETF南方", "中概互联网ETF"):
+            self.assertFalse(be.is_overseas_etf(name), name)
+            self.assertEqual(be.classify_etf_region(name), "hk", name)
+
+    def test_domestic_index_with_overseas_brand_excluded(self):
+        # 标普A股红利 / MSCI中国A股 是境内指数, 不能当外盘
+        for name in ("标普A股红利ETF华宝", "MSCI中国A股ETF摩根", "MSCI中国ETF招商"):
+            self.assertFalse(be.is_overseas_etf(name), name)
+
+    def test_plain_domestic_excluded(self):
+        self.assertFalse(be.is_overseas_etf("沪深300ETF华泰柏瑞"))
+        self.assertFalse(be.is_overseas_etf("黄金ETF华安"))
+
+
+class TestEtfDividendAdjust(unittest.TestCase):
+    """ETF 分红后复权: 除息日的价格缺口必须被抹平"""
+
+    def _frame(self, closes, start="2026-01-05"):
+        import pandas as pd
+        dates = pd.bdate_range(start, periods=len(closes))
+        c = np.array(closes, dtype=float)
+        return pd.DataFrame({"date": dates, "open": c, "high": c * 1.01,
+                             "low": c * 0.99, "close": c})
+
+    def test_ex_date_gap_removed(self):
+        # 除息日每份分红 0.10 元, 价格 2.00 -> 1.90 (看似 -5%)
+        df = self._frame([2.00, 2.00, 1.90, 1.90, 1.90])
+        out = be._adjust_fund_dividends(df, [("2026-01-07", 0.10)])
+        pct = out["close"].pct_change().to_numpy()
+        self.assertAlmostEqual(pct[2], 0.0, places=6)
+
+    def test_no_events_untouched(self):
+        df = self._frame([2.00, 1.90, 1.90])
+        out = be._adjust_fund_dividends(df, [])
+        self.assertTrue(np.allclose(out["close"], df["close"]))
+
+    def test_history_before_ex_date_unchanged(self):
+        df = self._frame([2.00, 2.00, 1.90, 1.90])
+        out = be._adjust_fund_dividends(df, [("2026-01-07", 0.10)])
+        self.assertAlmostEqual(out["close"].iloc[1], 2.00)   # 除息前的K线不动
+        self.assertGreater(out["close"].iloc[3], 1.90)       # 除息后被放大
 
 
 if __name__ == "__main__":

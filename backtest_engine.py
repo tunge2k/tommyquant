@@ -128,17 +128,60 @@ def _adjust_fund_splits(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
+def _adjust_fund_dividends(df: pd.DataFrame, events) -> pd.DataFrame:
+    """ETF 分红后复权 (除息日价差抹平, 与份额折算复权叠加)
+
+    新浪 ETF 日线是不复权价, 除息日会凭空掉一个「分红额」的缺口, 回测会把它当成
+    真实下跌 (误触发补仓/止损)。这里按后复权口径构造乘法因子 (交易所除权因子):
+        f(t) = Π_{除息日 ≤ t} 前收 / (前收 - 每份分红)
+        P_hfq(t) = P_raw(t) × f(t)
+    后复权只放大除息日之后的价格, 历史K线不随新分红变化 → 增量下载不会产生跳空。
+
+    events: [(date_str, 累计分红), ...] (升序, 来自 data_store.etf_dividend_map)
+    """
+    if df is None or len(df) < 2 or not events or "close" not in df.columns:
+        return df
+    df = df.copy()
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    dates = pd.to_datetime(df["date"]).to_numpy()
+    evs = []
+    prev_cum = 0.0
+    for ds, cum in events:
+        try:
+            evs.append((np.datetime64(pd.Timestamp(ds)), float(cum) - prev_cum))
+            prev_cum = float(cum)
+        except Exception:
+            continue
+    if not evs:
+        return df
+    fac = np.ones(len(df), dtype=float)
+    cur, j = 1.0, 0
+    for i in range(len(df)):
+        while j < len(evs) and evs[j][0] <= dates[i]:
+            pay = evs[j][1]
+            j += 1
+            if pay > 1e-9 and i > 0 and np.isfinite(close[i - 1]) and close[i - 1] > pay:
+                cur *= close[i - 1] / (close[i - 1] - pay)
+        fac[i] = cur
+    for c in ("open", "high", "low", "close"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce") * fac
+    return df
+
+
+def add_factors(df: pd.DataFrame, code: str = None, div_events=None) -> pd.DataFrame | None:
     """为单只股票计算技术面因子
 
     code 提供时按板块口径标记涨停 (主板 10% / 创业板·科创板 20% / 北交所 30%),
-    不再对所有标的写死 9.5%。
+    不再对所有标的写死 9.5%。ETF 额外做「份额折算 + 分红」后复权 (div_events)。
     """
     if df is None or len(df) < 120:
         return None
-    # 场内基金先做份额折算复权, 否则拆分日会被当成 -70% 暴跌
+    # 场内基金先做份额折算复权, 再叠加分红后复权, 否则折算/除息日会被当成暴跌
     if code and price_limits.is_etf(code):
         df = _adjust_fund_splits(df)
+        if div_events:
+            df = _adjust_fund_dividends(df, div_events)
     df = df.copy()
     for c in ["open", "close", "high", "low", "volume", "turnover", "outstanding_share"]:
         if c in df.columns:
@@ -177,14 +220,74 @@ def add_factors(df: pd.DataFrame, code: str = None) -> pd.DataFrame | None:
     return df
 
 
-def compute_factors(raw: dict) -> dict:
-    """批量计算因子"""
+def compute_factors(raw: dict, div_map: dict = None) -> dict:
+    """批量计算因子
+
+    div_map: {symbol: [(除息日, 累计分红), ...]} — ETF 后复权用; 不传时尝试从库读取
+    (无库/无记录则退化为只做份额折算复权)。
+    """
+    if div_map is None:
+        try:
+            import data_store
+            div_map = data_store.etf_dividend_map()
+        except Exception:
+            div_map = {}
     feat = {}
     for code, df in raw.items():
-        f = add_factors(df, code=code)
+        f = add_factors(df, code=code, div_events=div_map.get(code))
         if f is not None:
             feat[code] = f
     return feat
+
+
+# ==================== ETF 选品区域分类 (跨境 / 港股 / 内地) ====================
+# ETF 没有行业/成分股元数据, 只能按名称识别投资区域。港股系优先判定 (中概互联
+# 同时含港股与美股, 统一归入港股系剔除), 其余含海外指数关键词的才算跨境。
+ETF_HK_KEYWORDS = ("恒生", "港股", "香港", "H股", "国企", "中概", "港科",
+                   "港中小", "中华港股", "港股通")
+ETF_OVERSEAS_KEYWORDS = ("纳指", "纳斯达克", "标普", "道琼斯", "道指", "美国",
+                         "美股", "日经", "东证", "日本", "德国", "法国", "英国",
+                         "欧洲", "东南亚", "越南", "印度", "沙特", "巴西",
+                         "亚太", "新兴市场", "全球", "海外")
+
+_ETF_NAME_CACHE: dict = {"ts": 0.0, "map": {}}
+
+
+def classify_etf_region(name: str) -> str:
+    """按名称判断 ETF 投资区域: hk / overseas / domestic / unknown"""
+    s = str(name or "")
+    if not s:
+        return "unknown"
+    if any(k in s for k in ETF_HK_KEYWORDS):
+        return "hk"
+    # 「标普A股红利」「MSCI中国A股」这类是境内指数, 名称里带海外指数商的字眼
+    if "A股" in s or "中国" in s:
+        return "domestic"
+    if any(k in s for k in ETF_OVERSEAS_KEYWORDS):
+        return "overseas"
+    return "domestic"
+
+
+def is_overseas_etf(name: str) -> bool:
+    """跨境(外盘)ETF 且非港股系"""
+    return classify_etf_region(name) == "overseas"
+
+
+def _etf_name_map(ttl: float = 600.0) -> dict:
+    """ETF 名称映射 (库内 etf_name), 10 分钟进程内缓存; 无库时返回空字典"""
+    import time
+    now = time.time()
+    if _ETF_NAME_CACHE["map"] and now - _ETF_NAME_CACHE["ts"] < ttl:
+        return _ETF_NAME_CACHE["map"]
+    try:
+        import data_store
+        m = data_store.etf_name_map()
+    except Exception:
+        m = {}
+    if m:
+        _ETF_NAME_CACHE["map"] = m
+        _ETF_NAME_CACHE["ts"] = now
+    return m
 
 
 def get_selection_dates(feat: dict) -> set:
@@ -271,6 +374,11 @@ class BarIndex:
         self._gem_arr = np.array([p.startswith("30") or p.startswith("688") for p in pure_arr])
         # 场内基金 (ETF/LOF): 股票策略池需显式排除, ETF 策略池只保留它们
         self._etf_arr = np.array([price_limits.is_etf(c) for c in codes])
+        # 跨境(外盘)ETF 且非港股系: 按库内 ETF 名称识别 (无名称数据时全 False)
+        _names = _etf_name_map()
+        self._etf_overseas_arr = np.array([
+            bool(price_limits.is_etf(c)) and is_overseas_etf(_names.get(c, ""))
+            for c in codes])
         # 每只标的上市首日 (datetime64[ns], 无数据用 NaT)
         self._first_dates = np.empty(N, dtype="datetime64[ns]")
         self._first_dates.fill(np.datetime64("NaT"))
@@ -431,6 +539,8 @@ class CrossSection:
             return bi._gem_arr[self._jmask]
         if name == "etf":
             return bi._etf_arr[self._jmask]
+        if name == "etf_overseas":
+            return bi._etf_overseas_arr[self._jmask]
         if name == "first_date":
             return bi._first_dates[self._jmask]
         return None
@@ -1042,7 +1152,8 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                                 max_dd_threshold: float = 0.30,
                                 require_ma60_up: bool = True,
                                 ret20_min: float = 0.0,
-                                ret60_min: float = 0.0) -> list:
+                                ret60_min: float = 0.0,
+                                overseas_only: bool = False) -> list:
     """
     标的池过滤 (股票池 / ETF 池共用入口, pool_type 分流):
     - stock: 市值区间 + 上市年限 + 财务/分红剔除 + 周K MA30 上升, 按市值升序
@@ -1062,7 +1173,8 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
             premium_map=premium_map, flow_map=flow_map,
             premium_cap=premium_cap, flow_min=flow_min, market_ok=market_ok,
             max_dd_threshold=max_dd_threshold, require_ma60_up=require_ma60_up,
-            ret20_min=ret20_min, ret60_min=ret60_min)
+            ret20_min=ret20_min, ret60_min=ret60_min,
+            overseas_only=overseas_only)
 
     # --- CrossSection 向量化快路径 ---
     if isinstance(snap, CrossSection):
@@ -1215,7 +1327,8 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
                          max_dd_threshold: float = 0.30,
                          require_ma60_up: bool = True,
                          ret20_min: float = 0.0,
-                         ret60_min: float = 0.0) -> list:
+                         ret60_min: float = 0.0,
+                         overseas_only: bool = False) -> list:
     """ETF 池筛选: 中长期向上趋势 + 低回撤 + 动量排名 (近 N 日涨幅降序)
 
     新增 (2026-11-20) 优质标的过滤:
@@ -1248,6 +1361,12 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
         if etf is None:
             return []
         mask = etf.copy()
+
+        # 选品范围: 只做跨境(外盘)ETF, 并剔除港股系 (恒生/港股通/H股/中概等)
+        if overseas_only:
+            ovs = snap.static_filter("etf_overseas")
+            if ovs is not None and ovs.any():
+                mask &= ovs
 
         amt = snap.col("amount_ma20")
         mask &= np.isfinite(amt) & (amt >= float(min_amount) * 1e8)
@@ -1311,9 +1430,12 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
 
     # --- dict 回退路径 ---
     date_ts = pd.Timestamp(date) if date is not None else None
+    names = _etf_name_map() if overseas_only else {}
     out = []
     for code, row in snap.items():
         if not price_limits.is_etf(code):
+            continue
+        if overseas_only and names and not is_overseas_etf(names.get(code, "")):
             continue
         amt = row.get("amount_ma20", np.nan)
         if not np.isfinite(amt) or amt < float(min_amount) * 1e8:
@@ -1498,7 +1620,8 @@ def select_etf(snap: dict, top_n: int = 5,
                min_history: int = 120,
                max_dd_threshold: float = 0.30,
                require_ma60_up: bool = True,
-               ret20_min: float = 0.0, ret60_min: float = 0.0) -> list:
+               ret20_min: float = 0.0, ret60_min: float = 0.0,
+               overseas_only: bool = True) -> list:
     """函数式 ETF 选股 (给今日选股用)
 
     复用 _filter_etf_universe 的全部过滤: 流动性 / 数据长度 / 周K MA30 /
@@ -1516,7 +1639,8 @@ def select_etf(snap: dict, top_n: int = 5,
         min_amount=min_amount, min_history=min_history,
         max_dd_threshold=max_dd_threshold,
         require_ma60_up=require_ma60_up,
-        ret20_min=ret20_min, ret60_min=ret60_min)
+        ret20_min=ret20_min, ret60_min=ret60_min,
+        overseas_only=overseas_only)
     return pool[:top_n]
 
 
@@ -2020,7 +2144,8 @@ class MarketCapStrategy(BaseStrategy):
                  etf_mkt_flow_guard=False, etf_mkt_flow_days=5,
                  etf_abs_mom_days=60, etf_abs_mom_min=3.0,
                  etf_max_dd_threshold=0.30, etf_require_ma60_up=True,
-                 etf_ret20_min=0.0, etf_ret60_min=0.0):
+                 etf_ret20_min=0.0, etf_ret60_min=0.0,
+                 etf_overseas_only=True):
         self.top_n = int(top_n)
         # 标的池类型: stock=股票(市值+财务筛选) / etf=ETF(动量排名+流动性门槛)
         # 两类共用同一套建仓/调仓/撮合逻辑, 只有选品规则不同
@@ -2046,6 +2171,8 @@ class MarketCapStrategy(BaseStrategy):
         self.etf_require_ma60_up = bool(etf_require_ma60_up)
         self.etf_ret20_min = float(etf_ret20_min)
         self.etf_ret60_min = float(etf_ret60_min)
+        # 选品范围: 只做跨境(外盘)ETF 并剔除港股系 (恒生/港股通/H股/中概等)
+        self.etf_overseas_only = bool(etf_overseas_only)
         self._etf_ext = None        # {premium/flow/market} 按日索引的因子字典
         self._mkt_ok = None         # {date: 市场资金流是否健康}
         # 标的池: 指定后跳过市值/财务选股, 只在这些标的内建仓与调仓 (单标的验证用)
@@ -2124,7 +2251,8 @@ class MarketCapStrategy(BaseStrategy):
                       max_dd_threshold=self.etf_max_dd_threshold,
                       require_ma60_up=self.etf_require_ma60_up,
                       ret20_min=self.etf_ret20_min,
-                      ret60_min=self.etf_ret60_min)
+                      ret60_min=self.etf_ret60_min,
+                      overseas_only=self.etf_overseas_only)
             # 溢价/资金流/市场风控: 仅有增强数据时才参与, 否则保持原行为
             if (self.etf_premium_cap or self.etf_flow_min is not None
                     or self.etf_mkt_flow_guard):

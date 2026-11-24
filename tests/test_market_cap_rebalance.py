@@ -468,5 +468,174 @@ class Ma30CacheTest(unittest.TestCase):
         self.assertGreater(checked, 100)
 
 
+class EtfRebalanceCompletenessTest(unittest.TestCase):
+    """ETF + topk_drop 无固定池时也必须做偏离度调仓 (否则 3 年只剩 3 条记录)"""
+
+    def test_etf_topk_drop_still_rebalances(self):
+        strat = make_strategy(top_n=1, pool_type="etf", rebalance_mode="topk_drop",
+                              ma30_exit=False, universe=None, rank_buffer=10)
+        bars = FakeBars({("sh518880", DATE): {"close": 1.10, "cap_yi": np.nan,
+                                              "ret_60": 12.0}})
+        pf = FakePortfolio(cash=1000, positions={"sh518880": position(100000)},
+                           total_value=111000.0)
+        strat.portfolio = pf
+        strat.bars = bars
+        strat._target_weights = {"sh518880": 1.0}
+        strat._entry_prices = {"sh518880": 1.0}   # ETF 无市值 → 按价格偏离 +10%
+
+        with mock.patch.object(be, "_filter_market_cap_universe",
+                               return_value=["sh518880"]):
+            sig = strat.on_bar(MarketBarEvent(DATE, {"sh518880": {}}, bars))
+
+        self.assertIsNotNone(sig, "ETF + topk_drop 不得跳过偏离度调仓")
+        self.assertTrue(sig.rebalance_orders)
+        self.assertEqual(sig.rebalance_orders[0].direction, "sell")
+        self.assertEqual(sig.rebalance_orders[0].code, "sh518880")
+
+
+class EtfHoldingRuleTest(unittest.TestCase):
+    """ETF 持仓规则 (2026-11-23 修订): 与股票一致按 Topk-Drop 排名换出"""
+
+    def test_held_etf_sold_by_rank_drop(self):
+        ranked = ["sh513880", "sh513100", "sh510500", "sh512880", "sh518880"]
+        strat = make_strategy(top_n=1, pool_type="etf", rebalance_mode="topk_drop",
+                              ma30_exit=False, universe=None, rank_buffer=2,
+                              check_freq="daily")
+        bars = FakeBars({(c, DATE): {"close": 1.0, "cap_yi": np.nan}
+                         for c in ranked})
+        pf = FakePortfolio(cash=25000,
+                           positions={"sh518880": position(75000)},
+                           total_value=100000.0)
+        strat.portfolio = pf
+        strat.bars = bars
+        strat._target_weights = {"sh518880": 1.0}
+        strat._entry_prices = {"sh518880": 1.0}
+
+        with mock.patch.object(be, "_filter_market_cap_universe",
+                               return_value=ranked):
+            sig = strat.on_bar(MarketBarEvent(
+                DATE, {c: {} for c in ranked}, bars))
+
+        sells = sig.sells if sig else []
+        reasons = sig.sell_reasons if sig else {}
+        # 排名 #5 > top_n(1) + rank_buffer(2) = 3 → 换出
+        self.assertIn("sh518880", sells)
+        self.assertEqual(reasons.get("sh518880"), "rank_drop")
+
+    def test_held_etf_kept_within_rank_buffer(self):
+        ranked = ["sh513880", "sh513100", "sh518880"]
+        strat = make_strategy(top_n=1, pool_type="etf", rebalance_mode="topk_drop",
+                              ma30_exit=False, universe=None, rank_buffer=2,
+                              check_freq="daily")
+        bars = FakeBars({(c, DATE): {"close": 1.0, "cap_yi": np.nan}
+                         for c in ranked})
+        pf = FakePortfolio(cash=25000,
+                           positions={"sh518880": position(75000)},
+                           total_value=100000.0)
+        strat.portfolio = pf
+        strat.bars = bars
+        strat._target_weights = {"sh518880": 1.0}
+        strat._entry_prices = {"sh518880": 1.0}
+
+        with mock.patch.object(be, "_filter_market_cap_universe",
+                               return_value=ranked):
+            sig = strat.on_bar(MarketBarEvent(
+                DATE, {c: {} for c in ranked}, bars))
+
+        sells = sig.sells if sig else []
+        reasons = sig.sell_reasons if sig else {}
+        # 排名 #3 <= top_n(1) + rank_buffer(2) = 3 → 保留
+        self.assertNotIn("sh518880", sells)
+        self.assertNotEqual(reasons.get("sh518880"), "rank_drop")
+
+    def test_fill_slot_by_rank_when_holdings_less_than_target(self):
+        ranked = ["sh518880", "sh513880"]
+        strat = make_strategy(top_n=2, pool_type="etf", rebalance_mode="topk_drop",
+                              ma30_exit=False, universe=None, rank_buffer=2,
+                              check_freq="daily")
+        bars = FakeBars({
+            ("sh518880", DATE): {"close": 1.0, "cap_yi": np.nan},
+            ("sh513880", DATE): {"close": 2.0, "cap_yi": np.nan},
+        })
+        pf = FakePortfolio(cash=25000,
+                           positions={"sh518880": position(75000)},
+                           total_value=100000.0)
+        strat.portfolio = pf
+        strat.bars = bars
+        strat._target_weights = {"sh518880": 1.0}
+        strat._entry_prices = {"sh518880": 1.0}
+
+        with mock.patch.object(be, "_filter_market_cap_universe",
+                               return_value=ranked):
+            sig = strat.on_bar(MarketBarEvent(DATE, {c: {} for c in ranked}, bars))
+
+        buys = [o.code for o in orders_of(sig) if o.direction == "buy"]
+        self.assertIn("sh513880", buys)
+
+
+class CashGuardTest(unittest.TestCase):
+    """资金实时校验: 买入扣款不得超过可用现金, 不足一手则拒单"""
+
+    def _fill(self, direction, qty, price, cost):
+        return be.FillEvent(pd.Timestamp(DATE), "sh510300", direction, qty, price,
+                            commission=cost, stamp_tax=0.0, transfer_fee=0.0,
+                            slippage_cost=0.0, impact_cost=0.0)
+
+    def test_buy_shrinks_to_affordable_lots(self):
+        pf = be.Portfolio(3050.0)
+        ok = pf.apply_fill(self._fill("buy", 500, 10.0, 100.0))
+        self.assertTrue(ok)
+        self.assertEqual(pf.positions["sh510300"].quantity, 200)
+        self.assertGreaterEqual(pf.cash, -1e-9)
+
+    def test_buy_rejected_when_cash_below_one_lot(self):
+        pf = be.Portfolio(900.0)
+        ok = pf.apply_fill(self._fill("buy", 100, 10.0, 20.0))
+        self.assertFalse(ok)
+        self.assertEqual(pf.rejected_buys, 1)
+        self.assertAlmostEqual(pf.cash, 900.0)
+        self.assertNotIn("sh510300", pf.positions)
+
+
+class SellBeforeBuyExecutionTest(unittest.TestCase):
+    """同一交易日撮合: 即使买单先入队, 也必须先执行卖单"""
+
+    @staticmethod
+    def _feat():
+        dates = pd.to_datetime(["2026-01-05", "2026-01-06"])
+        rows = {
+            "sh510300": [10.0, 10.0],
+            "sz159915": [2.0, 2.0],
+        }
+        out = {}
+        for code, closes in rows.items():
+            out[code] = pd.DataFrame({
+                "date": dates, "open": closes, "high": closes,
+                "low": closes, "close": closes,
+                "volume": [1e7, 1e7], "amount": [1e8, 1e8],
+            })
+        return out
+
+    def test_buy_order_waits_for_sell_proceeds(self):
+        feat = self._feat()
+        strat = be.BaseStrategy()
+        eng = be.EventDrivenBacktest(feat, strat, initial_capital=1000.0)
+        d1 = pd.Timestamp("2026-01-06")
+        pf = eng.portfolio
+        pf.positions["sh510300"] = be.Position(
+            "sh510300", pd.Timestamp("2026-01-05"), 10.0, 1000, 0.0, 0.0)
+        pf.cash = 0.0
+        # 故意把买单排在卖单前面 (旧实现的入队顺序)
+        eng._pending_orders = [
+            be.OrderEvent(d1, "sz159915", "buy", 4000),
+            be.OrderEvent(d1, "sh510300", "sell", 1000),
+        ]
+        eng._execute_orders(d1)
+
+        self.assertEqual([f["direction"] for f in pf.fills], ["sell", "buy"])
+        self.assertTrue(all(f["cash_after"] >= -1e-9 for f in pf.fills))
+        self.assertGreaterEqual(pf.cash, -1e-9)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

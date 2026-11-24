@@ -320,7 +320,8 @@ class FastBacktest:
         fill = be.FillEvent(date, order.code, order.direction, order.quantity,
                             fp, comm, stamp, trans, slip, impact,
                             reason=getattr(order, "reason", "rebalance"))
-        self.portfolio.apply_fill(fill)
+        if not self.portfolio.apply_fill(fill):
+            return False
         return True
 
     def _execute_orders(self, date):
@@ -350,24 +351,35 @@ class FastBacktest:
                 self._deferred_sells.pop(code, None)
                 executed = True
 
-        for order in self._pending:
-            if order.direction == "sell" and order.code in self._deferred_sells:
+        # 先卖后买: 与事件驱动引擎同口径, 与订单入队顺序无关
+        sell_orders = [o for o in self._pending if o.direction == "sell"]
+        buy_orders = [o for o in self._pending if o.direction == "buy"]
+
+        for order in sell_orders:
+            if order.code in self._deferred_sells:
                 continue
             row = self.bars.row(order.code, date)
             if row is None:
-                if enforce and order.direction == "sell" and order.code in self.portfolio.positions:
+                if enforce and order.code in self.portfolio.positions:
                     self._deferred_sells[order.code] = order
                     self.fill_blocks["sell_suspended"] += 1
-                elif order.direction == "buy":
-                    self.fill_blocks["buy_suspended"] += 1
                 continue
             block = be._order_block_reason(self.bars, order, date, self.limit_rules)
             if block:
-                if order.direction == "sell":
-                    self._deferred_sells[order.code] = order
-                    self.fill_blocks[f"sell_{block}"] += 1
-                else:
-                    self.fill_blocks[f"buy_{block}"] += 1
+                self._deferred_sells[order.code] = order
+                self.fill_blocks[f"sell_{block}"] += 1
+                continue
+            if self._do_fill(order, date, row):
+                executed = True
+
+        for order in buy_orders:
+            row = self.bars.row(order.code, date)
+            if row is None:
+                self.fill_blocks["buy_suspended"] += 1
+                continue
+            block = be._order_block_reason(self.bars, order, date, self.limit_rules)
+            if block:
+                self.fill_blocks[f"buy_{block}"] += 1
                 continue
             if self._do_fill(order, date, row):
                 executed = True
@@ -416,7 +428,16 @@ class FastBacktest:
                     if code not in buys:
                         self._pending.append(be.OrderEvent(
                             ts, code, "sell", self.portfolio.positions[code].quantity))
-                per = self.portfolio.cash / self.top_n
+                # 买入预算 = 现金 + 当日卖出回款 (先卖后买)
+                sell_proceeds = 0.0
+                for code in list(self.portfolio.positions.keys()):
+                    if code in buys:
+                        continue
+                    row = self.bars.row(code, ts)
+                    px = row["close"] if row is not None else None
+                    if px and px > 0:
+                        sell_proceeds += self.portfolio.positions[code].quantity * px * 0.998
+                per = (self.portfolio.cash + sell_proceeds) / self.top_n
                 for code in buys:
                     if code in self.portfolio.positions:
                         continue
@@ -426,7 +447,9 @@ class FastBacktest:
                     ref_px = row.get("open", row["close"])
                     if not ref_px or ref_px <= 0:
                         continue
-                    qty = max(int(per / ref_px / 100) * 100, 100)
+                    qty = int(per / ref_px / 100) * 100
+                    if qty < 100:
+                        continue
                     self._pending.append(be.OrderEvent(ts, code, "buy", qty))
 
             pv = self.portfolio.total_value(ts, self.bars)

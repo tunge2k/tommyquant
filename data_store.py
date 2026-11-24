@@ -14,7 +14,7 @@ import sqlite3
 import random
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -265,6 +265,15 @@ def init_db():
         PRIMARY KEY (symbol, date)
     );
 
+    CREATE TABLE IF NOT EXISTS etf_share_daily (
+        symbol     TEXT NOT NULL,
+        date       TEXT NOT NULL,
+        shares     REAL,           -- 场内份额(份), 上交所官方 (深市暂无)
+        nav        REAL,           -- 单位净值(元), 东财
+        updated_at TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+
     CREATE TABLE IF NOT EXISTS etf_market_flow (
         date       TEXT NOT NULL,
         category   TEXT NOT NULL,       -- all/stock/bond/commodity/monetary/qdii
@@ -278,6 +287,7 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_quote_ext_date  ON etf_quote_ext(date);
     CREATE INDEX IF NOT EXISTS idx_capital_date    ON etf_capital(date);
+    CREATE INDEX IF NOT EXISTS idx_share_date      ON etf_share_daily(date);
     CREATE INDEX IF NOT EXISTS idx_margin_date     ON etf_margin(date);
 
     CREATE TABLE IF NOT EXISTS etf_valuation (
@@ -290,6 +300,28 @@ def init_db():
         dividend_ratio REAL,
         updated_at    TEXT,
         PRIMARY KEY (symbol, report_date)
+    );
+
+    -- ETF 分红记录 (后复权用): 新浪 fund_etf_dividend_sina 的「日期 + 累计分红」
+    CREATE TABLE IF NOT EXISTS etf_dividend (
+        symbol      TEXT NOT NULL,
+        date        TEXT NOT NULL,      -- 除息日 YYYY-MM-DD
+        cum_div     REAL,               -- 累计分红(元/份, 自成立以来)
+        updated_at  TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+    -- 分红同步进度: 无分红的 ETF 也要留痕, 否则每天重复请求
+    CREATE TABLE IF NOT EXISTS etf_dividend_sync (
+        symbol      TEXT PRIMARY KEY,
+        events      INTEGER,
+        updated_at  TEXT
+    );
+
+    -- ETF 名称 (选品池按名称识别「跨境/港股」)
+    CREATE TABLE IF NOT EXISTS etf_name (
+        symbol      TEXT PRIMARY KEY,
+        name        TEXT,
+        updated_at  TEXT
     );
     """)
     conn.commit()
@@ -429,7 +461,16 @@ def data_fingerprint() -> str:
     仅靠日期会让因子缓存沿用旧行情。
     """
     s = db_stats()
-    return f"{s['symbols']}_{s['bars']}_{s['first_date']}_{s['last_date']}"
+    # 分红事件数影响 ETF 后复权因子, 名称影响跨境/港股分类, 都必须纳入指纹
+    conn = get_conn()
+    try:
+        n_div = conn.execute("SELECT COUNT(*) FROM etf_dividend").fetchone()[0]
+        n_name = conn.execute("SELECT COUNT(*) FROM etf_name").fetchone()[0]
+    except sqlite3.OperationalError:
+        n_div = n_name = 0
+    conn.close()
+    return (f"{s['symbols']}_{s['bars']}_{s['first_date']}_{s['last_date']}"
+            f"_d{n_div}_n{n_name}")
 
 
 def invalidate_stats():
@@ -627,6 +668,130 @@ def etf_stats() -> dict:
             "first_date": row[2] or "-", "last_date": row[3] or "-"}
 
 
+# ==================== ETF 名称 / 分红 (选品分类 + 后复权) ====================
+
+def sync_etf_names(use_cache: bool = True) -> int:
+    """同步 ETF 名称到库 (选品池按名称识别「跨境/港股」), 返回写入条数"""
+    from datetime import datetime
+    pairs = [(s, n) for s, n in get_etf_codes(use_cache=use_cache) if s and n]
+    if not pairs:
+        return 0
+    ts = datetime.now().isoformat(timespec="seconds")
+    conn = get_conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO etf_name (symbol, name, updated_at) VALUES (?,?,?)",
+        [(s, n, ts) for s, n in pairs])
+    conn.commit()
+    conn.close()
+    return len(pairs)
+
+
+def etf_name_map() -> dict[str, str]:
+    """{sh513100: '国泰纳斯达克100ETF'} — 缺失时返回空字典 (调用方需容错)"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT symbol, name FROM etf_name WHERE name IS NOT NULL AND name != ''").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def sync_etf_dividends(symbols: list[str] | None = None, max_age_days: int = 30,
+                       workers: int = 6, force: bool = False,
+                       progress_cb=None) -> dict:
+    """同步 ETF 分红记录 (后复权的除息事件), 返回 {synced, events, skipped}
+
+    新浪 fund_etf_dividend_sina 给「日期 + 累计分红」; 无分红的 ETF 也写入同步表,
+    避免每轮重复请求。max_age_days 内的记录视为新鲜, 不再重拉。
+    """
+    import akshare as ak
+    from datetime import datetime
+    if symbols is None:
+        symbols = [s for s, _ in get_etf_codes()]
+    symbols = [s for s in dict.fromkeys(symbols) if s]
+    if not symbols:
+        return {"synced": 0, "events": 0, "skipped": 0}
+
+    fresh = {}
+    if not force:
+        cutoff = (datetime.now() - timedelta(days=max_age_days)).isoformat(timespec="seconds")
+        conn = get_conn()
+        try:
+            fresh = {r[0] for r in conn.execute(
+                "SELECT symbol FROM etf_dividend_sync WHERE updated_at >= ?", (cutoff,))}
+        except sqlite3.OperationalError:
+            fresh = set()
+        conn.close()
+    todo = [s for s in symbols if s not in fresh]
+    if not todo:
+        return {"synced": 0, "events": 0, "skipped": len(symbols)}
+
+    def _one(sym):
+        try:
+            df = ak.fund_etf_dividend_sina(symbol=sym)
+        except Exception:
+            return sym, None
+        if df is None or df.empty:
+            return sym, []
+        out = []
+        for _, r in df.iterrows():
+            try:
+                out.append((pd.Timestamp(r["日期"]).strftime("%Y-%m-%d"),
+                            float(r["累计分红"])))
+            except Exception:
+                continue
+        return sym, out
+
+    ts = datetime.now().isoformat(timespec="seconds")
+    rows, sync_rows = [], []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_one, s): s for s in todo}
+        for fut in as_completed(futs):
+            sym, evs = fut.result()
+            done += 1
+            if evs is None:            # 请求失败: 不留痕, 下轮重试
+                if progress_cb:
+                    progress_cb(done, len(todo), sym)
+                continue
+            rows.extend([(sym, d, v, ts) for d, v in evs])
+            sync_rows.append((sym, len(evs), ts))
+            if progress_cb:
+                progress_cb(done, len(todo), sym)
+    conn = get_conn()
+    if rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO etf_dividend (symbol, date, cum_div, updated_at) "
+            "VALUES (?,?,?,?)", rows)
+    if sync_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO etf_dividend_sync (symbol, events, updated_at) "
+            "VALUES (?,?,?)", sync_rows)
+    conn.commit()
+    conn.close()
+    invalidate_stats()
+    return {"synced": len(sync_rows), "events": len(rows),
+            "skipped": len(symbols) - len(todo)}
+
+
+def etf_dividend_map() -> dict[str, list[tuple[str, float]]]:
+    """{sh510500: [(date, cum_div), ...]} — 后复权用, 无记录返回空字典"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT symbol, date, cum_div FROM etf_dividend "
+            "WHERE cum_div IS NOT NULL ORDER BY symbol, date").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    out: dict[str, list] = {}
+    for sym, d, v in rows:
+        out.setdefault(sym, []).append((str(d), float(v)))
+    return out
+
+
 def _upsert_rows(table: str, cols: list[str], rows: list[dict]) -> int:
     """通用批量写入 (INSERT OR REPLACE); rows 的键与 cols 同名, 缺省写 NULL"""
     if not rows:
@@ -695,6 +860,69 @@ def upsert_etf_margin(symbol: str, rows: list[dict]) -> int:
     return _upsert_rows("etf_margin", cols, rows)
 
 
+def upsert_etf_share_daily(rows: list[dict]) -> int:
+    """写入官方份额 / 东财净值
+
+    份额与净值来自两个接口, 同一天会分两次写入, 因此按 COALESCE 合并,
+    不能用 INSERT OR REPLACE (会互相把对方的列清成 NULL)。
+    """
+    if not rows:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = [(r.get("symbol"), r.get("date"), r.get("shares"), r.get("nav"), now)
+               for r in rows if r.get("symbol") and r.get("date")]
+    if not payload:
+        return 0
+    conn = get_conn()
+    conn.executemany(
+        "INSERT INTO etf_share_daily (symbol, date, shares, nav, updated_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(symbol, date) DO UPDATE SET "
+        "shares=COALESCE(excluded.shares, shares), "
+        "nav=COALESCE(excluded.nav, nav), "
+        "updated_at=excluded.updated_at", payload)
+    conn.commit()
+    n = len(payload)
+    conn.close()
+    return n
+
+
+def etf_share_max_date() -> str | None:
+    """已有份额数据的最后日期 (回补缺口判断)"""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT MAX(date) FROM etf_share_daily WHERE shares IS NOT NULL").fetchone()
+    except sqlite3.OperationalError:
+        row = (None,)
+    conn.close()
+    return row[0] if row else None
+
+
+def etf_share_dates() -> set:
+    """已有份额数据的交易日集合"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT date FROM etf_share_daily WHERE shares IS NOT NULL").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return {r[0] for r in rows}
+
+
+def etf_share_symbols() -> list[str]:
+    """已有份额数据的标的 (净值回补用)"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT symbol FROM etf_share_daily WHERE shares IS NOT NULL "
+            "ORDER BY symbol").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    conn.close()
+    return [r[0] for r in rows]
+
+
 def upsert_etf_market_flow(rows: list[dict]) -> int:
     cols = ["date", "category", "buy_value", "sell_value", "net_value",
             "etf_count", "updated_at"]
@@ -719,6 +947,11 @@ def etf_ext_stats() -> dict:
         "SELECT COUNT(*), COUNT(DISTINCT symbol), MAX(date) FROM etf_capital")
     mg_n, mg_last = q("SELECT COUNT(*), MAX(date) FROM etf_margin")
     fl_n, fl_last = q("SELECT COUNT(*), MAX(date) FROM etf_market_flow")
+    sh_n, sh_sym, sh_last = q(
+        "SELECT COUNT(*), COUNT(DISTINCT symbol), MAX(date) FROM etf_share_daily "
+        "WHERE shares IS NOT NULL")
+    nav_n, nav_last = q(
+        "SELECT COUNT(*), MAX(date) FROM etf_share_daily WHERE nav IS NOT NULL")
     meta_n = q("SELECT COUNT(*) FROM etf_meta")[0]
     conn.close()
     return {"meta_symbols": meta_n or 0,
@@ -727,7 +960,10 @@ def etf_ext_stats() -> dict:
             "capital_bars": cap_n or 0, "capital_symbols": cap_sym or 0,
             "capital_last": cap_last or "-",
             "margin_bars": mg_n or 0, "margin_last": mg_last or "-",
-            "flow_bars": fl_n or 0, "flow_last": fl_last or "-"}
+            "flow_bars": fl_n or 0, "flow_last": fl_last or "-",
+            "share_bars": sh_n or 0, "share_symbols": sh_sym or 0,
+            "share_last": sh_last or "-",
+            "nav_bars": nav_n or 0, "nav_last": nav_last or "-"}
 
 
 def _has_year(table: str, symbol: str, year: int, min_rows: int = 200) -> bool:
@@ -755,11 +991,48 @@ def has_etf_capital_year(symbol: str, year: int) -> bool:
     return _has_year("etf_capital", symbol, year)
 
 
+def _apply_official_flow(conn, flow: dict, window: int = 5) -> None:
+    """用交易所官方份额覆盖资金流因子: 近 5 个交易日净申购 / 当前份额 × 100"""
+    try:
+        rows = conn.execute(
+            "SELECT symbol, date, shares FROM etf_share_daily "
+            "WHERE shares IS NOT NULL ORDER BY symbol, date").fetchall()
+    except sqlite3.OperationalError:
+        return
+    hist = {}
+    for sym, d, sh in rows:
+        h = hist.setdefault(sym, [])
+        if len(h) >= window:
+            base = h[-window]
+            if base and sh and sh > 0:
+                flow.setdefault(d, {})[sym] = (float(sh) - float(base)) / float(sh) * 100.0
+        h.append(sh)
+
+
+def _apply_official_premium(conn, premium: dict) -> None:
+    """官方份额 + 东财净值 → 本地算溢价率, 仅补华泰柏瑞缺失的日期
+
+    单位净值口径与 IOPV 有差异, 且 QDII 净值滞后 T-1/T-2,
+    因此只做兜底, 不覆盖已有数据。
+    """
+    try:
+        rows = conn.execute(
+            "SELECT s.symbol, s.date, b.close, s.nav FROM etf_share_daily s "
+            "JOIN daily_bar b ON b.symbol = s.symbol AND b.date = s.date "
+            "WHERE s.nav > 0 AND b.close > 0").fetchall()
+    except sqlite3.OperationalError:
+        return
+    for sym, d, close, nav in rows:
+        day = premium.setdefault(d, {})
+        if sym not in day:
+            day[sym] = (float(close) / float(nav) - 1.0) * 100.0
+
+
 def load_etf_factor_maps() -> dict:
     """ETF 增强因子 (按日期索引, 供回测 as-of 查询)
 
     返回:
-      premium: {date: {symbol: 溢价率%}}      — etf_quote_ext.premium_ratio
+      premium: {date: {symbol: 溢价率%}}      — 华泰柏瑞实测值, 缺失时用「收盘价/净值」兜底
       flow:    {date: {symbol: 净申购强度%}}  — 近5日净申购 / 规模 × 100
       market:  {date: {"stock": 亿元, "all": 亿元}} — 全市场 ETF 当日净流入
     """
@@ -774,6 +1047,9 @@ def load_etf_factor_maps() -> dict:
                 "SELECT symbol, date, near5_netbuy, market_scale FROM etf_capital "
                 "WHERE near5_netbuy IS NOT NULL AND market_scale > 0"):
             flow.setdefault(d, {})[sym] = float(sub) / float(scale) * 100.0
+        # 交易所官方份额覆盖面更广, 覆盖华泰柏瑞的净申购因子
+        _apply_official_flow(conn, flow)
+        _apply_official_premium(conn, premium)
         for d, cat, v in conn.execute(
                 "SELECT date, category, net_value FROM etf_market_flow "
                 "WHERE category IN ('all','stock') AND net_value IS NOT NULL"):
@@ -986,7 +1262,8 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
 
 # ==================== 因子缓存 (磁盘, 避免每次重启重算 80 秒) ====================
 FEAT_CACHE_PATH = os.path.join(DATA_DIR, "feat_cache.pkl")
-FEAT_CACHE_VERSION = 3      # 因子口径变更时 +1 (v3: ETF 份额折算复权)
+FEAT_CACHE_VERSION = 5      # 因子口径变更时 +1 (v3: ETF 份额折算复权; v4: max_dd_250 改单层rolling,
+                            # v5: ETF 改后复权 (叠加分红除息事件))
 
 
 def load_feat_cached(fingerprint: str = None) -> dict:
@@ -1008,7 +1285,8 @@ def load_feat_cached(fingerprint: str = None) -> dict:
 
     from backtest_engine import compute_factors   # 延迟导入, 避免循环依赖
     raw = load_all_bars()
-    feat = compute_factors(raw) if raw else {}
+    # ETF 后复权: 分红除息事件一并交给因子层 (缺失时只做份额折算复权)
+    feat = compute_factors(raw, div_map=etf_dividend_map()) if raw else {}
     try:
         tmp = p + ".tmp"
         with open(tmp, "wb") as f:
