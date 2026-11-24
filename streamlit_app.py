@@ -4185,10 +4185,13 @@ elif page == "backtest":
                         format_func=lambda v: f"近{v}日涨幅",
                         key=_draft("etf_mom_days", 60))
             _num("最少K线(根)", 60, 500, "etf_min_history", step=10, col=_a[1],
-                 help="次新 ETF 数据不足时不参与排名")
+                 help="次新 ETF 数据不足时不参与排名。设太大会把早期上市的标的全部排除"
+                      "（例如 500 根 ≈ 要求上市满 2 年，2016-2022 年多数跨境 ETF 无法入选）")
             _b = st.columns(2)
             _num("成交额下限(亿)", 0.1, 5.0, "etf_min_amount", step=0.1, fmt="%.1f",
-                 col=_b[0], help="近20日日均成交额，低于该值的 ETF 不参与排名")
+                 col=_b[0], help="近20日日均成交额，低于该值的 ETF 不参与排名。"
+                                 "跨境 ETF 在 2019 年前日均成交额普遍仅 0.01-0.5 亿，"
+                                 "设太高（如 >1 亿）会让早年长期空仓")
             _num("资金比例", 0.50, 1.00, "etf_weight_frac", step=0.05, fmt="%.2f",
                  col=_b[1], help="买入金额占总市值比例")
             st.checkbox("仅外盘 ETF（剔除港股系）", key=_draft("etf_overseas_only", True),
