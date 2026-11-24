@@ -2116,6 +2116,8 @@ class MarketCapStrategy(BaseStrategy):
          - "deviation": 上条 4 的偏离度再平衡, 每日检查, 换手高
          - "topk_drop" (借 Qlib Topk-Drop): 持仓跌出候选前 top_n+rank_buffer 名才换出,
            空槽位才补新标的; 不做偏离度再平衡, 显著降低换手与成本
+           rank_swap=False (界面默认) 时关闭「排名跌出换股」, 只有止损清出空槽才补位;
+           此时股票仍走偏离度再平衡 (低买高卖 ±4% / ≥5% 权重)
          - 指定标的池 (universe) 时没有排名概念, topk_drop 自动退化为偏离度再平衡
       8. 标的池类型 pool_type:
          - "stock": 上条 1-3 的股票口径 (市值区间 + 财务/分红/ST 剔除 + 市值升序)
@@ -2137,6 +2139,7 @@ class MarketCapStrategy(BaseStrategy):
                  dividend_years=3, ma30_lookback=5, universe=None,
                  ma30_exit=True, ma30_entry_weeks=1,
                  rebalance_mode="deviation", rank_buffer=2,
+                 rank_swap=True,
                  check_freq="daily",
                  pool_type="stock", etf_mom_days=60,
                  etf_min_amount=0.2, etf_min_history=60,
@@ -2195,6 +2198,10 @@ class MarketCapStrategy(BaseStrategy):
         # 调仓方式: deviation=偏离度再平衡 (旧逻辑); topk_drop=排名缓冲 (借 Qlib Topk-Drop)
         self.rebalance_mode = str(rebalance_mode)
         self.rank_buffer = int(rank_buffer)      # topk_drop: 排名跌出 top_n+rank_buffer 才换出
+        # 排名跌出是否换股 (2026-11-24): 默认 True 保持直调兼容;
+        # 界面默认 False → 只有持仓数 < top_n (止损清出空槽) 才补位, 不做排名驱动的换股,
+        # 避免频繁换股; 关闭时股票仍走第 3 步偏离度调仓 (低买高卖 ±4% / ≥5% 权重)。
+        self.rank_swap = bool(rank_swap)
         # 排名检查频率: daily=每日; weekly=每周最后一个交易日
         # (ETF 60日动量排名日间噪声大, 日频检查会带来无谓换手与成本)
         self.check_freq = str(check_freq)
@@ -2502,16 +2509,19 @@ class MarketCapStrategy(BaseStrategy):
                 # 持仓跌出候选前 top_n+rank_buffer 名即换出 (2026-11-23: ETF 也启用)。
                 # 此前 ETF 只靠周K MA30 走弱退出, 实测出现「排名已跌出标的池仍死扛 85 天」,
                 # 是 2026 年两笔大额亏损的主要来源。
-                for code in list(remaining):
-                    r = rank_map.get(code)
-                    if r is None or r > keep_limit:
-                        sells.append(code)
-                        sell_reasons[code] = "rank_drop"
-                        remaining.remove(code)
-                        sell_codes.add(code)
-                        self._entry_cap_ratios.pop(code, None)
-                        self._entry_prices.pop(code, None)
-                        self._target_weights.pop(code, None)
+                # (2026-11-24) rank_swap=False 时关闭排名换股: 只有止损清出空槽才补位,
+                #   不再因排名跌出而换股, 避免频繁换股; 接受排名跌出但未止损时的持有风险。
+                if self.rank_swap:
+                    for code in list(remaining):
+                        r = rank_map.get(code)
+                        if r is None or r > keep_limit:
+                            sells.append(code)
+                            sell_reasons[code] = "rank_drop"
+                            remaining.remove(code)
+                            sell_codes.add(code)
+                            self._entry_cap_ratios.pop(code, None)
+                            self._entry_prices.pop(code, None)
+                            self._target_weights.pop(code, None)
 
             # 换出后重新计算空槽位 (上面 need_fill 是换出前的值)
             need_fill = self.n_slots - len(remaining)
@@ -2624,7 +2634,8 @@ class MarketCapStrategy(BaseStrategy):
 
         _deviation_rebal = ((self.rebalance_mode != "topk_drop")
                             or bool(self.universe)
-                            or self.pool_type == "etf")
+                            or self.pool_type == "etf"
+                            or not self.rank_swap)
         if _deviation_rebal and held_codes and not rebalance_orders:
             # 当前总持仓市值
             cur_total_mv = 0.0

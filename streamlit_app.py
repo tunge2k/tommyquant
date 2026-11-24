@@ -1692,12 +1692,13 @@ BT_PARAM_DEFAULTS = {
     "mc_entry_weeks": 2,
     "mc_ex_st": True, "mc_ex_ocf": True, "mc_ex_nonop": True,
     "mc_ex_nodiv": True, "mc_div_years": 3,
-    "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop",
+    "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_rank_swap": False,
     # ETF 策略 (池选品: 动量排名 + 流动性/趋势门槛, 无财务/分红参数)
     "etf_mom_days": 60, "etf_min_amount": 0.5, "etf_min_history": 120,
     "etf_weight_frac": 0.75, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
     "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
-    "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_check_freq": "weekly",
+    "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_rank_swap": False,
+    "etf_check_freq": "weekly",
     # ETF 风控因子 (华泰柏瑞增强数据: 溢价率 / 资金流 / 全市场资金流)
     "etf_premium_cap": 0.0, "etf_flow_on": True, "etf_flow_min": -3.0,
     "etf_mkt_flow_guard": False, "etf_mkt_flow_days": 5,
@@ -1780,10 +1781,12 @@ _APPLY_KEYS = {
                  "mc_div_years", "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop",
                  "mc_ex_nodiv", "mc_ma30_exit", "mc_ma30_lookback",
                  "mc_entry_weeks",
-                 "mc_weight_frac", "mc_rank_buffer", "mc_rebal_mode",
+                 "mc_weight_frac", "mc_rank_buffer", "mc_rank_swap",
+                 "mc_rebal_mode",
                  "mc_cap_chg_th", "mc_rebal_th"),
     "ETF策略": ("etf_mom_days", "etf_min_amount", "etf_min_history",
-                 "etf_weight_frac", "etf_rank_buffer", "etf_rebal_mode",
+                 "etf_weight_frac", "etf_rank_buffer", "etf_rank_swap",
+                 "etf_rebal_mode",
                  "etf_check_freq",
                  "etf_cap_chg_th", "etf_rebal_th", "etf_ma30_exit",
                  "etf_ma30_lookback", "etf_entry_weeks",
@@ -1961,13 +1964,15 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-BACKTEST_LOGIC_VERSION = 11  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+BACKTEST_LOGIC_VERSION = 12  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
 # v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
 # v8: ETF 启用 Topk-Drop 排名换出；ETF 上涨不再因 +4% 削赢（仅下跌补仓 / 权重偏离≥5%）
 # v9: ETF 绝对动量阈值默认 0% → 3%（top_n=5, 2024-01~2026-11: 收益 +22.0%→+53.8%,
 #     最大回撤 -14.7%→-13.3%, 夏普 0.74→1.19; K=4 稳健分 0.17→0.45）
 # v10: 买入按 T+1 实际开盘价重算股数, 建仓不再因跳空超配（跌 4% 触发后可正常补仓而非减仓）
 # v11: ETF 数据改后复权（份额折算+分红）；ETF 选品池限定跨境(外盘)并剔除港股系
+# v12: 排名跌出换股默认关闭 (rank_swap=False): 仅持仓数 < top_n 时补位, 不再频繁换股;
+#      关闭时股票仍走偏离度调仓 (低买高卖 ±4% / ≥5% 权重)
 
 
 def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
@@ -2003,6 +2008,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "ma30_entry_weeks": int(ss["mc_entry_weeks"]),
             "rebalance_mode": str(ss["mc_rebal_mode"]),
             "rank_buffer": int(ss["mc_rank_buffer"]),
+            "rank_swap": bool(ss.get("mc_rank_swap", False)),
         })
     elif strategy_key == "ETF策略":
         p.update({
@@ -2020,6 +2026,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "ma30_entry_weeks": int(ss["etf_entry_weeks"]),
             "rebalance_mode": str(ss["etf_rebal_mode"]),
             "rank_buffer": int(ss["etf_rank_buffer"]),
+            "rank_swap": bool(ss.get("etf_rank_swap", False)),
             "check_freq": str(ss["etf_check_freq"]),
             "etf_premium_cap": float(ss["etf_premium_cap"]),
             "etf_flow_min": float(ss["etf_flow_min"]) if ss["etf_flow_on"] else None,
@@ -2071,6 +2078,7 @@ def _run_backtest_params(strategy_key, params, feat_data):
             ma30_entry_weeks=params["ma30_entry_weeks"],
             rebalance_mode=params["rebalance_mode"],
             rank_buffer=params["rank_buffer"],
+            rank_swap=params.get("rank_swap", True),
             check_freq=params.get("check_freq", "daily"),
             etf_premium_cap=params.get("etf_premium_cap", 0.0),
             etf_flow_min=params.get("etf_flow_min"),
@@ -3379,6 +3387,7 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
             ma30_entry_weeks=ss.get("etf_entry_weeks", 2),
             rebalance_mode=ss.get("etf_rebal_mode", "topk_drop"),
             rank_buffer=o.get("rank_buffer", ss.get("etf_rank_buffer", 5)),
+            rank_swap=bool(ss.get("etf_rank_swap", False)),
             check_freq=ss.get("etf_check_freq", "weekly"),
             etf_premium_cap=float(ss.get("etf_premium_cap", 0.0) or 0.0),
             etf_flow_min=(float(ss.get("etf_flow_min", -3.0))
@@ -3409,6 +3418,7 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
         ma30_entry_weeks=ss.get("mc_entry_weeks", 2),
         rebalance_mode=ss.get("mc_rebal_mode", "topk_drop"),
         rank_buffer=o.get("rank_buffer", ss.get("mc_rank_buffer", 2)),
+        rank_swap=bool(ss.get("mc_rank_swap", False)),
     )
 
 
@@ -4129,6 +4139,10 @@ elif page == "backtest":
                          help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
             _b[3].slider("排名缓冲(名)", 0, 10, key=_draft("etf_rank_buffer", 5),
                          help="排名跌出 持仓数+缓冲 才换出")
+            _br = st.columns(4)
+            _br[0].checkbox("排名跌出换股", key=_draft("etf_rank_swap", False),
+                            help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
+                                 "止损(MA30走弱/绝对动量)仍会清仓并当日补位。开启则恢复排名换股。")
             st.radio("调仓方式", options=["topk_drop", "deviation"],
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
@@ -4196,6 +4210,10 @@ elif page == "backtest":
                          step=0.05, help="买入金额占总市值比例")
             _c[3].slider("排名缓冲(名)", 0, 10, key=_draft("mc_rank_buffer", 2),
                          help="排名跌出 持仓数+缓冲 才换出")
+            _cr = st.columns(4)
+            _cr[0].checkbox("排名跌出换股", key=_draft("mc_rank_swap", False),
+                            help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
+                                 "止损仍会清仓并当日补位，低买高卖(±4%/≥5%权重)调仓照常。开启则恢复排名换股。")
             st.radio("调仓方式", options=["topk_drop", "deviation"],
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],

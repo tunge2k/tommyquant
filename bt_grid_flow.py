@@ -68,6 +68,7 @@ def run_grid_search():
         etf_abs_mom_min=0.0,  # 关闭绝对动量
         rebalance_mode="topk_drop",
         rank_buffer=5,
+        rank_swap=False,  # 关闭排名跌出换股, 仅持仓数不足时补位 (2026-11-24 新默认)
         check_freq="weekly",
     )
     
