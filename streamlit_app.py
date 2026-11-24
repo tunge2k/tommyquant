@@ -2192,31 +2192,24 @@ def _render_top_nav(cur_page: str, subtitle: str = None, cfg_toggle=None):
 _MARKET_CARDS_HTML = r"""
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
   * { box-sizing: border-box; }
+  html, body { height:100%; }
   body { margin:0; background:#0a0a1f; font-family:'Inter',-apple-system,BlinkMacSystemFont,
-                   'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif; }
-  /* ---- 世界地图: 按国家分色, equirectangular 拉伸填满 ---- */
-  .mapwrap { position:relative; border:1px solid rgba(0,229,255,.16); border-radius:12px;
-             background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; }
-  svg.ww { width:100%; height:300px; display:block; }
+                   'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+         display:flex; flex-direction:column; }
+  /* ---- 世界地图: 按国家实时涨跌着色 (色系内各国色阶不同), 自适应拉伸填满 ---- */
+  .mapwrap { position:relative; flex:1; min-height:0; border:1px solid rgba(0,229,255,.16);
+             border-radius:12px; background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; }
+  svg.ww { width:100%; height:100%; display:block; }
   .ctx path { fill:#131a30; stroke:#1e2942; stroke-width:.45; stroke-linejoin:round; }
-  .cty { stroke-width:.6; stroke-linejoin:round; cursor:pointer;
-         transition:fill .15s ease, stroke .15s ease; }
-  .cty[data-c="中国"]     { fill:#4a2b26; stroke:#a8563f; }
-  .cty[data-c="美国"]     { fill:#20304f; stroke:#4a6fa5; }
-  .cty[data-c="日本"]     { fill:#33284a; stroke:#7a5aa5; }
-  .cty[data-c="韩国"]     { fill:#213c37; stroke:#3f8a74; }
-  .cty[data-c="澳大利亚"] { fill:#3a3122; stroke:#8a6a3a; }
-  .cty[data-c="德国"]     { fill:#22303f; stroke:#4a7a9a; }
-  .cty[data-c="英国"]     { fill:#33301f; stroke:#8a7d3a; }
-  .cty[data-c="法国"]     { fill:#26294a; stroke:#5a6aa5; }
-  .cty:hover { filter:brightness(1.55); stroke:#9fe8ff; }
+  .cty { fill:#2a3050; stroke:#41507a; stroke-width:.7; stroke-linejoin:round; cursor:pointer;
+         transition:fill .3s ease, stroke .3s ease; }
+  .cty:hover { filter:brightness(1.55); }
   .cty.live { animation:breathe 1.9s ease-in-out infinite alternate; }
-  @keyframes breathe { from { fill:#123a37; stroke:#0a7f6b; } to { fill:#127a5c; stroke:#00ffa3; } }
+  @keyframes breathe { from { stroke-width:.7; } to { stroke-width:3.4; } }
   .mk { cursor:pointer; }
-  .mk circle { stroke:#ffc53d; fill:rgba(255,197,61,.3); stroke-width:1.2; transition:fill .15s; }
-  .mk:hover circle { fill:rgba(255,197,61,.65); }
-  .mk.live circle { animation:blinkDot 1.9s ease-in-out infinite alternate; }
-  @keyframes blinkDot { from { fill:#0a7f6b; stroke:#0a7f6b; } to { fill:#00ffa3; stroke:#00ffa3; } }
+  .mk circle { stroke:#ffc53d; fill:rgba(255,197,61,.45); stroke-width:1.2; transition:fill .25s; }
+  .mk:hover circle { filter:brightness(1.45); }
+  .mk.live circle { animation:breathe 1.9s ease-in-out infinite alternate; }
   .cname { position:absolute; transform:translate(-50%,-50%); font-size:11px; font-weight:600;
            color:#a9b8dc; pointer-events:none; text-shadow:0 1px 3px #000; letter-spacing:.2px; }
   /* ---- 悬停浮层: 该国全部指数实时行情 ---- */
@@ -2231,18 +2224,19 @@ _MARKET_CARDS_HTML = r"""
   .tbr .n { color:#c0cbe8; }
   .hint { position:absolute; right:9px; bottom:4px; font-size:10px; color:#6b7596; }
   /* ---- 商品/汇率/加密 胶囊 ---- */
-  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; flex:none; }
   .chip { display:flex; align-items:center; gap:6px; background:#141430; cursor:pointer;
           border:1px solid rgba(0,229,255,.2); border-radius:999px; padding:4px 10px;
           font-size:11.5px; color:#c0cbe8; font-variant-numeric:tabular-nums;
           transition:border-color .15s, box-shadow .15s; }
   .chip:hover { border-color:#00e5ff; box-shadow:0 0 10px rgba(0,229,255,.18); }
   .chip b { font-weight:600; }
-  .foot { margin-top:6px; font-size:10.5px; color:#6b7596; }
+  .foot { margin-top:6px; font-size:10.5px; color:#6b7596; flex:none; }
   /* ---- K线面板 (点击国家后就地展开, 不占额外高度) ---- */
   .chartwrap { display:none; border:1px solid rgba(0,229,255,.3); border-radius:12px;
-               background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:6px 10px 2px; }
-  .chartwrap.on { display:block; }
+               background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:6px 10px 2px;
+               flex:1; min-height:0; }
+  .chartwrap.on { display:flex; flex-direction:column; }
   .chead { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
   .chead .t { font-size:13px; font-weight:700; color:#7fe9ff; }
   .mx { cursor:pointer; color:#8b95b5; font-size:13px; padding:1px 7px; border-radius:6px; }
@@ -2251,7 +2245,7 @@ _MARKET_CARDS_HTML = r"""
   .tg { font-size:11px; padding:2px 9px; border-radius:999px; cursor:pointer;
         border:1px solid #2c3c66; color:#c0cbe8; user-select:none; }
   .tg.on { background:rgba(0,229,255,.14); border-color:#00e5ff; color:#7fe9ff; }
-  canvas { width:100%; height:238px; display:block; }
+  canvas { width:100%; flex:1; min-height:0; display:block; }
   .mfoot { font-size:10px; color:#5c6688; text-align:right; }
 </style></head><body>
 <div class="mapwrap" id="mapwrap">
@@ -2274,12 +2268,42 @@ __LABELS__
 </div>
 <script>
 const ITEMS = __ITEMS__;
+const PALETTE = __PALETTE__;
 const UP="#dc2626", DOWN="#16a34a", FLAT="#64748b";
 const STATE = {};
+/* 用后端兜底行情预填, 首屏即可按涨跌着色, 不必等 2 秒刷新 */
+ITEMS.forEach(function(it){ if(it.price) STATE[it.code]={price:it.price,pct:it.pct}; });
 function fmtPrice(v){ return v>=10000 ? v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : v.toFixed(2); }
 function arrow(p){ return p>0?"▲":(p<0?"▼":"—"); }
 function colorOf(p){ return p>0?UP:(p<0?DOWN:FLAT); }
 function itemsOf(c){ return ITEMS.filter(function(it){ return it.group === c; }); }
+/* ---- 国家按实时涨跌着色: 色系内各国色阶不同 (PALETTE 由后端按语言注入) ---- */
+function shadeColor(hex, amt){
+  var c = String(hex).replace('#',''); if(c.length !== 6) return hex;
+  var num = parseInt(c, 16);
+  var r = Math.max(0, Math.min(255, (num >> 16) + amt));
+  var g = Math.max(0, Math.min(255, ((num >> 8) & 0xff) + amt));
+  var b = Math.max(0, Math.min(255, (num & 0xff) + amt));
+  return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
+}
+function countryPct(c){
+  var its = itemsOf(c), s = 0, n = 0;
+  its.forEach(function(it){ var st = STATE[it.code]; if(st && st.price){ s += st.pct; n++; } });
+  return n ? s / n : null;
+}
+function paintCountries(){
+  document.querySelectorAll('.cty[data-c],.mk').forEach(function(el){
+    var c = el.getAttribute('data-c'); if(!c) return;
+    var p = countryPct(c), col;
+    if(p === null){ col = PALETTE.flat; }
+    else if(p > 0.001){ col = PALETTE.up[c] || PALETTE.flat; }
+    else if(p < -0.001){ col = PALETTE.down[c] || PALETTE.flat; }
+    else { col = PALETTE.flat; }
+    var circ = (el.tagName === 'g') ? el.querySelector('circle') : null;
+    if(circ){ circ.style.fill = col; circ.style.stroke = shadeColor(col, 55); }
+    else { el.style.fill = col; el.style.stroke = shadeColor(col, 45); }
+  });
+}
 /* ---- 悬停浮层: 国家 -> 该国全部指数 ---- */
 function buildTip(c){
   const rows = itemsOf(c).map(function(it){
@@ -2453,6 +2477,7 @@ function apply(code, price, pct){
   if(c){ c.textContent = arrow(pct)+Math.abs(pct).toFixed(2)+'%'; c.style.color = colorOf(pct); }
   const tb = document.getElementById('tipbox');
   if(tb.style.display === 'block' && tb.dataset.c) tb.innerHTML = buildTip(tb.dataset.c);
+  paintCountries();
 }
 function pull(){
   const ids = ITEMS.filter(function(i){ return i.code.indexOf('.') > 0; })
@@ -2523,7 +2548,7 @@ document.querySelectorAll('.cty,.mk').forEach(function(el){
     if(its.length) openChart(el.dataset.c, its[0]);
   });
 });
-renderChips(); pull(); pullBtc(); paintSessions();
+renderChips(); paintCountries(); pull(); pullBtc(); paintSessions();
 setInterval(pull, 2000);
 setInterval(pullBtc, 5000);
 setInterval(paintSessions, 30000);
@@ -3653,17 +3678,37 @@ if page == "home":
         f'<div class="cname" style="left:{_x}%;top:{_y}%">{_c}</div>'
         for _c, (_x, _y) in _LABEL_POS.items())
 
+    # 各国涨跌色系: 中文 涨=红系/跌=绿系, 英文 涨=绿系/跌=红系
+    # 色系内每个国家用不同色阶, 保证相邻国家可区分 (东亚 中/韩/日, 欧洲 英/法/德)
+    _RED_SHADES = {
+        "中国": "#d32f2f", "美国": "#e64a19", "日本": "#c2185b", "韩国": "#b71c1c",
+        "澳大利亚": "#f4511e", "德国": "#d81b60", "英国": "#bf360c", "法国": "#ad1457",
+        "香港": "#ef5350",
+    }
+    _GREEN_SHADES = {
+        "中国": "#2e7d32", "美国": "#00897b", "日本": "#558b2f", "韩国": "#1b5e20",
+        "澳大利亚": "#33691e", "德国": "#00695c", "英国": "#689f38", "法国": "#004d40",
+        "香港": "#66bb6a",
+    }
+    _zh = lang() != "en"
+    _palette = {
+        "up": _RED_SHADES if _zh else _GREEN_SHADES,
+        "down": _GREEN_SHADES if _zh else _RED_SHADES,
+        "flat": "#3a4168",
+    }
+
     st.markdown(f"### {t('global_markets')}")
     _mc = market_colors()
     _comp.html(
         paint_colors(
             _MARKET_CARDS_HTML
                 .replace("__ITEMS__", json.dumps(_items, ensure_ascii=False))
+                .replace("__PALETTE__", json.dumps(_palette, ensure_ascii=False))
                 .replace("__CTX_PATHS__", "".join(_ctx_paths))
                 .replace("__TRK_PATHS__", "".join(_trk_paths))
                 .replace("__LABELS__", _labels),
             _mc),
-        height=430, scrolling=False)
+        height=540, scrolling=False)
 
     st.divider()
 
