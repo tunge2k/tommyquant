@@ -2342,7 +2342,7 @@ class MarketCapStrategy(BaseStrategy):
         """是否允许在当日进行排名驱动的换股/补位 (买入新标的)。
         - 空仓 (含初始建仓): 始终允许, 否则策略无法建仓;
         - 已有持仓: 仅在复核日允许; off 模式下永不补入新标的 (止损清出的仓位留现金)。
-        调仓 (持仓内部低买高卖) 不受此限制, 仍每日执行。"""
+        调仓 (持仓内部低买高卖) 由价格/权重偏离触发, 与换股周期无关, 不受此限制。"""
         if not has_positions:
             return True
         if self._eff_rank_freq == "off":

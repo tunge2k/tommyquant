@@ -4234,7 +4234,8 @@ elif page == "backtest":
                                             "quarterly": "每季", "yearly": "每年(默认)",
                                             "off": "关闭换股(只调仓)"}[v],
                      key=_draft("etf_rank_check_freq", "yearly"), horizontal=True,
-                     help="仅控制「换入新标的/补位」的复核频率；持仓内部的调仓(低买高卖)仍每日执行。"
+                     help="仅控制「换入新标的/补位」的复核频率；持仓内部的调仓(低买高卖)"
+                          "由价格/权重偏离触发，与本周期无关。"
                           "关闭后：初始建仓后不再换入新标的，止损清出的仓位留现金，更接近长期持有。")
 
             with st.expander("④ 风控因子（高级，需先同步华泰柏瑞增强数据）", expanded=False):
