@@ -27,7 +27,8 @@ FILES = ["streamlit_app.py", "backtest_engine.py", "fast_backtest.py",
          "htbr_source.py", "exchange_source.py",
          "world_map_countries.py",
          "entrypoint.sh",
-         "Dockerfile", "docker-compose.yml", "requirements.txt"]
+         "Dockerfile", "docker-compose.yml", "requirements.txt",
+         "vectorbt_etf_backtest.py", "docs/vectorbt_etf_strategy.md"]
 
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -57,7 +58,10 @@ scp = SCPClient(ssh.get_transport())
 for f in FILES:
     p = os.path.join(LOCAL_DIR, f)
     if os.path.exists(p):
-        scp.put(p, f"{REMOTE_DIR}/{f}")
+        remote_rel = f.replace("\\", "/")
+        if "/" in remote_rel:
+            run(f"mkdir -p {REMOTE_DIR}/{remote_rel.rsplit('/', 1)[0]}")
+        scp.put(p, f"{REMOTE_DIR}/{remote_rel}")
         print(f"  ✅ {f}")
 # streamlit 主题配置 (需建目录)
 cfg = os.path.join(LOCAL_DIR, ".streamlit", "config.toml")

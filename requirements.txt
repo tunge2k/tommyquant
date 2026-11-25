@@ -5,3 +5,5 @@ plotly>=5.15.0
 streamlit>=1.28.0
 PySocks>=1.7.1
 quantstats-lumi==1.1.6
+vectorbt==0.28.0
+matplotlib>=3.8.0
