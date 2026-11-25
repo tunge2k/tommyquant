@@ -1704,6 +1704,8 @@ BT_PARAM_DEFAULTS = {
     "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
     "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_rank_swap": False,
     "etf_check_freq": "weekly",
+    # 换股/补位复核周期: weekly/monthly/quarterly/yearly/off (默认每年, 降低换手)
+    "etf_rank_check_freq": "yearly",
     # ETF 风控因子 (华泰柏瑞增强数据: 溢价率 / 资金流 / 全市场资金流)
     "etf_premium_cap": 0.0, "etf_flow_on": True, "etf_flow_min": -3.0,
     "etf_mkt_flow_guard": False, "etf_mkt_flow_days": 5,
@@ -1792,7 +1794,7 @@ _APPLY_KEYS = {
     "ETF策略": ("etf_mom_days", "etf_min_amount", "etf_min_history",
                  "etf_weight_frac", "etf_rank_buffer", "etf_rank_swap",
                  "etf_rebal_mode",
-                 "etf_check_freq",
+                 "etf_check_freq", "etf_rank_check_freq",
                  "etf_cap_chg_th", "etf_rebal_th", "etf_ma30_exit",
                  "etf_ma30_lookback", "etf_entry_weeks",
                  "etf_premium_cap", "etf_flow_on", "etf_flow_min",
@@ -2033,6 +2035,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "rank_buffer": int(ss["etf_rank_buffer"]),
             "rank_swap": bool(ss.get("etf_rank_swap", False)),
             "check_freq": str(ss["etf_check_freq"]),
+            "rank_check_freq": str(ss.get("etf_rank_check_freq", "yearly")),
             "etf_premium_cap": float(ss["etf_premium_cap"]),
             "etf_flow_min": float(ss["etf_flow_min"]) if ss["etf_flow_on"] else None,
             "etf_mkt_flow_guard": bool(ss["etf_mkt_flow_guard"]),
@@ -2085,6 +2088,7 @@ def _run_backtest_params(strategy_key, params, feat_data):
             rank_buffer=params["rank_buffer"],
             rank_swap=params.get("rank_swap", True),
             check_freq=params.get("check_freq", "daily"),
+            rank_check_freq=params.get("rank_check_freq"),
             etf_premium_cap=params.get("etf_premium_cap", 0.0),
             etf_flow_min=params.get("etf_flow_min"),
             etf_mkt_flow_guard=params.get("etf_mkt_flow_guard", False),
@@ -2209,10 +2213,10 @@ _MARKET_CARDS_HTML = r"""
   body { margin:0; background:#0a0a1f; font-family:'Inter',-apple-system,BlinkMacSystemFont,
                    'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
          display:flex; flex-direction:column; }
-  /* ---- 世界地图: 按国家实时涨跌着色 (色系内各国色阶不同), 自适应拉伸填满 ---- */
-  .mapwrap { position:relative; flex:1; min-height:0; border:1px solid rgba(0,229,255,.16);
+  /* ---- 世界地图: 横向填满容器, 纵向按 viewBox 比例 (1000:500=2:1) 等比缩放 ---- */
+  .mapwrap { position:relative; border:1px solid rgba(0,229,255,.16);
              border-radius:12px; background:linear-gradient(180deg,#0c0c24,#0a0a1f); padding:2px 4px; }
-  svg.ww { width:100%; height:100%; display:block; }
+  svg.ww { width:100%; height:auto; display:block; }
   .ctx path { fill:#131a30; stroke:#1e2942; stroke-width:.45; stroke-linejoin:round; }
   .cty { fill:#2a3050; stroke:#41507a; stroke-width:.7; stroke-linejoin:round; cursor:pointer;
          transition:fill .3s ease, stroke .3s ease; }
@@ -2263,7 +2267,7 @@ _MARKET_CARDS_HTML = r"""
   .mfoot { font-size:10px; color:#5c6688; text-align:right; }
 </style></head><body>
 <div class="mapwrap" id="mapwrap">
-  <svg class="ww" viewBox="0 0 1000 500" preserveAspectRatio="none" aria-label="世界主要市场国家分布图">
+  <svg class="ww" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid meet" aria-label="世界主要市场国家分布图">
     <g class="ctx">__CTX_PATHS__</g>
     <g class="trk">__TRK_PATHS__</g>
     <g class="mk" data-c="香港"><circle cx="817" cy="192" r="4.2"/></g>
@@ -3394,6 +3398,7 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
             rank_buffer=o.get("rank_buffer", ss.get("etf_rank_buffer", 5)),
             rank_swap=bool(ss.get("etf_rank_swap", False)),
             check_freq=ss.get("etf_check_freq", "weekly"),
+            rank_check_freq=ss.get("etf_rank_check_freq", "yearly"),
             etf_premium_cap=float(ss.get("etf_premium_cap", 0.0) or 0.0),
             etf_flow_min=(float(ss.get("etf_flow_min", -3.0))
                           if ss.get("etf_flow_on") else None),
@@ -4111,6 +4116,8 @@ elif page == "backtest":
                     'div[data-testid="stDialog"] div[data-testid="stVerticalBlock"]{gap:.4rem}'
                     'div[data-testid="stDialog"] hr{margin:.5rem 0}'
                     'div[data-testid="stDialog"] label{font-size:.86rem}'
+                    'div[data-testid="stDialog"] .stNumberInput,'
+                    'div[data-testid="stDialog"] .stDateInput{max-width:320px}'
                     "</style>", unsafe_allow_html=True)
 
         # 移动端友好: 数值一律用 number_input (可精确输入/点 +-), 不用 slider 避免误触
@@ -4221,11 +4228,14 @@ elif page == "backtest":
                      format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
                                             "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
                      key=_draft("etf_rebal_mode", "topk_drop"), horizontal=True)
-            st.radio("排名检查频率", options=["weekly", "daily"],
-                     format_func=lambda v: {"weekly": "每周最后一个交易日",
-                                             "daily": "每个交易日"}[v],
-                     key=_draft("etf_check_freq", "weekly"), horizontal=True,
-                     help="60日动量排名的日间噪声很大，周频检查可显著降低换手与成本")
+            st.radio("换股周期",
+                     options=["weekly", "monthly", "quarterly", "yearly", "off"],
+                     format_func=lambda v: {"weekly": "每周", "monthly": "每月",
+                                            "quarterly": "每季", "yearly": "每年(默认)",
+                                            "off": "关闭换股(只调仓)"}[v],
+                     key=_draft("etf_rank_check_freq", "yearly"), horizontal=True,
+                     help="仅控制「换入新标的/补位」的复核频率；持仓内部的调仓(低买高卖)仍每日执行。"
+                          "关闭后：初始建仓后不再换入新标的，止损清出的仓位留现金，更接近长期持有。")
 
             with st.expander("④ 风控因子（高级，需先同步华泰柏瑞增强数据）", expanded=False):
                 st.caption("无增强数据时自动不拦截。")

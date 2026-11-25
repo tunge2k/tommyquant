@@ -2141,6 +2141,7 @@ class MarketCapStrategy(BaseStrategy):
                  rebalance_mode="deviation", rank_buffer=2,
                  rank_swap=True,
                  check_freq="daily",
+                 rank_check_freq=None,
                  pool_type="stock", etf_mom_days=60,
                  etf_min_amount=0.2, etf_min_history=60,
                  etf_premium_cap=1.0, etf_flow_min=None,
@@ -2205,6 +2206,15 @@ class MarketCapStrategy(BaseStrategy):
         # 排名检查频率: daily=每日; weekly=每周最后一个交易日
         # (ETF 60日动量排名日间噪声大, 日频检查会带来无谓换手与成本)
         self.check_freq = str(check_freq)
+        # 换股/补位的排名复核周期 (2026-11-25 用户需求: 调仓保留, 换股拉长到1年或可关闭)。
+        # None → 回退到 check_freq (保持股票策略与旧配置行为不变);
+        # 可选 daily/weekly/monthly/quarterly/yearly/off。
+        # off=关闭换股: 初始建仓后不再因排名补入新标的, 止损清出的仓位留现金,
+        # 仅保留持仓内部的偏离度调仓 (低买高卖)。
+        self.rank_check_freq = rank_check_freq
+        _allowed = {"daily", "weekly", "monthly", "quarterly", "yearly", "off"}
+        _eff = (rank_check_freq or check_freq)
+        self._eff_rank_freq = _eff if _eff in _allowed else "weekly"
         self._check_days = None
 
         # 运行时状态 (由 on_init / on_bar 维护)
@@ -2295,19 +2305,49 @@ class MarketCapStrategy(BaseStrategy):
         self.portfolio = context.get("portfolio")
         self.bars = context.get("bars")
         self.feat = context.get("feat")
-        # 每周调仓: 预计算「每个自然周最后一个交易日」, 排名检查只在这些日子做
-        self._check_days = None
-        if self.check_freq == "weekly" and self.bars is not None:
-            dates = pd.DatetimeIndex(self.bars.all_dates)
-            wk = dates.strftime("%Y-%W")
-            self._check_days = set(pd.Series(dates).groupby(wk.to_numpy()).max().tolist())
-            self._check_days = {pd.Timestamp(d) for d in self._check_days}
+        # 排名/换股复核日: daily=每个交易日; off=永不; 其余取各周期最后一个交易日
+        self._check_days = self._compute_check_days()
+
+    def _compute_check_days(self) -> set | None:
+        if self.bars is None:
+            return None
+        freq = self._eff_rank_freq
+        if freq in ("daily", "off"):
+            return None
+        dates = pd.DatetimeIndex(self.bars.all_dates)
+        if freq == "weekly":
+            groups = dates.strftime("%Y-%W")
+        elif freq == "monthly":
+            groups = dates.strftime("%Y-%m")
+        elif freq == "quarterly":
+            groups = dates.to_period("Q").astype(str)
+        elif freq == "yearly":
+            groups = dates.strftime("%Y")
+        else:
+            groups = dates.strftime("%Y-%W")
+        return {pd.Timestamp(d) for d in
+                pd.Series(dates).groupby(groups.to_numpy()).max().tolist()}
 
     def _is_check_day(self, date) -> bool:
-        """排名/换股检查日: daily=每个交易日, weekly=每周最后一个交易日"""
-        if self.check_freq != "weekly" or self._check_days is None:
+        """排名/换股检查日: daily=每个交易日; off=永不; 其余=对应周期最后一个交易日"""
+        if self._eff_rank_freq == "daily":
+            return True
+        if self._eff_rank_freq == "off":
+            return False
+        if not self._check_days:
             return True
         return pd.Timestamp(date) in self._check_days
+
+    def _allow_rank_action(self, date, has_positions: bool) -> bool:
+        """是否允许在当日进行排名驱动的换股/补位 (买入新标的)。
+        - 空仓 (含初始建仓): 始终允许, 否则策略无法建仓;
+        - 已有持仓: 仅在复核日允许; off 模式下永不补入新标的 (止损清出的仓位留现金)。
+        调仓 (持仓内部低买高卖) 不受此限制, 仍每日执行。"""
+        if not has_positions:
+            return True
+        if self._eff_rank_freq == "off":
+            return False
+        return self._is_check_day(date)
 
     def _current_cap(self, code, date) -> float:
         """取标的当日市值 (亿)"""
@@ -2490,6 +2530,9 @@ class MarketCapStrategy(BaseStrategy):
         sell_codes = set(sells)
         remaining = [c for c in portfolio.positions.keys() if c not in sell_codes]
         need_fill = self.n_slots - len(remaining)
+        # 是否允许当日买入新标的 (换股/补位): 初始空仓始终允许; 已有持仓仅复核日允许;
+        # off 模式下不补入新标的。调仓 (持仓内部低买高卖) 不受影响。
+        rank_ok = self._allow_rank_action(date, bool(remaining))
 
         # =========================================
         # 2a. Topk-Drop 换股 (借 Qlib 思路):
@@ -2525,7 +2568,7 @@ class MarketCapStrategy(BaseStrategy):
 
             # 换出后重新计算空槽位 (上面 need_fill 是换出前的值)
             need_fill = self.n_slots - len(remaining)
-            if need_fill > 0:
+            if need_fill > 0 and rank_ok:
                 if ranked is None:
                     # 非检查日出现空槽 (清仓后): 用当日排名即时补位
                     ranked = _filter_market_cap_universe(
@@ -2574,7 +2617,7 @@ class MarketCapStrategy(BaseStrategy):
                     if not self._abs_mom_ok(code, date):
                         continue
                     selected.append(code)
-            else:
+            elif rank_ok:
                 # 选股池: MA30 上升 + 市值/财务过滤 (已由 _filter_market_cap_universe 内置)
                 selected = _filter_market_cap_universe(
                     snap, feat=self.feat, **self._selection_kwargs(date))
@@ -2582,6 +2625,9 @@ class MarketCapStrategy(BaseStrategy):
                 selected = [c for c in selected
                             if c not in portfolio.positions and c not in sell_codes
                             and self._abs_mom_ok(c, date)]
+            else:
+                # 非复核日 / 关闭换股: 不补入新标的, 空槽留现金 (调仓仍在存量持仓内进行)
+                selected = []
             candidates = selected[:need_fill]
 
             # 对 sell_codes 也清理 _target_weights (可能已在上一步清)
