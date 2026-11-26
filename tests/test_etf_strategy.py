@@ -191,5 +191,43 @@ class TestFundSplitAdjust(unittest.TestCase):
         self.assertAlmostEqual(out["close"].iloc[0], close[0], places=9)
 
 
+class TestMa30ExitConfirm(unittest.TestCase):
+    """v15: 趋势止损确认周数 (默认 2, 1=原单周口径)"""
+
+    @staticmethod
+    def _strategy(confirm):
+        s = MarketCapStrategy(pool_type="etf",
+                              ma30_exit_confirm_weeks=confirm)
+        return s
+
+    def test_single_weak_week_not_confirmed(self):
+        """只有本周走弱 → 确认 2 周时不清仓"""
+        s = self._strategy(2)
+        weak = {pd.Timestamp("2024-06-07")}
+        s._ma30_weak_at = lambda code, d: pd.Timestamp(d).normalize() in weak
+        self.assertFalse(s._ma30_is_decreasing("sh513100", pd.Timestamp("2024-06-07")))
+
+    def test_two_consecutive_weeks_confirmed(self):
+        """连续两周走弱 → 清仓"""
+        s = self._strategy(2)
+        weak = {pd.Timestamp("2024-06-07"), pd.Timestamp("2024-06-14")}
+        s._ma30_weak_at = lambda code, d: pd.Timestamp(d).normalize() in weak
+        self.assertTrue(s._ma30_is_decreasing("sh513100", pd.Timestamp("2024-06-14")))
+
+    def test_confirm_one_keeps_v14_behavior(self):
+        """确认 1 周 = 原行为: 本周走弱即清仓"""
+        s = self._strategy(1)
+        weak = {pd.Timestamp("2024-06-07")}
+        s._ma30_weak_at = lambda code, d: pd.Timestamp(d).normalize() in weak
+        self.assertTrue(s._ma30_is_decreasing("sh513100", pd.Timestamp("2024-06-07")))
+
+    def test_interrupted_week_breaks_confirmation(self):
+        """中间某周未走弱 → 不确认 (只认连续)"""
+        s = self._strategy(3)
+        weak = {pd.Timestamp("2024-06-14"), pd.Timestamp("2024-05-31")}
+        s._ma30_weak_at = lambda code, d: pd.Timestamp(d).normalize() in weak
+        self.assertFalse(s._ma30_is_decreasing("sh513100", pd.Timestamp("2024-06-14")))
+
+
 if __name__ == "__main__":
     unittest.main()

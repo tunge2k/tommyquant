@@ -2209,6 +2209,7 @@ class MarketCapStrategy(BaseStrategy):
                  exclude_nonop_profit=True, exclude_no_dividend=True,
                  dividend_years=3, ma30_lookback=5, universe=None,
                  ma30_exit=True, ma30_entry_weeks=1,
+                 ma30_exit_confirm_weeks=1,
                  rebalance_mode="deviation", rank_buffer=2,
                  rank_swap=True,
                  check_freq="daily",
@@ -2265,6 +2266,9 @@ class MarketCapStrategy(BaseStrategy):
         self.dividend_years = int(dividend_years)
         self.ma30_lookback = int(ma30_lookback)  # 周K线 MA30 斜率判断回看周数
         self.ma30_exit = bool(ma30_exit)         # 周K线 MA30 拐头向下是否清仓换出
+        # 止损确认周数 (ETF 默认 2): MA30 走弱需连续 N 个已完成周成立才清仓,
+        # 过滤长牛中的单周假摔 (1=原行为, 单周即卖)
+        self.ma30_exit_confirm_weeks = max(1, int(ma30_exit_confirm_weeks or 1))
         # 建仓趋势确认: 周K MA30 需连续 N 周上升 (0=关闭), 避免刚建仓就遇 MA30 走弱
         self.ma30_entry_weeks = int(ma30_entry_weeks)
         # 调仓方式: deviation=偏离度再平衡 (旧逻辑); topk_drop=排名缓冲 (借 Qlib Topk-Drop)
@@ -2465,12 +2469,21 @@ class MarketCapStrategy(BaseStrategy):
         return wk.values if len(wk) >= 30 else None
 
     def _ma30_is_decreasing(self, code, date) -> bool:
+        """周K线 MA30 走弱 (趋势止损): 需连续 N 个确认周成立, N=ma30_exit_confirm_weeks
+
+        单周口径 (N=1) 在长牛中会被单周假摔反复打出止损; N>=2 时要求
+        「当前周 + 往前 N-1 周」的 MA30 斜率全部走弱才清仓, 以整周为粒度回看,
+        不引入日内噪声。任一周数据不足 → False (不做判断), 与原有口径一致。
         """
-        判断标的 周K线 MA30 是否在减小 (趋势走弱):
-        取 周线 MA30(t) 与 MA30(t - ma30_lookback) 对比,
-        若 MA30(t) <= MA30(t - lookback) → True (在减小)
-        数据不足 → False (不做判断)
-        """
+        confirm = int(getattr(self, "ma30_exit_confirm_weeks", 1) or 1)
+        for k in range(max(1, confirm)):
+            d = date if k == 0 else pd.Timestamp(date) - pd.Timedelta(weeks=k)
+            if not self._ma30_weak_at(code, d):
+                return False
+        return True
+
+    def _ma30_weak_at(self, code, date) -> bool:
+        """单个时点 周K线 MA30 是否在减小 (数据不足 → False, 不做判断)"""
         if self._ma30_cache is not None or self.feat:
             up = ma30_slope_up(self._ensure_ma30_cache(), code, date,
                                completed_only=self.pool_type == "etf")
