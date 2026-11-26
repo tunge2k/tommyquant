@@ -467,6 +467,19 @@ class Ma30CacheTest(unittest.TestCase):
             checked += 1
         self.assertGreater(checked, 100)
 
+    def test_completed_only_ignores_unfinished_week(self):
+        rnd = np.random.default_rng(11)
+        dates = pd.bdate_range("2019-01-01", "2022-12-31")
+        closes = 10 * np.exp(np.cumsum(rnd.normal(0, 0.03, len(dates))))
+        df = pd.DataFrame({"date": dates, "close": closes})
+        cache = be.build_ma30_cache({"sh513100": df}, lookback=5)
+        for d in dates[900:]:
+            wk = df[df["date"] <= d].set_index("date")["close"].resample("W-FRI").last().dropna()
+            wk = wk[wk.index <= d]
+            expected = None if len(wk) < 35 else bool(wk[-30:].mean() > wk[-35:-5].mean())
+            self.assertEqual(expected, be.ma30_slope_up(
+                cache, "sh513100", d, completed_only=True), f"date={str(d)[:10]}")
+
 
 class EtfRebalanceCompletenessTest(unittest.TestCase):
     """ETF + topk_drop 无固定池时也必须做偏离度调仓 (否则 3 年只剩 3 条记录)"""

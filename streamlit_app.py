@@ -1699,8 +1699,9 @@ BT_PARAM_DEFAULTS = {
     "mc_ex_nodiv": True, "mc_div_years": 3,
     "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_rank_swap": False,
     # ETF 策略 (池选品: 动量排名 + 流动性/趋势门槛, 无财务/分红参数)
-    "etf_mom_days": 60, "etf_min_amount": 0.5, "etf_min_history": 120,
-    "etf_weight_frac": 0.75, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
+    "etf_top_n": 2,
+    "etf_mom_days": 60, "etf_min_amount": 0.01, "etf_min_history": 120,
+    "etf_weight_frac": 0.95, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
     "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
     "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_rank_swap": False,
     "etf_check_freq": "weekly",
@@ -1710,7 +1711,7 @@ BT_PARAM_DEFAULTS = {
     "etf_premium_cap": 0.0, "etf_flow_on": True, "etf_flow_min": -3.0,
     "etf_mkt_flow_guard": False, "etf_mkt_flow_days": 5,
     # 绝对动量过滤 (池选品时的强弱过滤): 60日涨幅 < 阈值则不买/强制卖出
-    "etf_abs_mom_days": 60, "etf_abs_mom_min": 3.0,
+    "etf_abs_mom_days": 60, "etf_abs_mom_min": 0.0,
     # ETF 优质标的过滤 (中长期向上趋势 + 低回撤, 对标纳指科技ETF 159509 周K形态)
     "etf_max_dd_th": 30, "etf_ma60_up": True,
     "etf_ret20_min": 0, "etf_ret60_min": 0,
@@ -1756,6 +1757,16 @@ def _load_bt_settings():
     _mdd = saved.get("etf_max_dd_th")
     if isinstance(_mdd, (int, float)) and _mdd < 1:
         saved["etf_max_dd_th"] = int(round(_mdd * 100))
+    # 2026-11-26 均衡方案默认值迁移: 仅替换上一版默认值, 保留用户自定义值
+    if "etf_top_n" not in saved:
+        saved["etf_top_n"] = 2
+        if saved.get("etf_abs_mom_min", 3.0) == 3.0:
+            saved["etf_abs_mom_min"] = 0.0
+        if saved.get("etf_weight_frac", 0.75) == 0.75:
+            saved["etf_weight_frac"] = 0.95
+    # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
+    if saved.get("etf_min_amount", 0.01) == 0.5:
+        saved["etf_min_amount"] = 0.01
     for k in _BT_PERSIST_KEYS:
         if k in saved:
             st.session_state[k] = saved[k]
@@ -1800,7 +1811,8 @@ _APPLY_KEYS = {
                  "etf_premium_cap", "etf_flow_on", "etf_flow_min",
                  "etf_mkt_flow_guard", "etf_mkt_flow_days",
                  "etf_max_dd_th", "etf_ma60_up",
-                 "etf_ret20_min", "etf_ret60_min", "etf_overseas_only"),
+                 "etf_ret20_min", "etf_ret60_min", "etf_overseas_only",
+                 "etf_abs_mom_days", "etf_abs_mom_min"),
 }
 
 # 函数式策略: 引擎参数名 -> 界面 session_state 键
@@ -1971,7 +1983,7 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-BACKTEST_LOGIC_VERSION = 12  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+BACKTEST_LOGIC_VERSION = 14  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
 # v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
 # v8: ETF 启用 Topk-Drop 排名换出；ETF 上涨不再因 +4% 削赢（仅下跌补仓 / 权重偏离≥5%）
 # v9: ETF 绝对动量阈值默认 0% → 3%（top_n=5, 2024-01~2026-11: 收益 +22.0%→+53.8%,
@@ -1980,6 +1992,9 @@ BACKTEST_LOGIC_VERSION = 12  # 回测/调仓逻辑有实质变更时 +1, 使旧�
 # v11: ETF 数据改后复权（份额折算+分红）；ETF 选品池限定跨境(外盘)并剔除港股系
 # v12: 排名跌出换股默认关闭 (rank_swap=False): 仅持仓数 < top_n 时补位, 不再频繁换股;
 #      关闭时股票仍走偏离度调仓 (低买高卖 ±4% / ≥5% 权重)
+# v13: ETF 多周期动量排名 + 止损后趋势修复快速再入场; 默认关闭绝对动量、95%仓位、持有2只
+# v14: ETF 止损/再入场改用完整周K (周五确认本周); 再入场同时豁免 MA60/回撤/动量等新建仓过滤;
+#      补位目标市值覆盖存量与候选 (等权); 历史周数不足按放行处理; ETF 流动性门槛默认 0.01 亿
 
 
 def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict:
@@ -2021,7 +2036,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
         p.update({
             "pool_type": "etf",
             "universe": None,
-            "top_n": int(top),
+            "top_n": int(ss.get("etf_top_n", 2)),
             "etf_mom_days": int(ss["etf_mom_days"]),
             "etf_min_amount": float(ss["etf_min_amount"]),
             "etf_min_history": int(ss["etf_min_history"]),
@@ -2041,7 +2056,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "etf_mkt_flow_guard": bool(ss["etf_mkt_flow_guard"]),
             "etf_mkt_flow_days": int(ss["etf_mkt_flow_days"]),
             "etf_abs_mom_days": int(ss.get("etf_abs_mom_days", 60)),
-            "etf_abs_mom_min": float(ss.get("etf_abs_mom_min", 3.0)),
+            "etf_abs_mom_min": float(ss.get("etf_abs_mom_min", 0.0)),
             "etf_max_dd_threshold": float(ss.get("etf_max_dd_th", 30)) / 100.0,
             "etf_require_ma60_up": bool(ss.get("etf_ma60_up", True)),
             "etf_ret20_min": float(ss.get("etf_ret20_min", 0)),
@@ -2068,7 +2083,7 @@ def _run_backtest_params(strategy_key, params, feat_data):
             universe=params.get("universe") or None,
             pool_type=params.get("pool_type", "stock"),
             etf_mom_days=params.get("etf_mom_days", 60),
-            etf_min_amount=params.get("etf_min_amount", 0.5),
+            etf_min_amount=params.get("etf_min_amount", 0.01),
             etf_min_history=params.get("etf_min_history", 120),
             cap_min=params.get("cap_min", 15.0),
             cap_max=params.get("cap_max", 200.0),
@@ -2099,6 +2114,7 @@ def _run_backtest_params(strategy_key, params, feat_data):
             etf_require_ma60_up=params.get("etf_require_ma60_up", True),
             etf_ret20_min=params.get("etf_ret20_min", 0.0),
             etf_ret60_min=params.get("etf_ret60_min", 0.0),
+            etf_overseas_only=params.get("etf_overseas_only", True),
         )
         return run_backtest(
             feat_data, mc, strategy_params={},
@@ -3370,7 +3386,7 @@ ROBUST_SCAN_PARAMS = {
         ("rank_buffer", "排名缓冲", 0, 10, 1, int, "mc_rank_buffer"),
     ],
     "ETF策略": [
-        ("etf_min_amount", "成交额下限(亿)", 0.1, 3.0, 0.1, float, "etf_min_amount"),
+        ("etf_min_amount", "成交额下限(亿)", 0.01, 3.0, 0.01, float, "etf_min_amount"),
         ("weight_fraction", "资金比例", 0.50, 1.00, 0.05, float, "etf_weight_frac"),
         ("rank_buffer", "排名缓冲", 0, 10, 1, int, "etf_rank_buffer"),
     ],
@@ -3382,11 +3398,11 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
     o = dict(overrides or {})
     if strategy_key == "ETF策略":
         return MarketCapStrategy(
-            top_n=int(o.pop("top_n", 0)) or int(ss.get("top_n", 5)),
+            top_n=int(o.pop("top_n", 0)) or int(ss.get("etf_top_n", 2)),
             pool_type="etf",
             universe=None,
             etf_mom_days=int(ss.get("etf_mom_days", 60)),
-            etf_min_amount=o.get("etf_min_amount", ss.get("etf_min_amount", 0.5)),
+            etf_min_amount=o.get("etf_min_amount", ss.get("etf_min_amount", 0.01)),
             etf_min_history=int(ss.get("etf_min_history", 120)),
             weight_fraction=o.get("weight_fraction", ss.get("etf_weight_frac", 0.95)),
             cap_change_threshold=ss.get("etf_cap_chg_th", 0.04),
@@ -3405,11 +3421,12 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
             etf_mkt_flow_guard=bool(ss.get("etf_mkt_flow_guard", False)),
             etf_mkt_flow_days=int(ss.get("etf_mkt_flow_days", 5)),
             etf_abs_mom_days=int(ss.get("etf_abs_mom_days", 60)),
-            etf_abs_mom_min=float(ss.get("etf_abs_mom_min", 3.0)),
+            etf_abs_mom_min=float(ss.get("etf_abs_mom_min", 0.0)),
             etf_max_dd_threshold=float(ss.get("etf_max_dd_th", 30)) / 100.0,
             etf_require_ma60_up=bool(ss.get("etf_ma60_up", True)),
             etf_ret20_min=float(ss.get("etf_ret20_min", 0)),
             etf_ret60_min=float(ss.get("etf_ret60_min", 0)),
+            etf_overseas_only=bool(ss.get("etf_overseas_only", True)),
         )
     top = int(o.pop("top_n", 0)) or int(ss.get("top_n", 3))
     return MarketCapStrategy(
@@ -4044,9 +4061,9 @@ elif page == "backtest":
 
     _summary_parts = [f"{initial_capital // 10000}万"]
     if strategy_choice == "ETF策略":
-        _summary_parts.append(f"{top_n}只ETF")
+        _summary_parts.append(f"{st.session_state.get('etf_top_n', 2)}只ETF")
         _summary_parts.append(
-            f"动量{st.session_state.get('etf_mom_days', 60)}日"
+            f"多周期动量({st.session_state.get('etf_mom_days', 60)}/120/250日)"
             f"·成交额≥{st.session_state.get('etf_min_amount', 0.5)}亿")
         _cap = float(st.session_state.get("etf_premium_cap", 0) or 0)
         if _cap > 0:
@@ -4090,7 +4107,8 @@ elif page == "backtest":
     # 弹窗内会重新赋值同名变量, 因此先把当前值存到 _cur_* 里当默认值,
     # 否则 value=_cur_initial 这类引用会命中未赋值的本地变量 (UnboundLocalError)
     _cur_initial = initial_capital
-    _cur_top_n = top_n
+    _cur_top_n = (st.session_state.get("etf_top_n", 2)
+                  if strategy_choice == "ETF策略" else top_n)
     _cur_hold = hold_days
     _cur_lup = limit_up_pct
 
@@ -4138,7 +4156,12 @@ elif page == "backtest":
             "初始资金(万)", min_value=10, max_value=10000,
             value=int(_cur_initial // 10000), step=10,
             format="%d", key="di_initial") * 10000
-        if strategy_choice in CLASS_STRATEGIES:
+        if strategy_choice == "ETF策略":
+            top_n = _r1[1].number_input(
+                "ETF持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
+                step=1, format="%d", key="di_etf_topn",
+                help="ETF 专用目标仓位数；止损后趋势修复可快速回补，不影响股票策略持仓数")
+        elif strategy_choice in CLASS_STRATEGIES:
             top_n = _r1[1].number_input(
                 "持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_topn",
@@ -4184,18 +4207,19 @@ elif page == "backtest":
             _num("市值上限(亿)", 50, 500, "cap_max", step=10, col=_a[1])
             st.checkbox("MA20 以上", key=_draft("require_ma20", True))
         elif strategy_choice == "ETF策略":
-            st.caption("用「动量排名 + 成交额流动性 + 周K MA30 趋势」选品；持仓数决定仓位个数，清仓后自动买入当日排名第一的标的。")
+            st.caption("用「多周期动量 + 成交额流动性 + 周K MA30 趋势」选品；新标的走四重建仓门槛，止损标的在 MA30 修复后可快速回补。")
 
             st.markdown("**① 选品**")
             _a = st.columns(2)
-            _a[0].radio("动量窗口", options=[20, 60], horizontal=True,
-                        format_func=lambda v: f"近{v}日涨幅",
-                        key=_draft("etf_mom_days", 60))
+            _a[0].radio("短期动量窗口", options=[20, 60], horizontal=True,
+                        format_func=lambda v: f"近{v}日（权重20%）",
+                        key=_draft("etf_mom_days", 60),
+                        help="排名 = 短期20% + 120日30% + 250日50%；缺失因子按可得权重归一化")
             _num("最少K线(根)", 60, 500, "etf_min_history", step=10, col=_a[1],
                  help="次新 ETF 数据不足时不参与排名。设太大会把早期上市的标的全部排除"
                       "（例如 500 根 ≈ 要求上市满 2 年，2016-2022 年多数跨境 ETF 无法入选）")
             _b = st.columns(2)
-            _num("成交额下限(亿)", 0.1, 5.0, "etf_min_amount", step=0.1, fmt="%.1f",
+            _num("成交额下限(亿)", 0.01, 5.0, "etf_min_amount", step=0.01, fmt="%.2f",
                  col=_b[0], help="近20日日均成交额，低于该值的 ETF 不参与排名。"
                                  "跨境 ETF 在 2019 年前日均成交额普遍仅 0.01-0.5 亿，"
                                  "设太高（如 >1 亿）会让早年长期空仓")
@@ -4253,7 +4277,7 @@ elif page == "backtest":
                      help="上述窗口内的净流入均值 < 0 视为风险")
 
             with st.expander("⑤ 绝对动量与优质标的过滤（高级）", expanded=False):
-                st.caption("绝对动量：近 N 日涨幅低于阈值则不买/强制卖出（0=关闭）。")
+                st.caption("绝对动量：近 N 日涨幅低于阈值则不买/强制卖出（0=关闭，默认关闭；周K MA30 止损仍保留）。")
                 _g = st.columns(2)
                 _num("动量窗口(日)", 5, 120, "etf_abs_mom_days", step=5, col=_g[0],
                      help="推荐 20/60/120")
@@ -4328,7 +4352,10 @@ elif page == "backtest":
                 if strategy_choice not in CLASS_STRATEGIES:
                     st.session_state["hold_days"] = hold_days
                     st.session_state["limit_up_pct"] = limit_up_pct
-                st.session_state["top_n"] = top_n
+                if strategy_choice == "ETF策略":
+                    st.session_state["etf_top_n"] = top_n
+                else:
+                    st.session_state["top_n"] = top_n
                 st.session_state["backtest_start"] = pd.Timestamp(_dr)
                 st.session_state["backtest_end"] = pd.Timestamp(_de)
                 for _pk in _APPLY_KEYS.get(strategy_choice, ()):
@@ -4605,7 +4632,7 @@ elif page == "picks":
         _pick_params = {
             "top_n": 50,
             "mom_days": int(st.session_state.get("etf_mom_days", 60)),
-            "min_amount": float(st.session_state.get("etf_min_amount", 0.5)),
+            "min_amount": float(st.session_state.get("etf_min_amount", 0.01)),
             "min_history": int(st.session_state.get("etf_min_history", 120)),
             "max_dd_threshold": float(st.session_state.get("etf_max_dd_th", 30)) / 100.0,
             "require_ma60_up": bool(st.session_state.get("etf_ma60_up", True)),
@@ -5100,7 +5127,7 @@ elif page == "settings":
     pc1, pc2, pc3, pc4 = st.columns(4)
     pc1.metric(t("initial_capital"), fmt_money(st.session_state['initial_capital']))
     pc2.metric(t("hold_days"), f"{st.session_state['hold_days']}{t('tian')}")
-    pc3.metric(t("top_n"), f"{st.session_state['top_n']}{t('zhi')}")
+    pc3.metric(t("top_n"), f"{st.session_state['top_n']}{t('zhi')} / ETF {st.session_state.get('etf_top_n', 2)}{t('zhi')}")
     pc4.metric(t("limit_up_pct"), f"{st.session_state['limit_up_pct']}%")
     st.caption(f"{t('dash_range')}: {st.session_state['backtest_start']} ~ {st.session_state['backtest_end']}")
 

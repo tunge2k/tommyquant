@@ -12,6 +12,7 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -73,6 +74,42 @@ class TestEtfFilters(unittest.TestCase):
                                       min_amount=0.5, min_history=120,
                                       ma30_up_only=False)
         self.assertEqual(out, ["sz159915", "sh510300"])
+
+    def test_crosssection_allows_insufficient_ma30_history(self):
+        feat, last = _make_feat(n=160)  # 满足120根日K, 但不足35根周K
+        cs = BarIndex(feat).snapshot(last)
+        cache = be.build_ma30_cache(feat, 5)
+        out = be._filter_etf_universe(
+            cs, feat=feat, date=last, min_amount=0.5, min_history=120,
+            ma30_up_only=True, ma30_entry_weeks=2, ma30_cache=cache)
+        self.assertEqual(out, ["sz159915", "sh510300"])
+
+    def test_multi_period_momentum_prefers_long_term_strength(self):
+        snap = {
+            "sh510300": {"amount_ma20": 5e8, "ret_60": 30.0,
+                         "ret_120": 5.0, "ret_250": 5.0},
+            "sh513100": {"amount_ma20": 5e8, "ret_60": 10.0,
+                         "ret_120": 20.0, "ret_250": 30.0},
+        }
+        out = be._filter_etf_universe(snap, mom_days=60, min_amount=0.5,
+                                      ma30_up_only=False)
+        self.assertEqual(out, ["sh513100", "sh510300"])
+
+    def test_stopped_etf_can_reenter_without_new_entry_gates(self):
+        snap = {
+            "sh513100": {"amount_ma20": 5e8, "ret_20": -5.0, "ret_60": -10.0,
+                         "above_ma60": 0, "ma60_slope": -0.01, "max_dd_250": -0.4},
+            "sh513500": {"amount_ma20": 5e8, "ret_20": 5.0, "ret_60": 8.0,
+                         "above_ma60": 1, "ma60_slope": 0.01, "max_dd_250": -0.1},
+        }
+        cache = {"sh513100": object(), "sh513500": object()}
+        with (mock.patch.object(be, "ma30_slope_up", return_value=True),
+              mock.patch.object(be, "ma30_rising_weeks", return_value=False),
+              mock.patch.object(be, "_entry_confirm_ok", return_value=False)):
+            out = be._filter_etf_universe(
+                snap, date="2026-11-26", ma30_cache=cache, ma30_entry_weeks=2,
+                reentry_codes={"sh513100"}, min_amount=0.5)
+        self.assertEqual(out, ["sh513100"])
 
     def test_stock_pool_excludes_etf(self):
         snap = {

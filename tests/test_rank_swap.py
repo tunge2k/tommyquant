@@ -119,6 +119,25 @@ class RankSwapDisabledTest(unittest.TestCase):
         # 不得把存量持仓因排名换股卖掉
         self.assertNotIn("sh600001", sig.sells if sig else [])
 
+    def test_refill_rebalances_overweight_existing_position(self):
+        """补位时存量重仓须同步卖回等权, 释放新标的建仓资金"""
+        strat = self._strat(top_n=2)
+        strat.portfolio = FakePortfolio(
+            cash=50000, positions={"sh600001": position(15000)}, total_value=200000.0)
+        strat.bars = FakeBars({
+            ("sh600001", DATE): {"close": 10.0, "cap_yi": 20.0},
+            ("sh600002", DATE): {"close": 10.0, "cap_yi": 30.0},
+        })
+        strat._target_weights = {"sh600001": 1.0}
+        strat._entry_prices = {"sh600001": 10.0}
+        with mock.patch.object(be, "_filter_market_cap_universe",
+                               return_value=["sh600001", "sh600002"]):
+            sig = strat.on_bar(MarketBarEvent(DATE, {"sh600001": {}}, strat.bars))
+        orders = orders_of(sig)
+        self.assertEqual([(o.code, o.direction, o.quantity) for o in orders],
+                         [("sh600001", "sell", 7500), ("sh600002", "buy", 7500)])
+        self.assertNotIn("sh600001", sig.sells)  # 等权调仓, 不是排名换出
+
     def test_rank_drop_still_sells_when_enabled(self):
         """rank_swap=True (勾选) → 恢复排名跌出换股, 保证开关双向有效"""
         strat = self._strat(rank_swap=True)

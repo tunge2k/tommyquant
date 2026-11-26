@@ -1262,8 +1262,8 @@ def load_all_bars() -> dict[str, pd.DataFrame]:
 
 # ==================== 因子缓存 (磁盘, 避免每次重启重算 80 秒) ====================
 FEAT_CACHE_PATH = os.path.join(DATA_DIR, "feat_cache.pkl")
-FEAT_CACHE_VERSION = 5      # 因子口径变更时 +1 (v3: ETF 份额折算复权; v4: max_dd_250 改单层rolling,
-                            # v5: ETF 改后复权 (叠加分红除息事件))
+FEAT_CACHE_VERSION = 6      # 因子口径变更时 +1 (v3: ETF 份额折算复权; v4: max_dd_250 改单层rolling,
+                            # v5: ETF 改后复权 (叠加分红除息事件); v6: 新增 ret_120/ret_250)
 
 
 def load_feat_cached(fingerprint: str = None) -> dict:
