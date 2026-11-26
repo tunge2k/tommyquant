@@ -229,5 +229,96 @@ class TestMa30ExitConfirm(unittest.TestCase):
         self.assertFalse(s._ma30_is_decreasing("sh513100", pd.Timestamp("2024-06-14")))
 
 
+class TestMa30ExitBelow(unittest.TestCase):
+    """v16: 止损还要求收盘跌破周 MA30 (价格未失守趋势线不清仓)"""
+
+    @staticmethod
+    def _strategy(below):
+        s = MarketCapStrategy(pool_type="etf", ma30_exit_below=below)
+        s.feat = {"sh513100": pd.DataFrame(
+            {"date": pd.bdate_range("2024-01-02", periods=5)})}
+        return s
+
+    def test_price_above_ma30_blocks_exit(self):
+        """MA30 走弱但价格仍在 MA30 上方 → 不清仓"""
+        s = self._strategy(True)
+        with mock.patch.object(be, "ma30_slope_up", return_value=False), \
+                mock.patch.object(be, "ma30_close_below", return_value=False):
+            self.assertFalse(s._ma30_weak_at("sh513100", pd.Timestamp("2024-06-07")))
+
+    def test_price_below_ma30_confirms_exit(self):
+        s = self._strategy(True)
+        with mock.patch.object(be, "ma30_slope_up", return_value=False), \
+                mock.patch.object(be, "ma30_close_below", return_value=True):
+            self.assertTrue(s._ma30_weak_at("sh513100", pd.Timestamp("2024-06-07")))
+
+    def test_default_ignores_price(self):
+        """未开启时只看 MA30 斜率 (旧行为)"""
+        s = self._strategy(False)
+        with mock.patch.object(be, "ma30_slope_up", return_value=False):
+            self.assertTrue(s._ma30_weak_at("sh513100", pd.Timestamp("2024-06-07")))
+
+
+def _weekly_cache(closes):
+    """构造 build_ma30_cache 同结构的周线缓存 (completed_only 只用到这几个字段)"""
+    n = len(closes)
+    idx = pd.date_range("2020-01-03", periods=n, freq="W-FRI")
+    vals = np.asarray(closes, dtype=float)
+    ma30 = pd.Series(vals).rolling(30).mean().to_numpy()
+    return {"X": {"wk_idx": idx.values, "ma30": ma30, "w_close": vals,
+                  "prefix": np.concatenate(([0.0], np.cumsum(vals))),
+                  "dates": idx.values, "closes": vals, "lb": 5}}
+
+
+class TestMa30PriceAbove(unittest.TestCase):
+    """v16: 周K收盘 vs 周 MA30 的判定 (再入场价格口径)"""
+
+    def test_close_above_ma30(self):
+        cache = _weekly_cache([1.0] * 31 + [2.0])
+        last = pd.Timestamp(cache["X"]["wk_idx"][-1])
+        self.assertTrue(be.ma30_price_above(cache, "X", last, completed_only=True))
+        self.assertFalse(be.ma30_close_below(cache, "X", last, completed_only=True))
+
+    def test_close_below_ma30(self):
+        cache = _weekly_cache([1.0] * 31 + [0.5])
+        last = pd.Timestamp(cache["X"]["wk_idx"][-1])
+        self.assertFalse(be.ma30_price_above(cache, "X", last, completed_only=True))
+        self.assertTrue(be.ma30_close_below(cache, "X", last, completed_only=True))
+
+    def test_insufficient_history_returns_none(self):
+        cache = _weekly_cache([1.0] * 20)
+        last = pd.Timestamp(cache["X"]["wk_idx"][-1])
+        self.assertIsNone(be.ma30_price_above(cache, "X", last, completed_only=True))
+
+
+class TestReentryPriority(unittest.TestCase):
+    """v16: 止损后再入场优先回补原标的 / 不买替代标的"""
+
+    def test_reentry_codes_moved_to_front(self):
+        s = MarketCapStrategy(pool_type="etf", etf_reentry_priority=True)
+        s._reentry_codes = {"sh513100"}
+        out = s._prioritize_reentry(["sh513500", "sh513100", "sz159612"])
+        self.assertEqual(out, ["sh513100", "sh513500", "sz159612"])
+
+    def test_priority_disabled_keeps_order(self):
+        s = MarketCapStrategy(pool_type="etf", etf_reentry_priority=False)
+        s._reentry_codes = {"sh513100"}
+        codes = ["sh513500", "sh513100"]
+        self.assertEqual(s._prioritize_reentry(codes), codes)
+
+    def test_no_standin_blocks_other_targets(self):
+        """etf_standin=False: 待回补原标的期间, 只允许买入原标的"""
+        s = MarketCapStrategy(pool_type="etf", etf_standin=False)
+        self.assertTrue(s._allow_candidate("sh513100"))   # 无待回补 → 允许
+        s._reentry_codes = {"sh513100"}
+        self.assertTrue(s._allow_candidate("sh513100"))
+        self.assertFalse(s._allow_candidate("sh513500"))
+
+    def test_standin_allows_other_targets(self):
+        s = MarketCapStrategy(pool_type="etf", etf_standin=True)
+        s._reentry_codes = {"sh513100"}
+        self.assertTrue(s._allow_candidate("sh513500"))
+
+
 if __name__ == "__main__":
     unittest.main()

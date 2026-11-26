@@ -992,6 +992,54 @@ def ma30_rising_weeks(cache: dict, code: str, date, weeks: int) -> bool | None:
     return True
 
 
+def ma30_price_above(cache: dict, code: str, date,
+                     completed_only: bool = False) -> bool | None:
+    """周K收盘价是否站上同周 MA30; None = 数据不足, 不做判断
+
+    completed_only=True 时只用已走完的周 (与 ma30_slope_up 的 completed_only 同义)。
+    用于「趋势修复」判定: 价格重新站上周 MA30 比「MA30 斜率转正」更早确认反弹。
+    """
+    item = cache.get(code) if cache else None
+    if item is None or date is None:
+        return None
+    d = pd.Timestamp(date).to_datetime64()
+    wk_idx = item["wk_idx"]
+    ma30 = item["ma30"]
+    w_close = item.get("w_close")
+    if w_close is None:
+        return None
+    if completed_only:
+        i = int(np.searchsorted(wk_idx, d, side="right")) - 1
+        if i < 29:
+            return None
+        ma, px = ma30[i], w_close[i]
+        if not (np.isfinite(ma) and np.isfinite(px)):
+            return None
+        return bool(px > ma)
+    i = int(np.searchsorted(wk_idx, d, side="left"))
+    nwk = len(wk_idx)
+    if i >= nwk:                     # 当日之后无行情 → 用最后一个完整周
+        i = nwk - 1
+    if i < 29:
+        return None
+    ma = ma30[i]
+    # 未走完的一周用当日收盘补齐 (与 ma30_slope_up 口径一致)
+    di = int(np.searchsorted(item["dates"], d, side="right")) - 1
+    if di < 0:
+        return None
+    px = item["closes"][di]
+    if not (np.isfinite(ma) and np.isfinite(px)):
+        return None
+    return bool(px > ma)
+
+
+def ma30_close_below(cache: dict, code: str, date,
+                     completed_only: bool = False) -> bool | None:
+    """周K收盘价是否跌破同周 MA30 (与 ma30_price_above 互为反向, 数据不足返回 None)"""
+    r = ma30_price_above(cache, code, date, completed_only=completed_only)
+    return None if r is None else (not r)
+
+
 def weekly_bull_weeks(cache: dict, code: str, date, weeks: int = 2) -> bool | None:
     """最近 weeks 个「已走完的周」是否都是阳线 (周收盘 > 周开盘)
 
@@ -1166,7 +1214,8 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
                                 ret20_min: float = 0.0,
                                 ret60_min: float = 0.0,
                                 overseas_only: bool = False,
-                                reentry_codes=None) -> list:
+                                reentry_codes=None,
+                                reentry_price_mode: bool = False) -> list:
     """
     标的池过滤 (股票池 / ETF 池共用入口, pool_type 分流):
     - stock: 市值区间 + 上市年限 + 财务/分红剔除 + 周K MA30 上升, 按市值升序
@@ -1187,7 +1236,8 @@ def _filter_market_cap_universe(snap, feat: dict = None, date=None,
             premium_cap=premium_cap, flow_min=flow_min, market_ok=market_ok,
             max_dd_threshold=max_dd_threshold, require_ma60_up=require_ma60_up,
             ret20_min=ret20_min, ret60_min=ret60_min,
-            overseas_only=overseas_only, reentry_codes=reentry_codes)
+            overseas_only=overseas_only, reentry_codes=reentry_codes,
+            reentry_price_mode=reentry_price_mode)
 
     # --- CrossSection 向量化快路径 ---
     if isinstance(snap, CrossSection):
@@ -1342,7 +1392,8 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
                          ret20_min: float = 0.0,
                          ret60_min: float = 0.0,
                          overseas_only: bool = False,
-                         reentry_codes=None) -> list:
+                         reentry_codes=None,
+                         reentry_price_mode: bool = False) -> list:
     """ETF 池筛选: 中长期向上趋势 + 低回撤 + 多周期动量排名
 
     排名权重: 短期(20/60日) 20% + 120日 30% + 250日 50%, 缺失因子按可得权重归一化。
@@ -1428,8 +1479,14 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
             if strict_mat is not None and 0 <= snap._i < strict_mat.shape[0]:
                 ma30_ok = strict_mat[snap._i, snap._jmask]
                 if reentry_codes:
-                    reentry_mat = _get_ma30_up_matrix(
-                        snap._bar_index, ma30_cache, ma30_lookback, 0, completed_only=True)
+                    if reentry_price_mode:
+                        # 价格口径: 收盘重新站上周 MA30 即视为趋势修复
+                        reentry_mat = _get_ma30_price_matrix(
+                            snap._bar_index, ma30_cache, completed_only=True)
+                    else:
+                        reentry_mat = _get_ma30_up_matrix(
+                            snap._bar_index, ma30_cache, ma30_lookback, 0,
+                            completed_only=True)
                     if reentry_mat is not None:
                         is_reentry = np.array([c in reentry_codes for c in codes], dtype=bool)
                         ma30_ok = np.where(is_reentry, reentry_mat[snap._i, snap._jmask], ma30_ok)
@@ -1504,8 +1561,12 @@ def _filter_etf_universe(snap, feat: dict = None, date=None,
                 continue
         is_reentry = code in reentry_codes
         if ma30_up_only and ma30_cache is not None and date is not None:
-            if ma30_slope_up(ma30_cache, code, date,
-                             completed_only=is_reentry) is False:
+            if is_reentry and reentry_price_mode:
+                if ma30_price_above(ma30_cache, code, date,
+                                    completed_only=True) is False:
+                    continue
+            elif ma30_slope_up(ma30_cache, code, date,
+                               completed_only=is_reentry) is False:
                 continue
             if not is_reentry and ma30_entry_weeks and ma30_rising_weeks(
                     ma30_cache, code, date, ma30_entry_weeks) is False:
@@ -1651,6 +1712,43 @@ def _get_ma30_up_matrix(bar_index, ma30_cache, lookback,
 
         mat[:, j] = mask_j | ~known if allow_insufficient else mask_j
 
+    setattr(bar_index, cache_attr, mat)
+    return mat
+
+
+def _get_ma30_price_matrix(bar_index, ma30_cache,
+                           completed_only: bool = True) -> np.ndarray | None:
+    """预构建 [D, N] 布尔矩阵: 当日(或已走完的最近一周)周收盘是否站上周 MA30
+
+    与 ma30_price_above 同口径, 供 ETF 池向量化路径判断「止损后再入场」。
+    """
+    if bar_index is None:
+        return None
+    cache_attr = f"_ma30_price_mat_{int(completed_only)}"
+    mat = getattr(bar_index, cache_attr, None)
+    if mat is not None:
+        return mat
+    dates_arr = bar_index.all_dates.to_numpy(dtype="datetime64[ns]")
+    codes = bar_index._codes
+    mat = np.zeros((len(dates_arr), len(codes)), dtype=bool)
+    for j, code in enumerate(codes):
+        item = ma30_cache.get(code) if ma30_cache else None
+        if item is None:
+            continue
+        wk_idx, ma30, w_close = item["wk_idx"], item["ma30"], item.get("w_close")
+        if w_close is None:
+            continue
+        if completed_only:
+            wi = np.searchsorted(wk_idx, dates_arr, side="right") - 1
+        else:
+            wi = np.searchsorted(wk_idx, dates_arr, side="left")
+            wi = np.minimum(np.where(wi >= len(wk_idx), len(wk_idx) - 1, wi),
+                            len(wk_idx) - 1)
+        valid = wi >= 29
+        idx = np.clip(wi, 0, len(wk_idx) - 1)
+        px = w_close[idx].astype(np.float64)
+        ma = ma30[idx].astype(np.float64)
+        mat[:, j] = valid & np.isfinite(px) & np.isfinite(ma) & (px > ma)
     setattr(bar_index, cache_attr, mat)
     return mat
 
@@ -2221,7 +2319,9 @@ class MarketCapStrategy(BaseStrategy):
                  etf_abs_mom_days=60, etf_abs_mom_min=0.0,
                  etf_max_dd_threshold=0.30, etf_require_ma60_up=True,
                  etf_ret20_min=0.0, etf_ret60_min=0.0,
-                 etf_overseas_only=True):
+                 etf_overseas_only=True, etf_reentry_priority=True,
+                 etf_reentry_price=False, ma30_exit_below=False,
+                 etf_standin=True):
         self.top_n = int(top_n)
         # 标的池类型: stock=股票(市值+财务筛选) / etf=ETF(动量排名+流动性门槛)
         # 两类共用同一套建仓/调仓/撮合逻辑, 只有选品规则不同
@@ -2249,6 +2349,19 @@ class MarketCapStrategy(BaseStrategy):
         self.etf_ret60_min = float(etf_ret60_min)
         # 选品范围: 只做跨境(外盘)ETF 并剔除港股系 (恒生/港股通/H股/中概等)
         self.etf_overseas_only = bool(etf_overseas_only)
+        # 止损后再入场优先回补原标的 (v16): 空槽补位时, 此前止损且趋势已修复的
+        # 原标的排到候选最前, 不再换成当日排名第一的新标的 → 减少标的切换损耗。
+        self.etf_reentry_priority = bool(etf_reentry_priority)
+        # 止损后再入场判定口径 (v16): False=周K MA30 斜率转正; True=收盘重新站上周 MA30。
+        # 后者在 V 型反弹里更早确认趋势修复, 缩短踏空期。
+        self.etf_reentry_price = bool(etf_reentry_price)
+        # 趋势止损额外条件 (v16): True 时除「MA30 走弱」外还要求收盘跌破周 MA30,
+        # 过滤牛市中的浅回撤假摔 (价格未破趋势线即不清仓)。
+        self.ma30_exit_below = bool(ma30_exit_below)
+        # 止损后是否允许买入「替代标的」(v16): True=按当日排名补位 (原行为);
+        # False=只回补此前止损且趋势已修复的原标的, 原标的未修复前该槽位留现金。
+        # 目的: 避免「止损换成次优标的 → 原标的修复后无槽位可回 → 永久错失」。
+        self.etf_standin = bool(etf_standin)
         self._etf_ext = None        # {premium/flow/market} 按日索引的因子字典
         self._mkt_ok = None         # {date: 市场资金流是否健康}
         # 标的池: 指定后跳过市值/财务选股, 只在这些标的内建仓与调仓 (单标的验证用)
@@ -2346,7 +2459,8 @@ class MarketCapStrategy(BaseStrategy):
                       ret20_min=self.etf_ret20_min,
                       ret60_min=self.etf_ret60_min,
                       overseas_only=self.etf_overseas_only,
-                      reentry_codes=self._reentry_codes)
+                      reentry_codes=self._reentry_codes,
+                      reentry_price_mode=self.etf_reentry_price)
             # 溢价/资金流/市场风控: 仅有增强数据时才参与, 否则保持原行为
             if (self.etf_premium_cap or self.etf_flow_min is not None
                     or self.etf_mkt_flow_guard):
@@ -2426,6 +2540,33 @@ class MarketCapStrategy(BaseStrategy):
             return False
         return self._is_check_day(date)
 
+    def _prioritize_reentry(self, codes: list) -> list:
+        """止损后再入场优先回补原标的 (v16)
+
+        候选顺序决定空槽补位买谁: 原设计只按动量排名取第一个, 止损后往往换成
+        当日排名第一的另一只 ETF, 长期把最强资产 (纳指) 换掉, 是收益差距的主因。
+        这里把「此前止损且已通过趋势修复判定」的原标的排到最前, 保持原有筛选
+        口径不变, 只调整优先级。开关 etf_reentry_priority=False 时恢复旧顺序。
+        """
+        if not codes or not self.etf_reentry_priority or not self._reentry_codes:
+            return codes
+        head = [c for c in codes if c in self._reentry_codes]
+        if not head:
+            return codes
+        tail = [c for c in codes if c not in self._reentry_codes]
+        return head + tail
+
+    def _allow_candidate(self, code) -> bool:
+        """空槽补位是否允许买入该标的 (v16)
+
+        etf_standin=False 时, 只要还有「待回补的原标的」(止损集合非空), 就只允许
+        买入这些原标的本身, 不买替代标的 → 避免止损后换成次优标的、原标的修复后
+        再无槽位可回。
+        """
+        if self.etf_standin or not self._reentry_codes:
+            return True
+        return code in self._reentry_codes
+
     def _current_cap(self, code, date) -> float:
         """取标的当日市值 (亿)"""
         if self.bars is None:
@@ -2483,12 +2624,23 @@ class MarketCapStrategy(BaseStrategy):
         return True
 
     def _ma30_weak_at(self, code, date) -> bool:
-        """单个时点 周K线 MA30 是否在减小 (数据不足 → False, 不做判断)"""
+        """单个时点 周K线 MA30 是否在减小 (数据不足 → False, 不做判断)
+
+        ma30_exit_below=True 时额外要求收盘跌破同周 MA30: 只有「均线走弱 + 价格
+        失守趋势线」才算趋势破位, 避免牛市浅回撤中 MA30 斜率短暂转负就清仓。
+        """
         if self._ma30_cache is not None or self.feat:
             up = ma30_slope_up(self._ensure_ma30_cache(), code, date,
                                completed_only=self.pool_type == "etf")
             if up is not None:
-                return not up
+                if up:
+                    return False
+                if getattr(self, "ma30_exit_below", False):
+                    below = ma30_close_below(self._ensure_ma30_cache(), code, date,
+                                             completed_only=self.pool_type == "etf")
+                    if below is not None:
+                        return bool(below)
+                return True
         closes = self._weekly_closes(code, date)
         if closes is None:
             return False
@@ -2670,7 +2822,9 @@ class MarketCapStrategy(BaseStrategy):
                 candidates = [c for c in ranked
                               if c not in portfolio.positions and c not in sell_codes
                               and (regular_rank_ok or c in self._reentry_codes)
-                              and self._abs_mom_ok(c, date)][:need_fill]
+                              and self._allow_candidate(c)
+                              and self._abs_mom_ok(c, date)]
+                candidates = self._prioritize_reentry(candidates)[:need_fill]
                 if candidates:
                     # 按实际持仓数(remaining+candidates)均分目标仓位,
                     # 避免候选不足 n_slots 时每只只分到 1/n_slots 导致总仓位不足
@@ -2723,7 +2877,9 @@ class MarketCapStrategy(BaseStrategy):
                 selected = [c for c in selected
                             if c not in portfolio.positions and c not in sell_codes
                             and (regular_rank_ok or c in self._reentry_codes)
+                            and self._allow_candidate(c)
                             and self._abs_mom_ok(c, date)]
+                selected = self._prioritize_reentry(selected)
             else:
                 # 非复核日 / 关闭换股: 不补入新标的, 空槽留现金 (调仓仍在存量持仓内进行)
                 selected = []

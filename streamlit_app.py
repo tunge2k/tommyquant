@@ -1699,12 +1699,16 @@ BT_PARAM_DEFAULTS = {
     "mc_ex_nodiv": True, "mc_div_years": 3,
     "mc_rank_buffer": 2, "mc_rebal_mode": "topk_drop", "mc_rank_swap": False,
     # ETF 策略 (池选品: 动量排名 + 流动性/趋势门槛, 无财务/分红参数)
-    "etf_top_n": 2,
+    "etf_top_n": 1,
     "etf_mom_days": 60, "etf_min_amount": 0.01, "etf_min_history": 120,
-    "etf_weight_frac": 0.95, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
-    "etf_ma30_lookback": 5, "etf_ma30_exit": True, "etf_entry_weeks": 2,
-    # MA30 止损确认周数: 2=连续两周走弱才清仓, 过滤长牛单周假摔 (1=旧行为)
-    "etf_ma30_exit_confirm": 2,
+    "etf_weight_frac": 1.0, "etf_cap_chg_th": 0.04, "etf_rebal_th": 0.05,
+    "etf_ma30_lookback": 8, "etf_ma30_exit": True, "etf_entry_weeks": 2,
+    # MA30 止损确认周数: 连续 N 周走弱才清仓, 过滤长牛单周假摔 (1=旧行为)
+    "etf_ma30_exit_confirm": 3,
+    # v16: 止损还要求收盘跌破周 MA30 (价格未失守趋势线不清仓)
+    "etf_ma30_exit_below": True,
+    # v16: 止损后只回补原标的, 原标的未修复前该槽位留现金 (不买替代标的)
+    "etf_standin": False,
     "etf_rank_buffer": 5, "etf_rebal_mode": "topk_drop", "etf_rank_swap": False,
     "etf_check_freq": "weekly",
     # 换股/补位复核周期: weekly/monthly/quarterly/yearly/off (默认每年, 降低换手)
@@ -1766,6 +1770,15 @@ def _load_bt_settings():
             saved["etf_abs_mom_min"] = 0.0
         if saved.get("etf_weight_frac", 0.75) == 0.75:
             saved["etf_weight_frac"] = 0.95
+    # v16 迁移: 把上一版默认值 (2只/95%/回看5周/确认2周) 升到新默认
+    if saved.get("etf_top_n") == 2:
+        saved["etf_top_n"] = 1
+    if saved.get("etf_weight_frac") == 0.95:
+        saved["etf_weight_frac"] = 1.0
+    if saved.get("etf_ma30_lookback") == 5:
+        saved["etf_ma30_lookback"] = 8
+    if saved.get("etf_ma30_exit_confirm") in (1, 2):
+        saved["etf_ma30_exit_confirm"] = 3
     # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
     if saved.get("etf_min_amount", 0.01) == 0.5:
         saved["etf_min_amount"] = 0.01
@@ -1810,6 +1823,7 @@ _APPLY_KEYS = {
                  "etf_check_freq", "etf_rank_check_freq",
                  "etf_cap_chg_th", "etf_rebal_th", "etf_ma30_exit",
                  "etf_ma30_lookback", "etf_entry_weeks", "etf_ma30_exit_confirm",
+                 "etf_ma30_exit_below", "etf_standin",
                  "etf_premium_cap", "etf_flow_on", "etf_flow_min",
                  "etf_mkt_flow_guard", "etf_mkt_flow_days",
                  "etf_max_dd_th", "etf_ma60_up",
@@ -1985,7 +1999,7 @@ def _cost_str() -> str:
             f"|limit:{int(lr['enforce'])}{int(lr['strict_open'])}{int(lr['use_st'])}")
 
 
-BACKTEST_LOGIC_VERSION = 15  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
+BACKTEST_LOGIC_VERSION = 16  # 回测/调仓逻辑有实质变更时 +1, 使旧缓存失效
 # v15: ETF 趋势止损加确认周数 (etf_ma30_exit_confirm 默认 2): MA30 走弱需连续 2 个
 #      已完成周成立才清仓, 过滤长牛中的单周假摔; 1 = 原 v14 行为
 # v7: 取消「标的列表」，改由「持仓数」决定仓位数；清仓当日即按当日排名补位
@@ -2050,7 +2064,9 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "ma30_lookback": int(ss["etf_ma30_lookback"]),
             "ma30_exit": bool(ss["etf_ma30_exit"]),
             "ma30_entry_weeks": int(ss["etf_entry_weeks"]),
-            "ma30_exit_confirm_weeks": int(ss.get("etf_ma30_exit_confirm", 2)),
+            "ma30_exit_confirm_weeks": int(ss.get("etf_ma30_exit_confirm", 3)),
+            "ma30_exit_below": bool(ss.get("etf_ma30_exit_below", True)),
+            "etf_standin": bool(ss.get("etf_standin", False)),
             "rebalance_mode": str(ss["etf_rebal_mode"]),
             "rank_buffer": int(ss["etf_rank_buffer"]),
             "rank_swap": bool(ss.get("etf_rank_swap", False)),
@@ -2104,6 +2120,9 @@ def _run_backtest_params(strategy_key, params, feat_data):
             ma30_lookback=params["ma30_lookback"],
             ma30_exit=params["ma30_exit"],
             ma30_entry_weeks=params["ma30_entry_weeks"],
+            ma30_exit_confirm_weeks=params.get("ma30_exit_confirm_weeks", 1),
+            ma30_exit_below=params.get("ma30_exit_below", False),
+            etf_standin=params.get("etf_standin", True),
             rebalance_mode=params["rebalance_mode"],
             rank_buffer=params["rank_buffer"],
             rank_swap=params.get("rank_swap", True),
@@ -3412,10 +3431,12 @@ def _class_strategy_from_state(strategy_key, ss, overrides: dict | None = None):
             weight_fraction=o.get("weight_fraction", ss.get("etf_weight_frac", 0.95)),
             cap_change_threshold=ss.get("etf_cap_chg_th", 0.04),
             rebalance_threshold=ss.get("etf_rebal_th", 0.05),
-            ma30_lookback=ss.get("etf_ma30_lookback", 5),
+            ma30_lookback=ss.get("etf_ma30_lookback", 8),
             ma30_exit=ss.get("etf_ma30_exit", True),
             ma30_entry_weeks=ss.get("etf_entry_weeks", 2),
-            ma30_exit_confirm_weeks=int(ss.get("etf_ma30_exit_confirm", 2)),
+            ma30_exit_confirm_weeks=int(ss.get("etf_ma30_exit_confirm", 3)),
+            ma30_exit_below=bool(ss.get("etf_ma30_exit_below", True)),
+            etf_standin=bool(ss.get("etf_standin", False)),
             rebalance_mode=ss.get("etf_rebal_mode", "topk_drop"),
             rank_buffer=o.get("rank_buffer", ss.get("etf_rank_buffer", 5)),
             rank_swap=bool(ss.get("etf_rank_swap", False)),
@@ -4242,8 +4263,15 @@ elif page == "backtest":
             _num("MA30 回看(周)", 2, 15, "etf_ma30_lookback", col=_c[1])
             _num("建仓确认(周)", 0, 4, "etf_entry_weeks",
                  help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
-            _num("止损确认(周)", 1, 4, "etf_ma30_exit_confirm",
-                 help="MA30 走弱需连续 N 周成立才清仓；2=过滤长牛中的单周假摔，1=原行为（单周即卖）")
+            _num("止损确认(周)", 1, 6, "etf_ma30_exit_confirm",
+                 help="MA30 走弱需连续 N 周成立才清仓；3=过滤长牛中的单周假摔，1=原行为（单周即卖）")
+            st.checkbox("止损需跌破 MA30", key=_draft("etf_ma30_exit_below", True),
+                        help="除 MA30 走弱外还要求收盘跌破周 MA30 才清仓："
+                             "价格未失守趋势线时不清仓，过滤牛市浅回撤假摔")
+            st.checkbox("止损后只回补原标的", key=_draft("etf_standin", False),
+                        help="开启(默认)：原标的趋势修复前该仓位留现金，不买入替代标的，"
+                             "避免「止损换成次优标的、原标的修复后无槽位可回」；"
+                             "关闭则按当日排名补位买入替代标的")
 
             st.markdown("**③ 换股与调仓**")
             st.checkbox("排名跌出换股", key=_draft("etf_rank_swap", False),
