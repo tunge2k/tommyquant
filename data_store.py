@@ -454,12 +454,22 @@ def log_download(symbol, status, rows, first_date, last_date):
 
 # ==================== 数据指纹 (缓存失效依据) ====================
 
+_FP_CACHE = {"value": None, "ts": 0.0}
+
+
 def data_fingerprint() -> str:
     """数据指纹: 股票数+K线总数+最早/最新日期。数据一变, 回测/因子缓存自动失效
 
     必须包含 bars 总数: 只补某一天的数据时 last_date 可能不变 (MAX(date) 早被抬高),
     仅靠日期会让因子缓存沿用旧行情。
+
+    进程级短 TTL: Streamlit 每次交互都 rerun, 而 db_stats 在 350 万行上 COUNT(*)
+    约需 0.3~0.4s; 数据写入会调 invalidate_stats() 主动清缓存, 平时 15s 内直接命中。
     """
+    import time
+    now = time.time()
+    if _FP_CACHE["value"] is not None and now - _FP_CACHE["ts"] < 15.0:
+        return _FP_CACHE["value"]
     s = db_stats()
     # 分红事件数影响 ETF 后复权因子, 名称影响跨境/港股分类, 都必须纳入指纹
     conn = get_conn()
@@ -469,14 +479,19 @@ def data_fingerprint() -> str:
     except sqlite3.OperationalError:
         n_div = n_name = 0
     conn.close()
-    return (f"{s['symbols']}_{s['bars']}_{s['first_date']}_{s['last_date']}"
-            f"_d{n_div}_n{n_name}")
+    fp = (f"{s['symbols']}_{s['bars']}_{s['first_date']}_{s['last_date']}"
+          f"_d{n_div}_n{n_name}")
+    _FP_CACHE["value"] = fp
+    _FP_CACHE["ts"] = now
+    return fp
 
 
 def invalidate_stats():
     """写数据之后调用, 让下一次 db_stats() 重新统计"""
     _STATS_CACHE["data"] = None
     _STATS_CACHE["ts"] = 0.0
+    _FP_CACHE["value"] = None
+    _FP_CACHE["ts"] = 0.0
 
 
 # ==================== 回测结果缓存 (SQLite 持久化) ====================
