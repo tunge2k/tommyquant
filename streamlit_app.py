@@ -12,6 +12,7 @@ import os
 import json
 import sys
 import time
+import threading
 
 # DoH 兜底: NAS 路由器可能劫持 UDP 53, 系统 DNS 失败时走阿里 DoH
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +51,33 @@ def run_backtest_auto(feat, select_fn, strategy_params=None, **kwargs):
 
 
 data_store.init_db()   # 幂等建表, 防止首次启动时表不存在
+
+
+# feat 后台预热 + 指纹变更监听: feat_cache.pkl 冷读约 157s (NAS, 1.1GB / 6476 标的),
+# 放常驻守护线程在开机阶段就加载进 data_store._feat_memo; 每日盘后数据更新→指纹变化时
+# 也自动后台重载, 用户点进计算页始终命中进程 memo, 不再被冷读阻塞 2~3 分钟。
+# GIL 在 pickle 反序列化期间会周期性让渡, 首页渲染 (~0.2s) 不受明显影响。
+# 用 @st.cache_resource 包裹: Streamlit 每次 rerun 都会重跑本模块, 须保证线程只启动一次。
+def _feat_watch_loop():
+    last_fp = None
+    while True:
+        try:
+            fp = data_store.data_fingerprint()
+            if fp != last_fp:
+                data_store.load_feat_cached(fp)   # 指纹已在 memo 则瞬时返回, 否则后台加载
+                last_fp = fp
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+@st.cache_resource(show_spinner=False)
+def _start_feat_watcher() -> bool:
+    threading.Thread(target=_feat_watch_loop, name="feat-watcher", daemon=True).start()
+    return True
+
+
+_start_feat_watcher()
 
 # 研究阶段: 界面暴露「ETF策略」与「市值策略(股票)」两个入口, 共用 MarketCapStrategy 引擎
 # 顺序即界面顺序, 第一项为默认选中: ETF 在前 (2026-11-24 用户要求)

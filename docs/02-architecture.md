@@ -249,14 +249,16 @@ MarketBarEvent ──▶ Strategy.on_bar ──▶ SignalEvent ──▶ OrderEv
 
 | 层 | 位置 | 键 | 失效条件 |
 |---|---|---|---|
-| 因子内存缓存 | Streamlit 进程（`@st.cache_resource(max_entries=1)`） | 数据指纹 | 指纹变化 / 进程重启 |
+| 因子内存缓存 | `data_store._feat_memo`（进程级，Streamlit + Worker 共享；`@st.cache_resource` 为薄二级缓存） | 数据指纹 | 指纹变化 / 进程重启；开机由 `feat-watcher` 守护线程预热，指纹变化自动后台重载 |
 | 因子磁盘缓存 | `data/feat_cache.pkl` | 数据指纹 | 指纹变化 |
 | 选股矩阵磁盘缓存 | `cache/factor_matrix/<sha1>/` | `MATRIX_VER=m1` + 指纹 + 需求列 + 选股日数 | 任一变化 |
 | 回测结果缓存 | SQLite `backtest_cache` | `v14` + 策略 + 全部参数 + 成本指纹 + 数据指纹 | 任一变化 |
 | 全球市场 | 内存 + `app_settings.global_markets_cache` | 时间戳 | TTL / Worker 刷新 |
 | 基准指数 | 内存 + `app_settings.benchmark_sh000300` | 时间戳 | 24 小时 |
 
-数据指纹定义：`股票数_最早日期_最新日期`（`data_store.data_fingerprint`）。
+数据指纹定义：`股票数_K线总数_最早日期_最新日期_d{分红事件数}_n{ETF名称数}`（`data_store.data_fingerprint`，含 K 线总数与分红/名称数，避免仅补某天数据时缓存误命中）。进程内带 15s 短 TTL，数据写入由 `invalidate_stats()` 主动失效。
+
+> 性能要点：`feat_cache.pkl` 在 NAS 上约 1.1GB / 6476 标的，冷读约 157s。`_feat_memo` 用锁 + Event 保证并发只加载一次（避免惊群），`streamlit_app` 启动的 `feat-watcher` 守护线程在开机阶段即后台加载、并在盘后数据更新（指纹变化）时自动重载，使用户点击计算页始终命中内存，不被冷读阻塞。
 
 > 代码中的 `cached_backtest` 文档字符串声称存在 L1 `st.cache_data`，但当前**没有该装饰器**，实际只有 SQLite L2 与因子缓存。属于文档/实现偏差，已登记在 03 第 11 节。
 

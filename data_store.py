@@ -12,6 +12,7 @@ import os
 import time
 import sqlite3
 import random
+import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -1280,36 +1281,79 @@ FEAT_CACHE_PATH = os.path.join(DATA_DIR, "feat_cache.pkl")
 FEAT_CACHE_VERSION = 6      # 因子口径变更时 +1 (v3: ETF 份额折算复权; v4: max_dd_250 改单层rolling,
                             # v5: ETF 改后复权 (叠加分红除息事件); v6: 新增 ret_120/ret_250)
 
+# 进程级 feat 常驻 memo: feat_cache.pkl 在 NAS 上 1.1GB / 6476 标的, 冷读约 157s。
+# 若每次都重读磁盘, 用户首次点进计算页会卡 2~3 分钟。memo 让同进程内同指纹只加载一次,
+# 配合 streamlit_app 启动时的后台预热线程, 把 157s 挪到开机阶段而非用户点击时。
+# 锁 + Event: 并发调用只触发一次磁盘读, 其余线程 wait, 避免惊群 (thundering herd)。
+# loading_fp 放在 dict 里: 函数内若直接给模块级变量赋值会触发 Python 局部变量绑定,
+# 导致同函数内更早的读取抛 UnboundLocalError。dict 内的键赋值只是变更, 不触发该问题。
+_feat_memo = {"fingerprint": None, "feat": None, "loading_fp": None}
+_feat_memo_lock = threading.Lock()
+_feat_memo_event = threading.Event()
+_feat_memo_event.set()          # set = 当前无加载进行中 (memo 可用或为空)
+
 
 def load_feat_cached(fingerprint: str = None) -> dict:
-    """行情 + 因子。优先读磁盘缓存 (指纹一致), 否则重算并写回。
+    """行情 + 因子。优先级: 进程 memo → 磁盘缓存 (指纹一致) → 重算并写回。
+
     全市场 350 万行: load_all_bars 约 30s + compute_factors 约 55s, 不能每次都算。
+    feat_cache.pkl 在 NAS 上 1.1GB, 冷读约 157s, 所以进程内常驻 memo 是关键。
     """
     import pickle
     fingerprint = fingerprint or data_fingerprint()
-    p = FEAT_CACHE_PATH
-    if os.path.exists(p):
-        try:
-            with open(p, "rb") as f:
-                d = pickle.load(f)
-            if (d.get("fingerprint") == fingerprint and d.get("feat")
-                    and d.get("version") == FEAT_CACHE_VERSION):
-                return d["feat"]
-        except Exception:
-            pass
 
-    from backtest_engine import compute_factors   # 延迟导入, 避免循环依赖
-    raw = load_all_bars()
-    # ETF 后复权: 分红除息事件一并交给因子层 (缺失时只做份额折算复权)
-    feat = compute_factors(raw, div_map=etf_dividend_map()) if raw else {}
+    # 快路径: memo 已命中
+    with _feat_memo_lock:
+        if _feat_memo["fingerprint"] == fingerprint and _feat_memo["feat"] is not None:
+            return _feat_memo["feat"]
+        # 已有其他线程正在加载同一指纹 → 等它完成, 直接复用结果
+        wait_for_other = (_feat_memo["loading_fp"] == fingerprint)
+
+    if wait_for_other:
+        _feat_memo_event.wait()          # 阻塞到加载完成 set()
+        with _feat_memo_lock:
+            if _feat_memo["fingerprint"] == fingerprint and _feat_memo["feat"] is not None:
+                return _feat_memo["feat"]
+        # 极端情况 (加载抛错 / 指纹又变): 落到下面自己加载
+
+    # 抢到加载权
+    with _feat_memo_lock:
+        if _feat_memo["fingerprint"] == fingerprint and _feat_memo["feat"] is not None:
+            return _feat_memo["feat"]
+        _feat_memo["loading_fp"] = fingerprint
+        _feat_memo_event.clear()
+
+    feat = None
     try:
-        tmp = p + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump({"fingerprint": fingerprint, "version": FEAT_CACHE_VERSION,
-                         "feat": feat}, f, protocol=5)
-        os.replace(tmp, p)
-    except Exception:
-        pass
+        p = FEAT_CACHE_PATH
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    d = pickle.load(f)
+                if (d.get("fingerprint") == fingerprint and d.get("feat")
+                        and d.get("version") == FEAT_CACHE_VERSION):
+                    feat = d["feat"]
+            except Exception:
+                pass
+        if feat is None:
+            from backtest_engine import compute_factors   # 延迟导入, 避免循环依赖
+            raw = load_all_bars()
+            # ETF 后复权: 分红除息事件一并交给因子层 (缺失时只做份额折算复权)
+            feat = compute_factors(raw, div_map=etf_dividend_map()) if raw else {}
+            try:
+                tmp = p + ".tmp"
+                with open(tmp, "wb") as f:
+                    pickle.dump({"fingerprint": fingerprint, "version": FEAT_CACHE_VERSION,
+                                 "feat": feat}, f, protocol=5)
+                os.replace(tmp, p)
+            except Exception:
+                pass
+    finally:
+        with _feat_memo_lock:
+            _feat_memo["fingerprint"] = fingerprint
+            _feat_memo["feat"] = feat
+            _feat_memo["loading_fp"] = None
+            _feat_memo_event.set()
     return feat
 
 
