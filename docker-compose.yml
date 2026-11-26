@@ -43,6 +43,8 @@ services:
       - NEWS_INTERVAL_MIN=120          # 新闻抓取间隔(分钟)
       - CHECK_INTERVAL=5               # 主循环间隔(秒)
       - FUNDAMENTAL_WEEKDAY=4          # 每周几刷新财务(4=周五)
+      # ---- 同花顺金融数据 API (值取宿主 .env, 未配置时为空) ----
+      - THS_API_KEY=${THS_API_KEY:-}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status==200 else 1)"]
       interval: 30s

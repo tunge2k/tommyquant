@@ -31,6 +31,7 @@ COPY perf_report.py .
 COPY doh_patch.py .
 COPY htbr_source.py .
 COPY exchange_source.py .
+COPY ths_source.py .
 COPY world_map_countries.py .
 COPY vectorbt_etf_backtest.py .
 COPY docs/vectorbt_etf_strategy.md ./docs/vectorbt_etf_strategy.md
