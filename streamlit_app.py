@@ -1771,6 +1771,12 @@ def _bt_settings_snapshot() -> dict:
     return out
 
 
+# 迁移版本号: 一次性迁移守卫。
+# 旧实现每次会话都按「值 == 旧默认值」改写, 用户手动选成旧默认值(如 MA30回看=8、
+# 持仓数=2)会被静默改回, 表现为「改了设置没用」——必须只迁移一次。
+_BT_MIG_VER = "v17"
+
+
 def _load_bt_settings():
     raw = data_store.get_setting("bt_settings")
     if not raw:
@@ -1787,29 +1793,38 @@ def _load_bt_settings():
                 saved[k] = pd.to_datetime(saved[k])
             except Exception:
                 saved.pop(k, None)
-    # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
-    _mdd = saved.get("etf_max_dd_th")
-    if isinstance(_mdd, (int, float)) and _mdd < 1:
-        saved["etf_max_dd_th"] = int(round(_mdd * 100))
-    # 2026-11-26 均衡方案默认值迁移: 仅替换上一版默认值, 保留用户自定义值
-    if "etf_top_n" not in saved:
-        saved["etf_top_n"] = 2
-        if saved.get("etf_abs_mom_min", 3.0) == 3.0:
-            saved["etf_abs_mom_min"] = 0.0
-        if saved.get("etf_weight_frac", 0.75) == 0.75:
-            saved["etf_weight_frac"] = 0.95
-    # v16 迁移: 把上一版默认值 (2只/95%/回看5周/确认2周) 升到新默认
-    if saved.get("etf_top_n") == 2:
-        saved["etf_top_n"] = 1
-    if saved.get("etf_weight_frac") == 0.95:
-        saved["etf_weight_frac"] = 1.0
-    if saved.get("etf_ma30_lookback") in (5, 8):
-        saved["etf_ma30_lookback"] = 10
-    if saved.get("etf_ma30_exit_confirm") in (1, 2):
-        saved["etf_ma30_exit_confirm"] = 3
-    # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
-    if saved.get("etf_min_amount", 0.01) == 0.5:
-        saved["etf_min_amount"] = 0.01
+    try:
+        _mig_done = data_store.get_setting("bt_settings_mig") or ""
+    except Exception:
+        _mig_done = ""
+    if _mig_done != _BT_MIG_VER:
+        # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
+        _mdd = saved.get("etf_max_dd_th")
+        if isinstance(_mdd, (int, float)) and _mdd < 1:
+            saved["etf_max_dd_th"] = int(round(_mdd * 100))
+        # 2026-11-26 均衡方案默认值迁移
+        if "etf_top_n" not in saved:
+            saved["etf_top_n"] = 2
+            if saved.get("etf_abs_mom_min", 3.0) == 3.0:
+                saved["etf_abs_mom_min"] = 0.0
+            if saved.get("etf_weight_frac", 0.75) == 0.75:
+                saved["etf_weight_frac"] = 0.95
+        # v16 迁移: 把上一版默认值 (2只/95%/回看5或8周/确认1或2周) 升到新默认
+        if saved.get("etf_top_n") == 2:
+            saved["etf_top_n"] = 1
+        if saved.get("etf_weight_frac") == 0.95:
+            saved["etf_weight_frac"] = 1.0
+        if saved.get("etf_ma30_lookback") in (5, 8):
+            saved["etf_ma30_lookback"] = 10
+        if saved.get("etf_ma30_exit_confirm") in (1, 2):
+            saved["etf_ma30_exit_confirm"] = 3
+        # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
+        if saved.get("etf_min_amount", 0.01) == 0.5:
+            saved["etf_min_amount"] = 0.01
+        try:
+            data_store.set_setting("bt_settings_mig", _BT_MIG_VER)
+        except Exception:
+            pass
     for k in _BT_PERSIST_KEYS:
         if k in saved:
             st.session_state[k] = saved[k]
@@ -4157,6 +4172,9 @@ elif page == "backtest":
     with _pill_cols[len(_all_names) + 2]:
         run_btn = st.button("🚀 开始回测", type="primary",
                             use_container_width=True, key="bt_run")
+    # 弹窗点「确定」后自动重跑一次, 否则用户改了参数看不到结果变化(误以为设置没生效)
+    if st.session_state.pop("bt_auto_run", False):
+        run_btn = True
 
     # ---------- 设置弹窗 (st.dialog: 原生 modal, 点确定关闭) ----------
     # 弹窗内会重新赋值同名变量, 因此先把当前值存到 _cur_* 里当默认值,
@@ -4186,11 +4204,14 @@ elif page == "backtest":
     @st.dialog("⚙️ 回测设置", width="large", on_dismiss=_bt_settings_dismissed)
     def _bt_settings_dialog():
         st.markdown("<style>"
-                    'div[data-testid="stDialog"] div[data-testid="stVerticalBlock"]{gap:.4rem}'
-                    'div[data-testid="stDialog"] hr{margin:.5rem 0}'
-                    'div[data-testid="stDialog"] label{font-size:.86rem}'
+                    'div[data-testid="stDialog"] div[data-testid="stVerticalBlock"]{gap:.28rem}'
+                    'div[data-testid="stDialog"] hr{margin:.35rem 0}'
+                    'div[data-testid="stDialog"] label p{font-size:.82rem}'
+                    'div[data-testid="stDialog"] [data-testid="stWidgetLabel"]{min-height:0}'
                     'div[data-testid="stDialog"] .stNumberInput,'
-                    'div[data-testid="stDialog"] .stDateInput{max-width:320px}'
+                    'div[data-testid="stDialog"] .stDateInput{max-width:100%}'
+                    'div[data-testid="stDialog"] [data-baseweb="tab-panel"]{padding-top:.45rem}'
+                    'div[data-testid="stDialog"] [data-testid="stCaptionContainer"] p{font-size:.75rem}'
                     "</style>", unsafe_allow_html=True)
 
         # 移动端友好: 数值一律用 number_input (可精确输入/点 +-), 不用 slider 避免误触
@@ -4199,40 +4220,33 @@ elif page == "backtest":
             return tgt.number_input(label, min_value=lo, max_value=hi, step=step,
                                     format=fmt, key=_draft(key), help=help)
 
-        def _sec(title, cap=None):
-            st.markdown(f"**{title}**")
-            if cap:
-                st.caption(cap)
-
-        # ---------------- 回测参数 ----------------
-        _sec("回测参数")
-        _r1 = st.columns(2)
-        initial_capital = _r1[0].number_input(
+        # ---------------- 回测参数 (一行 4 列, 节省纵向空间) ----------------
+        _r = st.columns(4)
+        initial_capital = _r[0].number_input(
             "初始资金(万)", min_value=10, max_value=10000,
             value=int(_cur_initial // 10000), step=10,
             format="%d", key="di_initial") * 10000
         if strategy_choice == "ETF策略":
-            top_n = _r1[1].number_input(
+            top_n = _r[1].number_input(
                 "ETF持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_etf_topn",
                 help="ETF 专用目标仓位数；止损后趋势修复可快速回补，不影响股票策略持仓数")
         elif strategy_choice in CLASS_STRATEGIES:
-            top_n = _r1[1].number_input(
+            top_n = _r[1].number_input(
                 "持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_topn",
                 help="目标仓位数；清仓后自动在该日标的池中买入排名第一的标的，不会留空仓")
         else:
-            top_n = _r1[1].number_input(
+            top_n = _r[1].number_input(
                 "持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_topn")
-            _r1b = st.columns(2)
-            hold_days = _r1b[0].number_input(
+            hold_days = _r[2].number_input(
                 "持有天数", min_value=1, max_value=30, value=int(_cur_hold),
                 step=1, format="%d", key="di_hold")
-            limit_up_pct = _r1b[1].number_input(
+            limit_up_pct = _r[3].number_input(
                 "涨停阈值(%)", min_value=5.0, max_value=15.0,
                 value=float(_cur_lup), step=0.1, format="%.1f", key="di_limitup")
-        _r2 = st.columns(2)
+        _r2 = st.columns(4)
         _dr = _r2[0].date_input(
             "回测起点", value=backtest_start,
             min_value=pd.Timestamp("2013-05-15").date(),
@@ -4244,7 +4258,7 @@ elif page == "backtest":
             max_value=datetime.now().date(), key="di_end")
 
         st.divider()
-        _sec("策略参数", "改完点「确定」生效；直接关闭弹窗则保留上一次的设置。")
+        st.caption("改完点「确定」生效并自动重跑回测；直接关闭弹窗则保留上一次的设置。")
 
         if strategy_choice == "小市值轮动·戴维斯双击":
             _a = st.columns(2)
@@ -4262,69 +4276,69 @@ elif page == "backtest":
             _num("市值上限(亿)", 50, 500, "cap_max", step=10, col=_a[1])
             st.checkbox("MA20 以上", key=_draft("require_ma20", True))
         elif strategy_choice == "ETF策略":
-            st.caption("用「多周期动量 + 成交额流动性 + 周K MA30 趋势」选品；新标的走四重建仓门槛，止损标的在 MA30 修复后可快速回补。")
+            _t1, _t2, _t3 = st.tabs(["① 选品", "② 趋势与止损", "③ 换股与调仓"])
+            with _t1:
+                st.caption("多周期动量 + 成交额流动性 + 周K MA30 趋势选品；新标的走四重建仓门槛，止损标的在 MA30 修复后可快速回补。")
+                _a = st.columns([1.4, 1, 1, 1])
+                _a[0].radio("短期动量窗口", options=[20, 60], horizontal=True,
+                            format_func=lambda v: f"近{v}日",
+                            key=_draft("etf_mom_days", 60),
+                            help="排名 = 短期(权重20%) + 120日(30%) + 250日(50%)；缺失因子按可得权重归一化")
+                _num("最少K线(根)", 60, 500, "etf_min_history", step=10, col=_a[1],
+                     help="次新 ETF 数据不足时不参与排名。设太大会把早期上市的标的全部排除"
+                          "（例如 500 根 ≈ 要求上市满 2 年，2016-2022 年多数跨境 ETF 无法入选）")
+                _num("成交额下限(亿)", 0.01, 5.0, "etf_min_amount", step=0.01, fmt="%.2f",
+                     col=_a[2], help="近20日日均成交额，低于该值的 ETF 不参与排名。"
+                                     "跨境 ETF 在 2019 年前日均成交额普遍仅 0.01-0.5 亿，"
+                                     "设太高（如 >1 亿）会让早年长期空仓")
+                _num("资金比例", 0.50, 1.00, "etf_weight_frac", step=0.05, fmt="%.2f",
+                     col=_a[3], help="买入金额占总市值比例")
+                st.checkbox("仅外盘 ETF（剔除港股系）", key=_draft("etf_overseas_only", True),
+                            help="选品池只保留跨境 ETF（纳指/标普/日经/欧洲/东南亚等），"
+                                 "剔除恒生、港股通、H股、中概互联等港股相关标的")
 
-            st.markdown("**① 选品**")
-            _a = st.columns(2)
-            _a[0].radio("短期动量窗口", options=[20, 60], horizontal=True,
-                        format_func=lambda v: f"近{v}日（权重20%）",
-                        key=_draft("etf_mom_days", 60),
-                        help="排名 = 短期20% + 120日30% + 250日50%；缺失因子按可得权重归一化")
-            _num("最少K线(根)", 60, 500, "etf_min_history", step=10, col=_a[1],
-                 help="次新 ETF 数据不足时不参与排名。设太大会把早期上市的标的全部排除"
-                      "（例如 500 根 ≈ 要求上市满 2 年，2016-2022 年多数跨境 ETF 无法入选）")
-            _b = st.columns(2)
-            _num("成交额下限(亿)", 0.01, 5.0, "etf_min_amount", step=0.01, fmt="%.2f",
-                 col=_b[0], help="近20日日均成交额，低于该值的 ETF 不参与排名。"
-                                 "跨境 ETF 在 2019 年前日均成交额普遍仅 0.01-0.5 亿，"
-                                 "设太高（如 >1 亿）会让早年长期空仓")
-            _num("资金比例", 0.50, 1.00, "etf_weight_frac", step=0.05, fmt="%.2f",
-                 col=_b[1], help="买入金额占总市值比例")
-            st.checkbox("仅外盘 ETF（剔除港股系）", key=_draft("etf_overseas_only", True),
-                        help="选品池只保留跨境 ETF（纳指/标普/日经/欧洲/东南亚等），"
-                             "剔除恒生、港股通、H股、中概互联等港股相关标的")
+            with _t2:
+                _c = st.columns(4)
+                _c[0].checkbox("MA30 拐头清仓", key=_draft("etf_ma30_exit", True),
+                               help="周K MA30 走弱即清仓（趋势止损，优先级最高）")
+                _num("MA30 回看(周)", 2, 15, "etf_ma30_lookback", col=_c[1])
+                _num("建仓确认(周)", 0, 4, "etf_entry_weeks", col=_c[2],
+                     help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
+                _num("止损确认(周)", 1, 6, "etf_ma30_exit_confirm", col=_c[3],
+                     help="MA30 走弱需连续 N 周成立才清仓；3=过滤长牛中的单周假摔，1=原行为（单周即卖）")
+                _d = st.columns(4)
+                _d[0].checkbox("止损需跌破 MA30", key=_draft("etf_ma30_exit_below", True),
+                               help="除 MA30 走弱外还要求收盘跌破周 MA30 才清仓："
+                                    "价格未失守趋势线时不清仓，过滤牛市浅回撤假摔")
+                _d[1].checkbox("止损后只回补原标的", key=_draft("etf_standin", False),
+                               help="开启(默认)：原标的趋势修复前该仓位留现金，不买入替代标的，"
+                                    "避免「止损换成次优标的、原标的修复后无槽位可回」；"
+                                    "关闭则按当日排名补位买入替代标的")
 
-            st.markdown("**② 趋势与止损**")
-            _c = st.columns(2)
-            _c[0].checkbox("MA30 拐头清仓", key=_draft("etf_ma30_exit", True),
-                           help="周K MA30 走弱即清仓（趋势止损，优先级最高）")
-            _num("MA30 回看(周)", 2, 15, "etf_ma30_lookback", col=_c[1])
-            _num("建仓确认(周)", 0, 4, "etf_entry_weeks",
-                 help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
-            _num("止损确认(周)", 1, 6, "etf_ma30_exit_confirm",
-                 help="MA30 走弱需连续 N 周成立才清仓；3=过滤长牛中的单周假摔，1=原行为（单周即卖）")
-            st.checkbox("止损需跌破 MA30", key=_draft("etf_ma30_exit_below", True),
-                        help="除 MA30 走弱外还要求收盘跌破周 MA30 才清仓："
-                             "价格未失守趋势线时不清仓，过滤牛市浅回撤假摔")
-            st.checkbox("止损后只回补原标的", key=_draft("etf_standin", False),
-                        help="开启(默认)：原标的趋势修复前该仓位留现金，不买入替代标的，"
-                             "避免「止损换成次优标的、原标的修复后无槽位可回」；"
-                             "关闭则按当日排名补位买入替代标的")
-
-            st.markdown("**③ 换股与调仓**")
-            st.checkbox("排名跌出换股", key=_draft("etf_rank_swap", False),
-                        help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
-                             "止损(MA30走弱/绝对动量)仍会清仓并当日补位。开启则恢复排名换股。")
-            _e = st.columns(2)
-            _num("排名缓冲(名)", 0, 10, "etf_rank_buffer", col=_e[0],
-                 help="排名跌出 持仓数+缓冲 才换出（仅开启「排名跌出换股」时生效）")
-            _num("价格变化阈值", 0.01, 0.15, "etf_cap_chg_th", step=0.01, fmt="%.2f",
-                 col=_e[1], help="相对建仓价偏离该比例才调仓，0.04 = 4%")
-            _num("持仓偏离阈值", 0.02, 0.15, "etf_rebal_th", step=0.01, fmt="%.2f",
-                 help="权重偏离达到该比例触发低买高卖，0.05 = 5%")
-            st.radio("调仓方式", options=["topk_drop", "deviation"],
-                     format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
-                                            "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
-                     key=_draft("etf_rebal_mode", "topk_drop"), horizontal=True)
-            st.radio("换股周期",
-                     options=["weekly", "monthly", "quarterly", "yearly", "off"],
-                     format_func=lambda v: {"weekly": "每周", "monthly": "每月",
-                                            "quarterly": "每季", "yearly": "每年(默认)",
-                                            "off": "关闭换股(只调仓)"}[v],
-                     key=_draft("etf_rank_check_freq", "yearly"), horizontal=True,
-                     help="仅控制「换入新标的/补位」的复核频率；持仓内部的调仓(低买高卖)"
-                          "由价格/权重偏离触发，与本周期无关。"
-                          "关闭后：初始建仓后不再换入新标的，止损清出的仓位留现金，更接近长期持有。")
+            with _t3:
+                _e = st.columns(4)
+                _e[0].checkbox("排名跌出换股", key=_draft("etf_rank_swap", False),
+                               help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
+                                    "止损(MA30走弱/绝对动量)仍会清仓并当日补位。开启则恢复排名换股。")
+                _num("排名缓冲(名)", 0, 10, "etf_rank_buffer", col=_e[1],
+                     help="排名跌出 持仓数+缓冲 才换出（仅开启「排名跌出换股」时生效）")
+                _num("价格变化阈值", 0.01, 0.15, "etf_cap_chg_th", step=0.01, fmt="%.2f",
+                     col=_e[2], help="相对建仓价偏离该比例才调仓，0.04 = 4%")
+                _num("持仓偏离阈值", 0.02, 0.15, "etf_rebal_th", step=0.01, fmt="%.2f",
+                     col=_e[3], help="权重偏离达到该比例触发低买高卖，0.05 = 5%")
+                st.radio("调仓方式", options=["topk_drop", "deviation"],
+                         format_func=lambda v: {"topk_drop": "排名缓冲（Topk-Drop，低换手）",
+                                                "deviation": "偏离度再平衡（旧逻辑，高换手）"}[v],
+                         key=_draft("etf_rebal_mode", "topk_drop"), horizontal=True)
+                st.radio("换股周期",
+                         options=["weekly", "monthly", "quarterly", "yearly", "off"],
+                         format_func=lambda v: {"weekly": "每周", "monthly": "每月",
+                                                "quarterly": "每季", "yearly": "每年(默认)",
+                                                "off": "关闭换股(只调仓)"}[v],
+                         key=_draft("etf_rank_check_freq", "yearly"), horizontal=True,
+                         help="仅控制「换入新标的/补位」的复核频率；持仓内部的调仓(低买高卖)"
+                              "由价格/权重偏离触发，与本周期无关。"
+                              "关闭后：初始建仓后不再换入新标的，止损清出的仓位留现金，更接近长期持有。")
 
             with st.expander("④ 风控因子（高级，需先同步华泰柏瑞增强数据）", expanded=False):
                 st.caption("无增强数据时自动不拦截。")
@@ -4360,40 +4374,39 @@ elif page == "backtest":
                      help="近60日涨幅低于该值则剔除，0=仅要求不跌")
         elif strategy_choice == "市值策略":
             st.markdown("**① 选股范围**")
-            _a = st.columns(2)
+            _a = st.columns(4)
             _num("市值下限(亿)", 5, 50, "mc_cap_min", col=_a[0])
             _num("市值上限(亿)", 100, 500, "mc_cap_max", step=10, col=_a[1])
-            _b = st.columns(2)
-            _num("上市年限(年)", 1.0, 10.0, "mc_listed_yrs", step=0.5, fmt="%.1f", col=_b[0])
-            _num("分红回看年数", 1, 5, "mc_div_years", col=_b[1])
+            _num("上市年限(年)", 1.0, 10.0, "mc_listed_yrs", step=0.5, fmt="%.1f", col=_a[2])
+            _num("分红回看年数", 1, 5, "mc_div_years", col=_a[3])
 
             st.markdown("**② 剔除条件**")
-            _e = st.columns(2)
+            _e = st.columns(4)
             _e[0].checkbox("剔除 ST", key=_draft("mc_ex_st", True), help="ST / *ST / 退市整理")
-            _e[0].checkbox("现金流背离", key=_draft("mc_ex_ocf", True),
+            _e[1].checkbox("现金流背离", key=_draft("mc_ex_ocf", True),
                            help="EPS>0 但每股经营现金流<0")
-            _e[1].checkbox("营业外盈利", key=_draft("mc_ex_nonop", True),
+            _e[2].checkbox("营业外盈利", key=_draft("mc_ex_nonop", True),
                            help="净利>0 但营业利润≤0")
-            _e[1].checkbox("长期不分红", key=_draft("mc_ex_nodiv", True),
+            _e[3].checkbox("长期不分红", key=_draft("mc_ex_nodiv", True),
                            help="回看年内无现金分红")
 
             st.markdown("**③ 趋势与止损**")
-            _g = st.columns(2)
+            _g = st.columns(4)
             _g[0].checkbox("MA30 拐头清仓", key=_draft("mc_ma30_exit", True), help="趋势止损")
             _num("MA30 回看(周)", 2, 15, "mc_ma30_lookback", col=_g[1])
-            _num("建仓确认(周)", 0, 4, "mc_entry_weeks",
+            _num("建仓确认(周)", 0, 4, "mc_entry_weeks", col=_g[2],
                  help="周K MA30 需连续 N 周上升才建仓；0=关闭确认")
 
             st.markdown("**④ 换股与调仓**")
-            st.checkbox("排名跌出换股", key=_draft("mc_rank_swap", False),
-                        help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
-                             "止损仍会清仓并当日补位，低买高卖(±4%/≥5%权重)调仓照常。开启则恢复排名换股。")
-            _c = st.columns(2)
-            _num("排名缓冲(名)", 0, 10, "mc_rank_buffer", col=_c[0],
+            _c = st.columns(4)
+            _c[0].checkbox("排名跌出换股", key=_draft("mc_rank_swap", False),
+                           help="关闭(默认)：不因排名跌出而换股，仅在持仓数 < 目标时补位；"
+                                "止损仍会清仓并当日补位，低买高卖(±4%/≥5%权重)调仓照常。开启则恢复排名换股。")
+            _num("排名缓冲(名)", 0, 10, "mc_rank_buffer", col=_c[1],
                  help="排名跌出 持仓数+缓冲 才换出（仅开启「排名跌出换股」时生效）")
             _num("资金比例", 0.50, 1.00, "mc_weight_frac", step=0.05, fmt="%.2f",
-                 col=_c[1], help="买入金额占总市值比例")
-            _d = st.columns(2)
+                 col=_c[2], help="买入金额占总市值比例")
+            _d = st.columns(4)
             _num("市值变化阈值", 0.01, 0.15, "mc_cap_chg_th", step=0.01, fmt="%.2f",
                  col=_d[0], help="相对建仓成本偏离该比例才调仓，0.04 = 4%")
             _num("持仓偏离阈值", 0.02, 0.15, "mc_rebal_th", step=0.01, fmt="%.2f",
@@ -4428,6 +4441,7 @@ elif page == "backtest":
                         st.session_state[_pk] = st.session_state[_pv]
                 _persist_bt_settings()   # 立即落库: 下面 st.rerun() 会中断脚本
                 st.session_state["bt_open_settings"] = False
+                st.session_state["bt_auto_run"] = True   # 确定后自动重跑回测
                 st.rerun()
 
     if st.session_state.get("bt_open_settings"):
