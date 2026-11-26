@@ -120,7 +120,7 @@ if _ths_key:
     if run(f"grep -q '^THS_API_KEY=' {REMOTE_DIR}/.env 2>/dev/null && echo yes || echo no") == "yes":
         print("  ℹ 远端 .env 已有 THS_API_KEY, 保留原值")
     else:
-        run("touch %s/.env && printf '\\nTHS_API_KEY=%s\\n' '%s' >> %s/.env && chmod 600 %s/.env"
+        run("touch %s/.env && printf '\\nTHS_API_KEY=%%s\\n' '%s' >> %s/.env && chmod 600 %s/.env"
             % (REMOTE_DIR, _ths_key, REMOTE_DIR, REMOTE_DIR))
         print("  ✅ THS_API_KEY 已写入远端 .env")
 else:
