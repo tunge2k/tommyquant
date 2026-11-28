@@ -11,9 +11,10 @@
      注意: 偏离按「市值/中枢-1」计算，不是权重百分点——75% 仓位下价格涨 23.9%
      权重只变动约 3.8 个百分点，若按权重偏离 4% 判定会长期空转。
      这是「低买高卖」触发: 涨过 +4% 卖出超出部分、跌破 -4% 用现金补足。
-  4. 年度换股: `rank_check_freq` 到期日（默认每年首个交易日）按排名指标重排全池，
-     只保留前 `top_n`：卖出非目标标的，买入新目标标的（沿用当前市值中枢）。
-  5. 定期再平衡: 周期触发（每 `rebalance_period`，默认 1 年），按「占总资产比例」
+  4. 定期换股: 距上次换股满 `rank_check_freq`（1m/3m/6m/1y/off，按实际持有
+     时间计算，不按自然年月）时按排名指标重排全池，只保留前 `top_n`：
+     卖出非目标标的，买入新目标标的（沿用当前市值中枢）。
+  5. 定期再平衡: 周期触发（距上次满 `rebalance_period`），按「占总资产比例」
      判定: 目标市值 = 当前总资产 × `weight_fraction` / 持仓数。总资产增长而持仓
      占比不足 → 买入补足；超配 → 卖出。完成后重置 4% 网格的市值中枢。
      与第 3 条严格区分: 本规则是周期+占比口径，第 3 条是每日+固定中枢口径。
@@ -126,13 +127,6 @@ _METRIC_COLS = {
 # 综合动量权重 (缺失按可得权重归一化)
 _MOM_WEIGHTS = (("ret_20", 0.2), ("ret_120", 0.3), ("ret_250", 0.5))
 
-_RANK_REASON = {
-    "yearly": "年度换股",
-    "quarterly": "季度换股",
-    "monthly": "月度换股",
-}
-
-
 def list_metrics() -> list[tuple[str, str]]:
     """返回 [(key, 中文标签), ...]，供界面下拉框使用"""
     return [(k, v["label"]) for k, v in METRIC_SPECS.items()]
@@ -148,7 +142,7 @@ def default_params() -> dict:
         "weight_fraction": 0.75,
         "deviation_threshold": 0.04,
         "rank_metric": DEFAULT_METRIC,
-        "rank_check_freq": "yearly",
+        "rank_check_freq": "1y",
         "rebalance_period": "1y",
         "min_amount": 0.01,     # 亿元
         "min_history": 250,     # K 线根数
@@ -192,6 +186,7 @@ def _empty_result() -> dict:
             "rank_metric_fallback_reason": "",
             "annual_swaps": 0,
             "deviation_trades": 0,
+            "cash_short_skips": 0,
             "initial_position_ratio": 0.0,
             "years": 0.0,
             "universe_size": 0,
@@ -369,8 +364,8 @@ class _RebalanceEngine:
         self.dev_threshold = float(params["deviation_threshold"])
         self.min_amount = float(params["min_amount"])
         self.min_history = int(params["min_history"])
-        self.rank_freq = str(params["rank_check_freq"] or "off").lower()
-        self.reb_years = _parse_years(params["rebalance_period"])
+        self.rank_period = _parse_period(params["rank_check_freq"])
+        self.reb_period = _parse_period(params["rebalance_period"])
 
         cost = params.get("cost")
         if not isinstance(cost, dict):
@@ -382,7 +377,9 @@ class _RebalanceEngine:
         self.entered = False
         self.entry_date = None
         self.next_reb = None
-        self._last_period = None
+        # 换股/再平衡都按「实际持有时间」计算: 下次日期 = 上次日期 + 周期偏移
+        self.next_rank = None
+        self.cash_short_skips = 0     # 资金不足未能执行的 4% 补仓次数
 
         self.trades: list = []
         self.fills: list = []          # 成交流水 (兼容报告页字段契约)
@@ -553,15 +550,6 @@ class _RebalanceEngine:
                      closing_fee=closing_fee)
 
     # ---------- 事件 ----------
-    def _period(self, d):
-        if self.rank_freq == "monthly":
-            return (d.year, d.month)
-        if self.rank_freq == "quarterly":
-            return (d.year, (d.month - 1) // 3)
-        if self.rank_freq == "yearly":
-            return (d.year,)
-        return None
-
     def _try_entry(self, d):
         """初始建仓: 区间内第一个候选池非空的交易日"""
         cands = self._candidates(d)
@@ -576,18 +564,21 @@ class _RebalanceEngine:
         self.entered = True
         self.entry_date = pd.Timestamp(d)
         self.targets = list(picks)
-        if self.reb_years:
-            self.next_reb = self.entry_date + pd.DateOffset(years=self.reb_years)
+        # 周期以实际建仓日为锚点, 不再按自然年/月边界 (2026-11-28 修正)
+        if self.rank_period:
+            self.next_rank = self.entry_date + self.rank_period[1]
+        if self.reb_period:
+            self.next_reb = self.entry_date + self.reb_period[1]
         tv = self._total_value(d)
         mv = sum((self._price(c, d) or 0) * p["qty"] for c, p in self.positions.items())
         self.initial_ratio = mv / tv if tv > 0 else 0.0
 
     def _rank_swap(self, d):
-        """年度(季度/月度)换股: 重排全池, 只留前 top_n, 卖非目标、买新目标"""
+        """定期换股: 重排全池, 只留前 top_n, 卖非目标、买新目标"""
         picks = self._candidates(d)[:self.top_n]
         if not picks:
             return
-        reason = _RANK_REASON.get(self.rank_freq, "排名换股")
+        reason = (f"{self.rank_period[0]}换股" if self.rank_period else "排名换股")
         # 先卖出非目标标的（回笼现金）
         for code in list(self.positions):
             if code not in picks:
@@ -670,15 +661,30 @@ class _RebalanceEngine:
                     sells.append((code, qty, dev))
             elif dev < -self.dev_threshold:
                 buys.append((code, base - mv, dev))
-        # 先卖后买, 避免现金不足
+        # 先卖后买: 卖出回笼的现金可立即用于同日低配补仓
         n0 = len(self.trades)
         for code, qty, dev in sells:
             if code in self.positions:
                 self._sell(code, qty, d, "4%偏差调仓", dev_before=dev)
+        # 买入前做可用资金充足性校验:
+        # 目标仓位 85%/95% 时现金垫很薄, 最大回撤期连续下跌会让可用现金耗尽。
+        # 这里按可用现金缩减买入额(优先保证能成交), 不足 1 手则跳过并计数,
+        # 不产生「挂了单却没有成交」的假调仓, 也不会出现负现金。
+        avail = max(float(self.cash), 0.0)
         for code, amount, dev in buys:
-            if code in self.positions:
-                self._buy(code, amount, d, "4%偏差调仓", dev_before=dev)
-        # 只统计真实成交 (现金不足时 _buy 可能不下单)
+            if code not in self.positions:
+                continue
+            px = self._price(code, d)
+            if px is None:
+                continue
+            need = min(float(amount), avail)
+            if need < px * 100 * 1.002:      # 含费后连 1 手都买不起
+                self.cash_short_skips += 1
+                continue
+            cash0 = self.cash
+            self._buy(code, need, d, "4%偏差调仓", dev_before=dev)
+            avail = max(avail - (cash0 - float(self.cash)), 0.0)
+        # 只统计真实成交
         self.deviation_trades += len(self.trades) - n0
 
     def _log_holdings(self, d):
@@ -702,20 +708,19 @@ class _RebalanceEngine:
     def run(self) -> dict:
         for d in self.calendar:
             d = pd.Timestamp(d)
-            period = self._period(d)
-            rank_due = (self.entered and self.rank_freq != "off"
-                        and self._last_period is not None
-                        and period != self._last_period)
-            self._last_period = period
-
             if not self.entered:
                 self._try_entry(d)
-            elif rank_due:
-                self._rank_swap(d)
-            elif self.next_reb is not None and d >= self.next_reb:
-                self._periodic_rebalance(d)
-                while self.next_reb is not None and d >= self.next_reb:
-                    self.next_reb = self.next_reb + pd.DateOffset(years=self.reb_years)
+            else:
+                # 换股: 距上次换股满一个配置周期 (按实际持有时间, 非自然年月)
+                if self.next_rank is not None and d >= self.next_rank:
+                    self._rank_swap(d)
+                    while self.next_rank is not None and d >= self.next_rank:
+                        self.next_rank = self.next_rank + self.rank_period[1]
+                # 再平衡: 距上次再平衡满一个配置周期
+                if self.next_reb is not None and d >= self.next_reb:
+                    self._periodic_rebalance(d)
+                    while self.next_reb is not None and d >= self.next_reb:
+                        self.next_reb = self.next_reb + self.reb_period[1]
 
             self._deviation_check(d)
             self._log_holdings(d)
@@ -744,6 +749,7 @@ class _RebalanceEngine:
                 "rank_metric_fallback_reason": self.p.get("_fallback_reason", ""),
                 "annual_swaps": self.annual_swaps,
                 "deviation_trades": self.deviation_trades,
+                "cash_short_skips": self.cash_short_skips,
                 "initial_position_ratio": round(self.initial_ratio, 6),
                 "years": round(years, 4),
                 "universe_size": len(self.symbols),
@@ -751,15 +757,34 @@ class _RebalanceEngine:
         }
 
 
-def _parse_years(period) -> int:
-    """'1y'/'2y' -> 年数; 'off'/None/0 -> 0 (不启用)"""
+# 周期注册表: 配置值 -> (中文标签, DateOffset 参数)。同时兼容旧设置值。
+_PERIOD_SPECS = {
+    "1m": ("每月", {"months": 1}),
+    "3m": ("每季度", {"months": 3}),
+    "6m": ("每半年", {"months": 6}),
+    "1y": ("每年", {"years": 1}),
+    "2y": ("每两年", {"years": 2}),
+    "monthly": ("每月", {"months": 1}),
+    "quarterly": ("每季度", {"months": 3}),
+    "yearly": ("每年", {"years": 1}),
+}
+
+
+def _parse_period(period):
+    """周期配置 -> (中文标签, pd.DateOffset, 折合年数)；off/None/非法 -> None
+
+    换股与再平衡都以「实际持有时间」为锚点：下次日期 = 上次日期 + 该偏移，
+    不按自然年/月边界切分（2026-11-28 修正）。
+    """
     s = str(period or "").strip().lower()
     if not s or s in ("off", "none", "0"):
-        return 0
-    try:
-        return max(int(s.rstrip("y")), 0)
-    except ValueError:
-        return 0
+        return None
+    spec = _PERIOD_SPECS.get(s)
+    if spec is None:
+        return None
+    label, kw = spec
+    years = float(kw.get("years", 0)) + kw.get("months", 0) / 12.0
+    return label, pd.DateOffset(**kw), years
 
 
 # ==================== 对外入口 ====================
@@ -821,7 +846,7 @@ def validate_result(result: dict, params: dict) -> list[dict]:
     校验项:
       1. 回测年限 >= 10 年
       2. 初始仓位 ≈ weight_fraction（±2%）
-      3. 年度换股次数 ≈ 年数
+      3. 换股次数 ≈ 区间年数 / 换股周期（按实际持有时间计算）
       4. 每笔 4% 偏差调仓的实际偏离 >= 3.5%
       5. 全程无止损类交易
     """
@@ -847,10 +872,20 @@ def validate_result(result: dict, params: dict) -> list[dict]:
     })
 
     swaps = int(meta.get("annual_swaps", 0) or 0)
+    rp = _parse_period(p["rank_check_freq"])
+    if rp is None:
+        expected, tol, name = 0.0, 0.5, "换股次数（不换股）"
+        detail = f"换股 {swaps} 次（配置为不换股）"
+    else:
+        expected = years / rp[2] if rp[2] > 0 else 0.0
+        tol = max(2.5, expected * 0.25)
+        name = "换股次数≈周期数"
+        detail = (f"换股 {swaps} 次，区间 {years:.2f} 年，"
+                  f"按「{rp[0]}」期望约 {expected:.1f} 次（容差±{tol:.1f}）")
     checks.append({
-        "name": "年度换股次数≈年数",
-        "passed": bool(abs(swaps - years) <= 2.5),
-        "detail": f"换股 {swaps} 次，区间 {years:.2f} 年",
+        "name": name,
+        "passed": bool(abs(swaps - expected) <= tol),
+        "detail": detail,
     })
 
     dev_trades = [t for t in trades if "4%" in str(t.get("reason", ""))]

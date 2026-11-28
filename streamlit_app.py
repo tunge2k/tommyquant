@@ -1757,7 +1757,7 @@ BT_PARAM_DEFAULTS = {
     # ETF 调仓策略 (独立策略: 可配置排序指标 + 4%偏差调仓 + 年度换股 + 目标仓位再平衡)
     # 与「ETF策略」的区别: 无趋势止损(用户 2026-11-28 确认的口径), 纯规则化调仓
     "erc_metric": "momentum", "erc_top_n": 3, "erc_weight_pct": 75,
-    "erc_dev_pct": 4, "erc_rank_freq": "yearly", "erc_rebal_period": "1y",
+    "erc_dev_pct": 4, "erc_rank_freq": "1y", "erc_rebal_period": "1y",
     "erc_min_amount": 0.01, "erc_min_history": 250,
 }
 for _k, _v in BT_PARAM_DEFAULTS.items():
@@ -2147,7 +2147,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "weight_fraction": float(ss.get("erc_weight_pct", 75)) / 100.0,
             "deviation_threshold": float(ss.get("erc_dev_pct", 4)) / 100.0,
             "rank_metric": str(ss.get("erc_metric", "momentum")),
-            "rank_check_freq": str(ss.get("erc_rank_freq", "yearly")),
+            "rank_check_freq": str(ss.get("erc_rank_freq", "1y")),
             "rebalance_period": str(ss.get("erc_rebal_period", "1y")),
             "min_amount": float(ss.get("erc_min_amount", 0.01)),
             "min_history": int(ss.get("erc_min_history", 250)),
@@ -2168,7 +2168,7 @@ def _bt_sig(params: dict) -> str:
 def _run_backtest_params(strategy_key, params, feat_data):
     """按参数跑回测 (市值/ETF 策略走同一个 MarketCapStrategy, 只是 pool_type 不同)"""
     if strategy_key == "ETF调仓策略":
-        # 独立引擎: 可配置排序指标 + 4%偏差调仓 + 年度换股 + 目标仓位再平衡 (无止损)
+        # 独立引擎: 可配置排序指标 + 4%偏差调仓 + 定期换股 + 目标仓位再平衡 (无止损)
         import etf_rebalance
         _p = dict(params)
         _p["cost"] = get_cost_params()   # params["cost"] 只是缓存指纹串, 这里换成真实成本参数
@@ -2308,8 +2308,10 @@ def _render_etf_rebalance_validation(result: dict, params: dict):
         st.caption(
             f"排序指标：{_eff}" + (f"（自动回退：{_fb}）" if _fb else "")
             + f" · 回测年限 {float(meta.get('years', 0)):.1f} 年"
-            + f" · 年度换股 {meta.get('annual_swaps', 0)} 次"
+            + f" · 定期换股 {meta.get('annual_swaps', 0)} 次"
             + f" · 4%偏差调仓 {meta.get('deviation_trades', 0)} 笔"
+            + (f" · 资金不足跳过 {meta['cash_short_skips']} 次"
+               if meta.get("cash_short_skips") else "")
             + f" · 初始仓位 {float(meta.get('initial_position_ratio', 0)) * 100:.1f}%"
             + f" · 标的池 {meta.get('universe_size', 0)} 只")
     try:
@@ -4228,9 +4230,12 @@ elif page == "backtest":
         _summary_parts.append(f"排序:{_mlabel}")
         _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 75))}%")
         _summary_parts.append(f"±{int(st.session_state.get('erc_dev_pct', 4))}%调仓")
-        _summary_parts.append(
-            {"yearly": "年度换股", "quarterly": "季度换股", "monthly": "月度换股",
-             "off": "不换股"}.get(st.session_state.get("erc_rank_freq", "yearly"), "年度换股"))
+        _rk_lbl = {"1y": "每年换股", "6m": "每半年换股", "3m": "每季换股",
+                   "1m": "每月换股", "off": "不换股",
+                   "yearly": "每年换股", "quarterly": "每季换股",
+                   "monthly": "每月换股"}.get(
+                       st.session_state.get("erc_rank_freq", "1y"), "每年换股")
+        _summary_parts.append(_rk_lbl)
     elif strategy_choice != "市值策略":
         _summary_parts.append(f"{top_n}只")
         _summary_parts.append(f"持有{hold_days}天·涨停{limit_up_pct:.1f}%")
@@ -4486,18 +4491,34 @@ elif page == "backtest":
             with _v2:
                 _b = st.columns(4)
                 _num("目标仓位(%)", 10, 100, "erc_weight_pct", step=5, col=_b[0],
-                     help="初始建仓与定期再平衡的目标总仓位，默认 75%")
+                     help="初始建仓与定期再平衡的目标总仓位，默认 75%；仓位越高现金垫越薄")
                 _num("偏差阈值(%)", 1, 30, "erc_dev_pct", step=1, col=_b[1],
-                     help="单标的权重偏离目标超过该值即调回目标，默认 4%")
-                _b[2].radio("换股周期", options=["yearly", "quarterly", "monthly", "off"],
-                            format_func=lambda v: {"yearly": "每年", "quarterly": "每季",
-                                                   "monthly": "每月", "off": "不换股"}[v],
-                            key=_draft("erc_rank_freq", "yearly"), horizontal=True,
-                            help="到期按选定指标重排全池，只保留前 N 只")
-                _b[3].radio("再平衡周期", options=["1y", "2y", "off"],
-                            format_func=lambda v: {"1y": "每年", "2y": "每两年", "off": "不强制"}[v],
-                            key=_draft("erc_rebal_period", "1y"), horizontal=True,
-                            help="到期把总持仓比例强制拉回目标仓位")
+                     help="持仓市值相对市值中枢的偏离超过该值即调回中枢，默认 4%")
+                # 换股周期 / 再平衡周期: 下拉单选（周期按实际持有时间计算）
+                _rk = {"yearly": "1y", "quarterly": "3m", "monthly": "1m"}.get(
+                    st.session_state.get("erc_rank_freq", "1y"),
+                    st.session_state.get("erc_rank_freq", "1y"))
+                _rd = _draft("erc_rank_freq", "1y")
+                if st.session_state.get(_rd) not in ("1y", "6m", "3m", "1m", "off"):
+                    st.session_state[_rd] = _rk if _rk in ("1y", "6m", "3m", "1m", "off") else "1y"
+                _b[2].selectbox("换股周期", options=["1y", "6m", "3m", "1m", "off"],
+                                format_func=lambda v: {"1y": "每年", "6m": "每半年",
+                                                       "3m": "每季度", "1m": "每月",
+                                                       "off": "不换股"}[v],
+                                key=_rd, help="距上次换股满一个周期后按选定指标重排全池，"
+                                              "周期按实际持有时间计算")
+                _rb = {"yearly": "1y"}.get(
+                    st.session_state.get("erc_rebal_period", "1y"),
+                    st.session_state.get("erc_rebal_period", "1y"))
+                _rbd = _draft("erc_rebal_period", "1y")
+                if st.session_state.get(_rbd) not in ("1y", "6m", "3m", "1m", "2y", "off"):
+                    st.session_state[_rbd] = _rb if _rb in ("1y", "6m", "3m", "1m", "2y", "off") else "1y"
+                _b[3].selectbox("再平衡周期", options=["1y", "6m", "3m", "1m", "2y", "off"],
+                                format_func=lambda v: {"1y": "每年", "6m": "每半年",
+                                                       "3m": "每季度", "1m": "每月",
+                                                       "2y": "每两年", "off": "不强制"}[v],
+                                key=_rbd, help="距上次再平衡满一个周期后把持仓占比拉回目标仓位，"
+                                               "周期按实际持有时间计算")
                 st.caption("本策略不设趋势止损（用户确认口径），仅靠 4% 偏差调仓 + 定期换股 + 定期再平衡控制风险。")
         elif strategy_choice == "市值策略":
             _u1, _u2, _u3 = st.tabs(["① 选股与剔除", "② 趋势与止损", "③ 换股与调仓"])
@@ -4590,8 +4611,9 @@ elif page == "backtest":
 
     if run_btn:
         # 参数 + 行情指纹都未变 → 直接调出最近一次结果, 不重算 (避免无谓转圈)
-        _sig_now = _bt_sig(_bt_params(strategy_choice, initial_capital, hold_days,
-                                      top_n, limit_up_pct, backtest_start, backtest_end))
+        _params_now = _bt_params(strategy_choice, initial_capital, hold_days,
+                                 top_n, limit_up_pct, backtest_start, backtest_end)
+        _sig_now = _bt_sig(_params_now)
         _rec_now = data_store.get_backtest_result(strategy_choice, _sig_now)
         if _rec_now is not None and str(_rec_now["fingerprint"]) == DATA_FINGERPRINT:
             result = _bt_result_from_rec(_rec_now)
@@ -4613,8 +4635,49 @@ elif page == "backtest":
                 data_store.save_run("backtest", strategy_choice, sp, result["performance"])
             except Exception:
                 pass
+            # 历史最优自动留存: 尚无最优、或本次更优 → 直接更新(更优无需确认)
+            try:
+                _best0 = data_store.get_best_backtest(strategy_choice)
+                _ret0 = float(result["performance"].get("total_return", 0) or 0)
+                if _best0 is None or _ret0 > float(_best0["metric_value"]) + 1e-9:
+                    data_store.save_best_backtest(
+                        strategy_choice, "total_return", _ret0, _params_now,
+                        DATA_FINGERPRINT, serialize_result(result))
+            except Exception:
+                pass
     else:
         result = _cached.get(strategy_choice)
+
+    # ---------- 历史最优结果保护 ----------
+    # 新结果劣于已保存的最优时, 明确提示并让用户确认是否放弃本次, 避免误覆盖最优
+    if result:
+        _p_chk = _bt_params(strategy_choice, initial_capital, hold_days,
+                            top_n, limit_up_pct, backtest_start, backtest_end)
+        _sig_chk = _bt_sig(_p_chk)
+        _best = data_store.get_best_backtest(strategy_choice)
+        _ret_chk = float(result["performance"].get("total_return", 0) or 0)
+        _discarded = st.session_state.get("_bt_best_discard") == _sig_chk
+        if (_best and not _discarded
+                and _ret_chk < float(_best["metric_value"]) - 1e-9):
+            st.warning(
+                f"⚠️ 本次回测总收益 {_ret_chk:+.2f}%，低于历史最优 "
+                f"{float(_best['metric_value']):+.2f}%（保存于 "
+                f"{str(_best['created_at']).replace('T', ' ')}）。"
+                "是否放弃本次结果、保留最优？")
+            _bc1, _bc2 = st.columns(2)
+            if _bc1.button("↩️ 放弃本次，查看最优结果", key="bt_keep_best"):
+                st.session_state["_bt_best_discard"] = _sig_chk
+                st.rerun()
+            if _bc2.button("✅ 保留本次并更新最优", key="bt_use_new"):
+                data_store.save_best_backtest(
+                    strategy_choice, "total_return", _ret_chk, _p_chk,
+                    DATA_FINGERPRINT, serialize_result(result))
+                st.session_state["_bt_best_discard"] = _sig_chk
+                st.rerun()
+        if _discarded and _best:
+            result = _bt_result_from_rec(_best)
+            st.info("已放弃本次结果，当前展示历史最优回测（"
+                    f"{str(_best['created_at']).replace('T', ' ')}）")
 
     if result:
         _meta = result.get("_meta") or {}

@@ -94,6 +94,17 @@ def init_db():
         PRIMARY KEY (strategy, param_sig)
     );
 
+    -- ===== 历史最优回测 (每策略一条, 新结果更差时提示用户, 避免误覆盖) =====
+    CREATE TABLE IF NOT EXISTS best_backtest (
+        strategy     TEXT PRIMARY KEY,
+        metric_name  TEXT,            -- 比较指标, 默认 total_return
+        metric_value REAL,
+        params       TEXT,            -- JSON: 产生最优结果的参数
+        fingerprint  TEXT,
+        payload      TEXT,            -- JSON: 最优结果完整数据
+        created_at   TEXT
+    );
+
     -- ===== 数据覆盖索引: 每个标的已同步到哪个区间 (只补缺口) =====
     CREATE TABLE IF NOT EXISTS data_coverage (
         dataset    TEXT NOT NULL,     -- daily_bar / fundamental / realtime
@@ -580,6 +591,42 @@ def save_backtest_result(strategy: str, param_sig: str, params: dict,
         " ORDER BY created_at DESC LIMIT 10)", (strategy, strategy))
     conn.commit()
     conn.close()
+
+
+def save_best_backtest(strategy: str, metric_name: str, metric_value: float,
+                       params: dict, fingerprint: str, payload: dict):
+    """保存/更新某策略的历史最优回测结果 (每策略一条)"""
+    import json as _json
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO best_backtest "
+        "(strategy, metric_name, metric_value, params, fingerprint, payload, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (strategy, metric_name, float(metric_value),
+         _json.dumps(params, ensure_ascii=False, default=str),
+         fingerprint, _json.dumps(payload, ensure_ascii=False, default=str),
+         datetime.now().isoformat(timespec="seconds")))
+    conn.commit()
+    conn.close()
+
+
+def get_best_backtest(strategy: str):
+    """读取某策略的历史最优回测; 无记录返回 None"""
+    import json as _json
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT metric_name, metric_value, params, fingerprint, payload, created_at "
+        "FROM best_backtest WHERE strategy=?", (strategy,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        payload = _json.loads(row[4]) if row[4] else {}
+    except Exception:
+        payload = {}
+    return {"metric_name": row[0] or "total_return", "metric_value": float(row[1] or 0),
+            "params": row[2] or "{}", "fingerprint": row[3] or "",
+            "payload": payload, "created_at": row[5] or ""}
 
 
 # ==================== 下载 (akshare → SQLite) ====================

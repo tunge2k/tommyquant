@@ -298,6 +298,69 @@ class EtfRebalanceTest(unittest.TestCase):
                             if t["date"] == d and "4%" in t["reason"]]
             self.assertEqual(dev_same_day, [], f"再平衡日不应再有 4% 调仓: {dev_same_day}")
 
+    # ---------- 13: 换股周期按「实际持有时间」而非自然年月 ----------
+    def test_rank_swap_anchored_to_holding_time(self):
+        dates = pd.bdate_range("2019-01-15", periods=320)   # 起始日非月初/季初
+        t = np.arange(len(dates), dtype=float)
+        # 513500 先强后弱, 513100 前平后强 → 建仓时选 513500, 3 个月后应换成 513100
+        px_a = np.where(t < 60, 1.0, 1.0 + 0.002 * (t - 60))
+        px_b = np.where(t < 100, 1.0 + 0.002 * t, 1.2 - 0.002 * (t - 100))
+        feat = build_feat(dates, {"sh513100": px_a, "sh513500": px_b},
+                          amounts={"sh513100": 5e8, "sh513500": 3e8})
+        params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                      top_n=1, weight_fraction=0.75, min_history=40,
+                      rank_check_freq="3m", rebalance_period="off")
+        r = er.run_etf_rebalance(feat, params)
+        swaps = [x for x in r["trades"] if "换股" in x["reason"]]
+        self.assertTrue(swaps, "3 个月周期应产生换股")
+        entry = pd.Timestamp(dates[39])          # 第 40 根 K 线建仓
+        expected = entry + pd.DateOffset(months=3)
+        first = pd.Timestamp(swaps[0]["date"])
+        self.assertLessEqual(abs((first - expected).days), 5,
+                             f"首次换股应在建仓后 3 个月({expected:%Y-%m-%d})，"
+                             f"实际 {first:%Y-%m-%d}")
+
+    # ---------- 14: 月度/季度/半年周期可用 ----------
+    def test_supported_rank_periods(self):
+        dates = pd.bdate_range("2019-01-02", periods=520)   # 约 2 年
+        px = np.linspace(1.0, 1.25, len(dates))
+        feat = build_feat(dates, {"sh513100": px}, amounts={"sh513100": 5e8})
+        base = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                    top_n=1, weight_fraction=0.75, min_history=40,
+                    rebalance_period="off")
+        counts = {}
+        for freq, expect in (("1m", 18), ("3m", 6), ("6m", 3)):
+            r = er.run_etf_rebalance(feat, dict(base, rank_check_freq=freq))
+            counts[freq] = r["meta"]["annual_swaps"]
+            self.assertGreaterEqual(counts[freq], expect,
+                                    f"{freq} 周期换股次数不足: {counts[freq]} < {expect}")
+            chk = [c for c in er.validate_result(r, dict(base, rank_check_freq=freq))
+                   if "换股" in c["name"]]
+            self.assertTrue(chk and chk[0]["passed"], chk)
+        self.assertGreater(counts["1m"], counts["3m"])
+        self.assertGreater(counts["3m"], counts["6m"])
+
+    # ---------- 15: 高目标仓位 + 最大回撤段的资金充足性 ----------
+    def test_high_weight_cash_guard_in_drawdown(self):
+        dates = pd.bdate_range("2019-01-01", periods=700)
+        t = np.arange(700)
+        # 前 60 天走平, 之后持续下跌约 55% (覆盖最大回撤段)
+        px = np.where(t < 60, 1.0, np.maximum(0.45, 1.0 - 0.0016 * (t - 60)))
+        feat = build_feat(dates, {"sh513100": px}, amounts={"sh513100": 5e8})
+        params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                      top_n=1, weight_fraction=0.95, min_history=40,
+                      rank_check_freq="off", rebalance_period="off")
+        r = er.run_etf_rebalance(feat, params)
+        # 现金不允许为负 (买入必须受可用资金约束)
+        self.assertGreaterEqual(float(r["curve"]["cash"].min()), -1e-6)
+        fills = pd.DataFrame(r["fills"])
+        if len(fills):
+            self.assertGreaterEqual(float(fills["cash_after"].min()), -1e-6)
+        # 95% 目标仓位: 初始仓位应接近 95%, 且资金不足跳过次数被如实统计
+        self.assertLess(abs(float(r["meta"]["initial_position_ratio"]) - 0.95), 0.02)
+        self.assertGreaterEqual(int(r["meta"]["cash_short_skips"]), 1,
+                                "深跌期应出现资金不足跳过")
+
     # ---------- 10: 指标注册表 ----------
     def test_list_metrics(self):
         keys = {k for k, _ in er.list_metrics()}
