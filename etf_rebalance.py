@@ -169,8 +169,11 @@ def _empty_result() -> dict:
     """空结果: 与正常返回同键, 便于 UI 统一处理"""
     return {
         "curve": pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
-                               "value": pd.Series(dtype=float)}),
+                               "value": pd.Series(dtype=float),
+                               "cash": pd.Series(dtype=float),
+                               "market_value": pd.Series(dtype=float)}),
         "trades": [],
+        "fills": [],
         "performance": {},
         "selection_dates": [],
         "trade_dates": [],
@@ -337,6 +340,7 @@ class _RebalanceEngine:
         self._last_period = None
 
         self.trades: list = []
+        self.fills: list = []          # 成交流水 (兼容报告页字段契约)
         self.holdings_log: list = []
         self.curve_rows: list = []
         self.trade_dates: set = set()
@@ -419,6 +423,21 @@ class _RebalanceEngine:
         }
         self.trades.append(trade)
         self.trade_dates.add(ts)
+        # 成交流水 (报告页按事件驱动引擎字段渲染: date/time/code/direction/qty/
+        # price/amount/cost/pnl/cash_after/reason); 此处 self.cash 已是成交后余额
+        self.fills.append({
+            "date": ts,
+            "time": "00:00",
+            "code": code,
+            "direction": direction,
+            "price": round(price, 4),
+            "qty": int(qty),
+            "amount": round(amount, 2),
+            "cost": round(fees + closing_fee, 2),
+            "pnl": round(pnl, 2),
+            "cash_after": round(float(self.cash), 2),
+            "reason": reason,
+        })
 
     def _buy(self, code, target_mv, d, reason, dev_before=None):
         """按目标市值买入, 100 股整手, 受可用现金约束"""
@@ -608,6 +627,7 @@ class _RebalanceEngine:
                 "cost_price": round(pos["cost"], 3),
                 "close": round(px, 3),
                 "market_value": round(mv, 2),
+                "pnl": round((px - pos["cost"]) * pos["qty"], 2),
                 "weight": round(mv / tv, 4) if tv > 0 else 0.0,
                 "total_value": round(tv, 2),
             })
@@ -632,9 +652,12 @@ class _RebalanceEngine:
 
             self._deviation_check(d)
             self._log_holdings(d)
-            self.curve_rows.append({"date": d, "value": float(self._total_value(d))})
+            _tv = float(self._total_value(d))
+            self.curve_rows.append({"date": d, "value": _tv,
+                                    "cash": float(self.cash),
+                                    "market_value": _tv - float(self.cash)})
 
-        curve = pd.DataFrame(self.curve_rows, columns=["date", "value"])
+        curve = pd.DataFrame(self.curve_rows, columns=["date", "value", "cash", "market_value"])
         perf = calc_performance(curve, self.trades, self.initial)
         years = 0.0
         if len(curve) >= 2:
@@ -642,6 +665,7 @@ class _RebalanceEngine:
         return {
             "curve": curve,
             "trades": self.trades,
+            "fills": self.fills,
             "performance": perf,
             "selection_dates": [],
             "trade_dates": sorted(self.trade_dates),
@@ -677,8 +701,8 @@ def run_etf_rebalance(feat: dict, params: dict) -> dict:
     """ETF 调仓回测主入口
 
     参数见 `default_params()`；返回 dict 与 `run_backtest` 同构：
-      curve(date,value) / trades / performance / selection_dates / trade_dates /
-      lu_dates / holdings_log / all_trade_days / meta
+      curve(date,value,cash,market_value) / trades / fills / performance /
+      selection_dates / trade_dates / lu_dates / holdings_log / all_trade_days / meta
 
     `meta` 额外报告: rank_metric_effective、rank_metric_fallback_reason、
     annual_swaps、deviation_trades、initial_position_ratio、years、universe_size。
