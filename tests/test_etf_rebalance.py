@@ -247,6 +247,57 @@ class EtfRebalanceTest(unittest.TestCase):
         self.assertGreater((curve["value"] / peak).min(), 0.9,
                            "拆分造成了假净值崩溃")
 
+    # ---------- 12: 定期再平衡按「占总资产比例」判定 ----------
+    def _run_periodic(self, closes, n_days=460):
+        dates = pd.bdate_range("2019-01-01", periods=n_days)
+        feat = build_feat(dates, closes, amounts={c: 5e8 for c in closes})
+        params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                      top_n=1, weight_fraction=0.75, min_history=40,
+                      rank_check_freq="off", rebalance_period="1y")
+        return er.run_etf_rebalance(feat, params)
+
+    def _ratio_after_trade(self, r, date):
+        rows = [h for h in r["holdings_log"] if h["date"] == date]
+        self.assertTrue(rows)
+        mv = sum(h["market_value"] for h in rows)
+        return mv / rows[0]["total_value"]
+
+    def test_periodic_buys_when_total_assets_grow(self):
+        """总资产增长(标的上涨 + 4%网格兑现)后, 持仓占比不足 → 应买入"""
+        n = 460
+        px = np.concatenate([np.ones(60), 1.0 + 0.0012 * np.arange(n - 60)])
+        r = self._run_periodic({"sh513100": px})
+        reb = [t for t in r["trades"] if t["reason"] == "定期再平衡"]
+        self.assertTrue(reb, "应产生定期再平衡交易")
+        self.assertTrue(all(t["direction"] == "buy" for t in reb),
+                        f"总资产增长时定期再平衡应为买入, 实际: {reb}")
+        for t in reb:
+            self.assertLess(abs(self._ratio_after_trade(r, t["date"]) - 0.75), 0.03)
+
+    def test_periodic_sells_when_position_overweight(self):
+        """总资产下降(标的下跌 + 4%网格补仓)后, 持仓占比超配 → 应卖出"""
+        n = 460
+        px = np.concatenate([np.ones(60), 1.0 - 0.0008 * np.arange(n - 60)])
+        r = self._run_periodic({"sh513100": px})
+        reb = [t for t in r["trades"] if t["reason"] == "定期再平衡"]
+        self.assertTrue(reb, "应产生定期再平衡交易")
+        self.assertTrue(all(t["direction"] == "sell" for t in reb),
+                        f"持仓超配时定期再平衡应为卖出, 实际: {reb}")
+        for t in reb:
+            self.assertLess(abs(self._ratio_after_trade(r, t["date"]) - 0.75), 0.03)
+
+    def test_two_rules_no_conflict_on_rebalance_day(self):
+        """再平衡日先按占比拉回 75% 并重置中枢, 当日 4% 网格不应再反向调仓"""
+        n = 460
+        px = np.concatenate([np.ones(60), 1.0 + 0.0012 * np.arange(n - 60)])
+        r = self._run_periodic({"sh513100": px})
+        reb_dates = {t["date"] for t in r["trades"] if t["reason"] == "定期再平衡"}
+        self.assertTrue(reb_dates)
+        for d in reb_dates:
+            dev_same_day = [t for t in r["trades"]
+                            if t["date"] == d and "4%" in t["reason"]]
+            self.assertEqual(dev_same_day, [], f"再平衡日不应再有 4% 调仓: {dev_same_day}")
+
     # ---------- 10: 指标注册表 ----------
     def test_list_metrics(self):
         keys = {k for k, _ in er.list_metrics()}

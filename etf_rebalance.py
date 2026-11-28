@@ -4,16 +4,19 @@
   1. 标的池: 仅「外盘 ETF」——`price_limits.is_etf(code)` 且 `is_overseas_etf(名称)` 为真；
      名称缺失时用 code 兜底放行。港股/中概由 `is_overseas_etf` 内部剔除。
   2. 仓位: 初始建仓买入总资产的 `weight_fraction`(默认 75%)，等权分给 `top_n` 只。
-  3. 4% 偏差调仓: 单标的持仓市值相对「目标市值中枢」的偏离
+  3. 4% 偏差调仓: 非周期、逐日检查。单标的持仓市值相对「市值中枢」的偏离
      > `deviation_threshold`(默认 0.04) 时，调回中枢市值。
-     中枢 = 初始总资产 × weight_fraction / top_n（默认 100 万 × 75% / 1 = 75 万），
-     建仓时确定后保持不变；换股与定期再平衡也都拉回该中枢。
+     中枢 = 最近一次建仓/换股/定期再平衡确定的目标市值（建仓时默认
+     100 万 × 75% / 1 = 75 万）；只在定期再平衡时重置，不会每日变动。
      注意: 偏离按「市值/中枢-1」计算，不是权重百分点——75% 仓位下价格涨 23.9%
      权重只变动约 3.8 个百分点，若按权重偏离 4% 判定会长期空转。
      这是「低买高卖」触发: 涨过 +4% 卖出超出部分、跌破 -4% 用现金补足。
   4. 年度换股: `rank_check_freq` 到期日（默认每年首个交易日）按排名指标重排全池，
-     只保留前 `top_n`：卖出非目标标的，买入新目标标的。
-  5. 定期再平衡: 每 `rebalance_period`(默认 "1y") 把总持仓比例强制拉回 `weight_fraction`。
+     只保留前 `top_n`：卖出非目标标的，买入新目标标的（沿用当前市值中枢）。
+  5. 定期再平衡: 周期触发（每 `rebalance_period`，默认 1 年），按「占总资产比例」
+     判定: 目标市值 = 当前总资产 × `weight_fraction` / 持仓数。总资产增长而持仓
+     占比不足 → 买入补足；超配 → 卖出。完成后重置 4% 网格的市值中枢。
+     与第 3 条严格区分: 本规则是周期+占比口径，第 3 条是每日+固定中枢口径。
   6. 无止损: 不实现任何 MA30/回撤/动量止损清仓逻辑，全部卖出只来源于换股或再平衡。
   7. 指标回退: 所选指标 `available=False` 或历史覆盖率 < 60% 时，自动回退到 momentum，
      并在结果的 meta 里如实写明 `rank_metric_effective` / `rank_metric_fallback_reason`。
@@ -599,14 +602,25 @@ class _RebalanceEngine:
         self.annual_swaps += 1
 
     def _periodic_rebalance(self, d):
-        """定期再平衡: 把各标的持仓市值强制拉回「目标市值中枢」"""
+        """定期再平衡（周期触发）: 把持仓占总资产比例拉回 weight_fraction。
+
+        与 4% 偏差调仓的严格区分（两套规则互斥，不共用判定基准）:
+          本函数 —— 周期触发（每 rebalance_period 年）+ 按「占总资产比例」判定:
+            目标市值 = 当前总资产 × weight_fraction / 持仓数。
+            总资产增长而持仓占比不足 → **买入**补足（截图中 2017-10-19 的情形）;
+            持仓占比超配 → 卖出。
+          4% 调仓 —— 每日非周期触发 + 按「固定市值中枢」判定，见 _deviation_check。
+        再平衡完成后把 4% 网格的市值中枢重置为新的目标市值，两类规则衔接而不冲突。
+        """
         targets = self.targets or list(self.positions)
         if not targets:
             return
         reason = "定期再平衡"
         tv = self._total_value(d)
-        per = self.center_mv if self.center_mv > 0 else tv * self.weight_fraction / len(targets)
-        # 卖出超配
+        per = tv * self.weight_fraction / len(targets)
+        if per <= 0:
+            return
+        # 先卖出占比超配的标的（回笼现金），再买入占比不足的标的
         for code in list(self.positions):
             if code not in targets:
                 continue
@@ -616,9 +630,8 @@ class _RebalanceEngine:
             mv = px * self.positions[code]["qty"]
             if mv > per:
                 qty = int((mv - per) / px // 100) * 100
-                if qty > 0:
+                if qty >= 100:
                     self._sell(code, qty, d, reason)
-        # 买入低配
         for code in targets:
             px = self._price(code, d)
             if px is None:
@@ -627,11 +640,16 @@ class _RebalanceEngine:
             mv = px * pos["qty"] if pos else 0.0
             if mv < per:
                 self._buy(code, per - mv, d, reason)
+        # 4% 网格中枢重置: 下一周期内以新的 75% 目标市值为基准做高抛低吸
+        self.center_mv = per
 
     def _deviation_check(self, d):
-        """4% 网格调仓: 持仓市值相对「目标市值中枢」偏离 > 阈值时调回中枢。
+        """4% 网格调仓（非周期，逐日触发）: 持仓市值相对「市值中枢」偏离 > 阈值时调回中枢。
 
-        关键口径: 偏离 = 当前持仓市值 / 目标市值中枢 - 1 (相对市值, 非权重百分点)。
+        与 _periodic_rebalance 的边界:
+          - 本函数: 每日检查、按「固定市值中枢」判定，用于高抛低吸; 与总资产规模无关。
+          - 定期再平衡: 周期触发、按「占总资产比例」判定，用于把仓位拉回 75%。
+        关键口径: 偏离 = 当前持仓市值 / 市值中枢 - 1 (相对市值, 非权重百分点)。
         例: 中枢 75 万, 标的上涨后市值 78.1 万 → 偏离 +4.1% → 卖出 3.1 万回到 75 万。
         这样单边上涨/下跌行情也能持续触发, 不会像「权重偏离」那样因 75% 仓位下
         价格涨 4% 权重只变动约 0.8 个百分点而长期空转。
