@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY streamlit_app.py .
 COPY backtest_engine.py .
+COPY etf_rebalance.py .
 COPY fast_backtest.py .
 COPY price_limits.py .
 COPY robust_backtest.py .
