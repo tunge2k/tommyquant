@@ -138,6 +138,7 @@ FILL_REASON_LABELS = {
     "rank_drop": "排名跌出换股",
     "hold_expire": "持有到期",
     "limit_up": "涨停卖出",
+    "现金安全垫补足": "现金保护加卖",
 }
 
 
@@ -1770,6 +1771,8 @@ BT_PARAM_DEFAULTS = {
     "erc_metric": "momentum", "erc_top_n": 3, "erc_weight_pct": 75,
     "erc_dev_pct": 4, "erc_rank_freq": "1y", "erc_rebal_period": "1y",
     "erc_min_amount": 0.01, "erc_min_history": 250,
+    # 现金安全垫保护: 余额低于「倍数 × 单次偏差调仓所需资金」时, 卖出调仓额外加卖
+    "erc_cash_guard": True, "erc_guard_mult": 4.0, "erc_guard_max_extra": 50,
 }
 for _k, _v in BT_PARAM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -1914,6 +1917,12 @@ def _settings_from_params(strategy_key: str, p: dict) -> dict:
             out["erc_min_amount"] = p["min_amount"]
         if p.get("min_history") is not None:
             out["erc_min_history"] = int(p["min_history"])
+        if p.get("cash_guard_enabled") is not None:
+            out["erc_cash_guard"] = bool(p["cash_guard_enabled"])
+        if p.get("cash_guard_mult") is not None:
+            out["erc_guard_mult"] = float(p["cash_guard_mult"])
+        if p.get("cash_guard_max_extra") is not None:
+            out["erc_guard_max_extra"] = int(round(float(p["cash_guard_max_extra"]) * 100))
     return out
 
 
@@ -1963,7 +1972,8 @@ _APPLY_KEYS = {
                  "etf_abs_mom_days", "etf_abs_mom_min"),
     "ETF调仓策略": ("erc_metric", "erc_top_n", "erc_weight_pct", "erc_dev_pct",
                     "erc_rank_freq", "erc_rebal_period", "erc_min_amount",
-                    "erc_min_history"),
+                    "erc_min_history", "erc_cash_guard", "erc_guard_mult",
+                    "erc_guard_max_extra"),
 }
 
 # 函数式策略: 引擎参数名 -> 界面 session_state 键
@@ -2246,6 +2256,9 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "min_amount": float(ss.get("erc_min_amount", 0.01)),
             "min_history": int(ss.get("erc_min_history", 250)),
             "overseas_only": True,
+            "cash_guard_enabled": bool(ss.get("erc_cash_guard", True)),
+            "cash_guard_mult": float(ss.get("erc_guard_mult", 4.0)),
+            "cash_guard_max_extra": float(ss.get("erc_guard_max_extra", 50)) / 100.0,
         })
     elif strategy_key in _FN_PARAM_MAP:
         p["params"] = {k: ss.get(v) for k, v in _FN_PARAM_MAP[strategy_key].items()}
@@ -2413,6 +2426,43 @@ def _render_etf_rebalance_validation(result: dict, params: dict):
                if meta.get("cash_short_skips") else "")
             + f" · 初始仓位 {float(meta.get('initial_position_ratio', 0)) * 100:.1f}%"
             + f" · 标的池 {meta.get('universe_size', 0)} 只")
+        # 现金安全垫保护: 参数 + 触发统计 + 逐次审计记录
+        _cg = meta.get("cash_guard") or {}
+        _cg_log = meta.get("cash_guard_log") or []
+        if _cg.get("enabled"):
+            st.caption(
+                f"🛡 现金安全垫保护：预警 {float(_cg.get('mult', 0)):.1f}×单次偏差调仓需求"
+                f"（阈值 {float(_cg.get('threshold', 0)):,.0f} 元）"
+                f" · 触发 {int(_cg.get('triggers', 0) or 0)} 次"
+                + (f" · 额外卖出 {float(_cg.get('extra_sell_amount', 0)):,.0f} 元"
+                   if _cg_log else "")
+                + f" · 单次额外上限 {float(_cg.get('max_extra', 0)):.0%}")
+            if _cg_log:
+                with st.expander(f"🛡 现金保护触发记录（{len(_cg_log)} 次）", expanded=False):
+                    _cg_df = pd.DataFrame(_cg_log).rename(columns={
+                        "date": "日期", "code": "标的", "trigger_cash": "触发时余额",
+                        "threshold": "预警阈值", "planned_qty": "原计划卖出(股)",
+                        "extra_qty": "额外卖出(股)", "actual_qty": "实际卖出(股)",
+                        "extra_ratio": "额外比例", "extra_value": "补足现金",
+                        "target_position": "目标仓位", "position_pct_after": "执行后仓位",
+                        "cash_after": "执行后余额", "cash_ratio_after": "执行后现金比例",
+                        "unit_need": "单次调仓需求", "mult": "预警倍数",
+                    })
+                    _cols = [c for c in ("日期", "标的", "触发时余额", "预警阈值",
+                                         "原计划卖出(股)", "额外卖出(股)", "实际卖出(股)",
+                                         "额外比例", "补足现金", "目标仓位", "执行后仓位",
+                                         "执行后余额") if c in _cg_df.columns]
+                    _show = _cg_df[_cols].copy()
+                    if "额外比例" in _show.columns:
+                        _show["额外比例"] = _show["额外比例"].apply(
+                            lambda v: f"{float(v):.0%}")
+                    if "目标仓位" in _show.columns:
+                        _show["目标仓位"] = _show["目标仓位"].apply(
+                            lambda v: f"{float(v):.0%}")
+                    if "执行后仓位" in _show.columns:
+                        _show["执行后仓位"] = _show["执行后仓位"].apply(
+                            lambda v: f"{float(v):.0%}")
+                    st.dataframe(_show, use_container_width=True, hide_index=True)
     try:
         checks = _erc.validate_result(result, params)
     except Exception as _e:
@@ -4619,6 +4669,17 @@ elif page == "backtest":
                                 key=_rbd, help="距上次再平衡满一个周期后把持仓占比拉回目标仓位，"
                                                "周期按实际持有时间计算")
                 st.caption("本策略不设趋势止损（用户确认口径），仅靠 4% 偏差调仓 + 定期换股 + 定期再平衡控制风险。")
+                _g = st.columns([1.2, 1, 1, 1.6])
+                _g[0].checkbox("现金安全垫保护", key=_draft("erc_cash_guard", True),
+                               help="可用余额低于预警值时，卖出调仓会自动多卖一部分补足现金垫；"
+                                    "默认开启，关闭后回到纯规则调仓")
+                _num("预警倍数", 1.0, 10.0, "erc_guard_mult", step=0.5, fmt="%.1f",
+                     col=_g[1],
+                     help="预警值 = 倍数 × 单次偏差调仓所需资金（默认 4 倍）；"
+                          "可用余额低于该值时触发加卖")
+                _num("额外卖出上限(%)", 5, 100, "erc_guard_max_extra", step=5, col=_g[2],
+                     help="单次额外卖出量 ≤ 原计划卖出量 × 该比例（默认 50%），防止过度卖出")
+                _g[3].caption("触发后自动加卖并写入审计日志（时间/余额/原计划量/实际量），无需人工干预。")
         elif strategy_choice == "市值策略":
             _u1, _u2, _u3 = st.tabs(["① 选股与剔除", "② 趋势与止损", "③ 换股与调仓"])
             with _u1:

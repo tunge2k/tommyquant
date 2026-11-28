@@ -372,5 +372,79 @@ class EtfRebalanceTest(unittest.TestCase):
                 self.assertIn(field, spec)
 
 
+class CashGuardTest(unittest.TestCase):
+    """现金安全垫保护: 余额 < 倍数×单次调仓需求 且当日有卖出调仓 → 额外加卖"""
+
+    def setUp(self):
+        self._p_name = mock.patch.object(er, "_etf_name_map", return_value=NAMES)
+        self._p_prem = mock.patch.object(er, "_load_premium_map", return_value={})
+        self._p_name.start()
+        self._p_prem.start()
+
+    def tearDown(self):
+        self._p_name.stop()
+        self._p_prem.stop()
+
+    def _run(self, rising=True, **over):
+        n = 400
+        dates = pd.bdate_range("2019-01-01", periods=n)
+        t = np.arange(n) - 60
+        step = 0.0015 if rising else -0.0012
+        px = np.where(t < 0, 1.0, 1.0 + step * np.maximum(t, 0))
+        feat = build_feat(dates, {"sh513100": px}, amounts={"sh513100": 5e8})
+        params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                      top_n=1, weight_fraction=0.95, min_history=40,
+                      rank_check_freq="off", rebalance_period="off")
+        params.update(over)
+        r = er.run_etf_rebalance(feat, params)
+        return r, params
+
+    def test_extra_sell_when_cash_below_threshold(self):
+        r, params = self._run()
+        guard = r["meta"]["cash_guard"]
+        self.assertTrue(guard["enabled"])
+        log = r["meta"]["cash_guard_log"]
+        self.assertTrue(log, "95% 仓位 + 上涨触发卖出时应记录现金保护")
+
+        for e in log:
+            # 触发前余额必须真的低于预警阈值
+            self.assertLess(e["trigger_cash"], e["threshold"])
+            # 实际卖出量 > 初始计划卖出量, 且额外量不超过上限
+            self.assertGreater(e["extra_qty"], 0)
+            self.assertEqual(e["actual_qty"], e["planned_qty"] + e["extra_qty"])
+            self.assertLessEqual(e["extra_qty"],
+                                 e["planned_qty"] * guard["max_extra"] + 1e-9)
+            # 只补到预警线, 不过度卖出
+            self.assertLessEqual(e["cash_after"], e["threshold"] + 1e-6)
+            # 调整后实际仓位 < 原目标仓位, 且审计字段齐全
+            self.assertLess(e["position_pct_after"], e["target_position"])
+            for k in ("date", "trigger_cash", "planned_qty", "actual_qty",
+                      "target_position", "position_pct_after", "cash_after"):
+                self.assertIn(k, e)
+        self.assertEqual(guard["triggers"], len(log))
+
+        checks = er.validate_result(r, params)
+        gchk = [c for c in checks if "现金保护" in c["name"]]
+        self.assertTrue(gchk and gchk[0]["passed"], gchk)
+
+    def test_zero_max_extra_blocks_extra_sell(self):
+        r, params = self._run(cash_guard_max_extra=0.0)
+        self.assertEqual(r["meta"]["cash_guard_log"], [])
+        self.assertEqual(r["meta"]["cash_guard"]["triggers"], 0)
+        gchk = [c for c in er.validate_result(r, params) if "现金保护" in c["name"]]
+        self.assertTrue(gchk and gchk[0]["passed"], gchk)
+
+    def test_disabled_guard_keeps_original_behavior(self):
+        r = self._run(cash_guard_enabled=False)[0]
+        self.assertFalse(r["meta"]["cash_guard"]["enabled"])
+        self.assertEqual(r["meta"]["cash_guard_log"], [])
+
+    def test_no_trigger_on_buy_only_days(self):
+        """下跌日只有补仓买入, 不触发加卖 (保护仅作用于卖出调仓)"""
+        r = self._run(rising=False)[0]
+        self.assertEqual(r["meta"]["cash_guard_log"], [])
+        self.assertGreaterEqual(int(r["meta"]["cash_short_skips"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,12 @@
      占比不足 → 买入补足；超配 → 卖出。完成后重置 4% 网格的市值中枢。
      与第 3 条严格区分: 本规则是周期+占比口径，第 3 条是每日+固定中枢口径。
   6. 无止损: 不实现任何 MA30/回撤/动量止损清仓逻辑，全部卖出只来源于换股或再平衡。
-  7. 指标回退: 所选指标 `available=False` 或历史覆盖率 < 60% 时，自动回退到 momentum，
+  7. 现金安全垫保护（余额不足主动风控）: 可用现金低于
+     `cash_guard_mult`(默认 4) × 单次偏差调仓所需资金时，若当日有卖出调仓，
+     则在原计划卖出量之外**额外卖出**把现金补回预警线；单次额外卖出量不超过
+     原计划卖出量的 `cash_guard_max_extra`(默认 50%)；每次触发写入
+     `meta.cash_guard_log`（时间/触发余额/原计划量/实际执行量/仓位）。
+  8. 指标回退: 所选指标 `available=False` 或历史覆盖率 < 60% 时，自动回退到 momentum，
      并在结果的 meta 里如实写明 `rank_metric_effective` / `rank_metric_fallback_reason`。
      能由 bars 推导的指标（规模=cap_yi、成交额、波动率、回撤）自动计算；
      拿不到的（PE/PB/百分位/稀疏的溢价率历史）自动回退，绝不外推假数据。
@@ -148,6 +153,11 @@ def default_params() -> dict:
         "min_history": 250,     # K 线根数
         "overseas_only": True,
         "cost": None,
+        # 现金安全垫保护: 可用余额低于「倍数 × 单次偏差调仓所需资金」时,
+        # 在当日卖出调仓的基础上额外卖出补足现金, 防止余额耗尽导致后续补仓失败
+        "cash_guard_enabled": True,
+        "cash_guard_mult": 4.0,
+        "cash_guard_max_extra": 0.5,
     }
 
 
@@ -190,6 +200,10 @@ def _empty_result() -> dict:
             "initial_position_ratio": 0.0,
             "years": 0.0,
             "universe_size": 0,
+            "cash_guard": {"enabled": False, "mult": 0.0, "max_extra": 0.0,
+                           "threshold": 0.0, "triggers": 0,
+                           "extra_sell_amount": 0.0},
+            "cash_guard_log": [],
         },
     }
 
@@ -381,6 +395,24 @@ class _RebalanceEngine:
         self.next_rank = None
         self.cash_short_skips = 0     # 资金不足未能执行的 4% 补仓次数
 
+        # 现金安全垫保护 (余额不足主动风控, 详见 _apply_cash_guard)
+        _ge = params.get("cash_guard_enabled")
+        self.guard_enabled = True if _ge is None else bool(_ge)
+        try:
+            self.guard_mult = max(float(params.get("cash_guard_mult") or 4.0), 1.0)
+        except (TypeError, ValueError):
+            self.guard_mult = 4.0
+        try:
+            _me = params.get("cash_guard_max_extra")
+            _me = 0.5 if _me is None else float(_me)
+        except (TypeError, ValueError):
+            _me = 0.5
+        # 单次最大额外卖出比例: 相对「原计划卖出量」, 限制在 0~100%
+        self.guard_max_extra = min(max(_me, 0.0), 1.0)
+        self.guard_threshold = 0.0      # 最近一次计算的预警阈值 (元)
+        self.cash_guard_log: list = []  # 每次触发的完整记录 (审计用)
+        self._day_sells: list = []      # 当日已执行的卖出调仓 [(code, qty, price)]
+
         self.trades: list = []
         self.fills: list = []          # 成交流水 (兼容报告页字段契约)
         self.holdings_log: list = []
@@ -548,6 +580,81 @@ class _RebalanceEngine:
         self._record(d, code, "sell", qty, fp, amount, fees, reason,
                      pnl=pnl, dev_before=dev_before, entry=entry,
                      closing_fee=closing_fee)
+        # 记录当日「计划内」的卖出调仓, 供收盘后现金安全垫保护判断是否加卖
+        if reason in ("4%偏差调仓", "定期再平衡"):
+            self._day_sells.append((code, int(qty), float(fp)))
+
+    # ---------- 现金安全垫保护 ----------
+    def _guard_unit_need(self) -> float:
+        """单次偏差调仓所需资金: 市值中枢 × 网格阈值 (跌到阈值时需补的金额)"""
+        return float(self.center_mv) * float(self.dev_threshold)
+
+    def _apply_cash_guard(self, d):
+        """可用余额低于「倍数 × 单次偏差调仓所需资金」且当日有卖出调仓时,
+        在原计划卖出量之外额外卖出, 把现金垫补回预警线。
+
+        约束 (防止过度卖出):
+          - 额外卖出量 ≤ 原计划卖出量 × guard_max_extra;
+          - 额外卖出总额 ≤ 现金缺口 (补到预警线即止);
+          - 额外卖出不能超过该标的剩余持仓;
+          - 仅在「卖出调仓日」触发, 不会在下跌买入日反向砸盘。
+        每次触发写入 cash_guard_log (时间/触发余额/阈值/计划与实际数量/仓位)。
+        """
+        if not self.guard_enabled or not self._day_sells:
+            return
+        unit_need = self._guard_unit_need()
+        if unit_need <= 0:
+            return
+        threshold = self.guard_mult * unit_need
+        self.guard_threshold = threshold
+        cash_before = float(self.cash)
+        if cash_before >= threshold:
+            return
+        need_value = threshold - cash_before
+        planned_value = sum(q * px for _, q, px in self._day_sells)
+        # 单次最大额外卖出金额 (相对原计划卖出总额)
+        cap_value = self.guard_max_extra * planned_value
+        budget = min(need_value, cap_value)
+        if budget <= 0:
+            return
+        tv = self._total_value(d)
+        for code, qty, px in list(self._day_sells):
+            if budget <= 0:
+                break
+            pos = self.positions.get(code)
+            if pos is None or px <= 0:
+                continue
+            max_extra_qty = int(self.guard_max_extra * qty // 100) * 100
+            qty_extra = int(min(budget, max_extra_qty * px) / px // 100) * 100
+            # 不得把仓位卖空: 保护性加卖最多卖到只剩 1 手 (全清由换股/再平衡决定)
+            qty_extra = min(qty_extra, int(pos["qty"] // 100) * 100 - 100)
+            if qty_extra < 100:
+                continue
+            cash0 = float(self.cash)
+            self._sell(code, qty_extra, d, "现金安全垫补足")
+            gained = float(self.cash) - cash0
+            if gained <= 0:
+                continue
+            budget -= gained
+            mv_after = sum((self._price(c, d) or 0) * p["qty"]
+                           for c, p in self.positions.items())
+            self.cash_guard_log.append({
+                "date": str(pd.Timestamp(d))[:10],
+                "code": code,
+                "trigger_cash": round(cash_before, 2),
+                "threshold": round(threshold, 2),
+                "unit_need": round(unit_need, 2),
+                "mult": round(self.guard_mult, 2),
+                "planned_qty": int(qty),
+                "extra_qty": int(qty_extra),
+                "actual_qty": int(qty + qty_extra),
+                "extra_ratio": round(qty_extra / qty, 4) if qty else 0.0,
+                "extra_value": round(gained, 2),
+                "target_position": round(self.weight_fraction, 4),
+                "position_pct_after": (round(mv_after / tv, 4) if tv > 0 else 0.0),
+                "cash_after": round(float(self.cash), 2),
+                "cash_ratio_after": (round(float(self.cash) / tv, 6) if tv > 0 else 0.0),
+            })
 
     # ---------- 事件 ----------
     def _try_entry(self, d):
@@ -708,6 +815,7 @@ class _RebalanceEngine:
     def run(self) -> dict:
         for d in self.calendar:
             d = pd.Timestamp(d)
+            self._day_sells = []          # 当日计划内卖出调仓 (供现金保护判断)
             if not self.entered:
                 self._try_entry(d)
             else:
@@ -723,6 +831,7 @@ class _RebalanceEngine:
                         self.next_reb = self.next_reb + self.reb_period[1]
 
             self._deviation_check(d)
+            self._apply_cash_guard(d)      # 收盘前: 余额低于预警线则加卖补足现金垫
             self._log_holdings(d)
             _tv = float(self._total_value(d))
             self.curve_rows.append({"date": d, "value": _tv,
@@ -753,6 +862,17 @@ class _RebalanceEngine:
                 "initial_position_ratio": round(self.initial_ratio, 6),
                 "years": round(years, 4),
                 "universe_size": len(self.symbols),
+                # 现金安全垫保护: 参数 + 触发统计 + 逐次审计记录
+                "cash_guard": {
+                    "enabled": bool(self.guard_enabled),
+                    "mult": round(self.guard_mult, 2),
+                    "max_extra": round(self.guard_max_extra, 4),
+                    "threshold": round(self.guard_threshold, 2),
+                    "triggers": len(self.cash_guard_log),
+                    "extra_sell_amount": round(
+                        sum(e.get("extra_value", 0.0) for e in self.cash_guard_log), 2),
+                },
+                "cash_guard_log": self.cash_guard_log[:500],
             },
         }
 
@@ -906,4 +1026,20 @@ def validate_result(result: dict, params: dict) -> list[dict]:
         "passed": len(stop_trades) == 0,
         "detail": f"止损类交易 {len(stop_trades)} 笔",
     })
+
+    # 6. 现金安全垫保护: 额外卖出不得超过「原计划卖出量 × 上限比例」
+    guard = meta.get("cash_guard") or {}
+    if guard.get("enabled"):
+        log = meta.get("cash_guard_log") or []
+        cap = float(guard.get("max_extra", 0.0) or 0.0)
+        over = [e for e in log if float(e.get("planned_qty", 0) or 0) > 0
+                and float(e.get("extra_qty", 0)) >
+                cap * float(e.get("planned_qty", 0)) + 1e-9]
+        neg = [e for e in log if float(e.get("cash_after", 0)) < -1e-6]
+        checks.append({
+            "name": "现金保护额外卖出≤上限",
+            "passed": bool(not over and not neg),
+            "detail": (f"触发 {len(log)} 次，上限 {cap:.0%}；"
+                       f"超额 {len(over)} 次，负余额 {len(neg)} 次"),
+        })
     return checks
