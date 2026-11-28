@@ -1,0 +1,782 @@
+"""ETF 调仓回测引擎（独立实现，不依赖也不修改现有事件驱动引擎）
+
+策略口径（用户已确认，不含任何止损）:
+  1. 标的池: 仅「外盘 ETF」——`price_limits.is_etf(code)` 且 `is_overseas_etf(名称)` 为真；
+     名称缺失时用 code 兜底放行。港股/中概由 `is_overseas_etf` 内部剔除。
+  2. 仓位: 初始建仓买入总资产的 `weight_fraction`(默认 75%)，等权分给 `top_n` 只。
+  3. 4% 偏差调仓: 单标的当前权重与目标权重(=weight_fraction/top_n)偏离
+     > `deviation_threshold`(默认 0.04) 时，调回目标权重。这是「低买高卖」的
+     权重补充触发: 涨多了卖出超配、跌多了用现金补足。
+  4. 年度换股: `rank_check_freq` 到期日（默认每年首个交易日）按排名指标重排全池，
+     只保留前 `top_n`：卖出非目标标的，买入新目标标的。
+  5. 定期再平衡: 每 `rebalance_period`(默认 "1y") 把总持仓比例强制拉回 `weight_fraction`。
+  6. 无止损: 不实现任何 MA30/回撤/动量止损清仓逻辑，全部卖出只来源于换股或再平衡。
+  7. 指标回退: 所选指标 `available=False` 或历史覆盖率 < 60% 时，自动回退到 momentum，
+     并在结果的 meta 里如实写明 `rank_metric_effective` / `rank_metric_fallback_reason`。
+     能由 bars 推导的指标（规模=cap_yi、成交额、波动率、回撤）自动计算；
+     拿不到的（PE/PB/百分位/稀疏的溢价率历史）自动回退，绝不外推假数据。
+
+撮合口径: 逐日循环、**当日收盘价**撮合（低频调仓策略可接受，比 T+1 更简单）。
+买入按 100 股整手取整，卖出可全部卖出；现金不足时按可用现金等比缩减。
+
+与 `run_backtest` 返回结构保持一致，便于现有 Streamlit 报告页直接渲染。
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+import price_limits
+from backtest_engine import (
+    CostModel,
+    _etf_name_map,
+    calc_performance,
+    is_overseas_etf,
+)
+
+DEFAULT_METRIC = "momentum"
+
+# 排序指标注册表: key -> {label(中文), higher_better(原值越大越好), available, note}
+METRIC_SPECS: dict = {
+    "momentum": {
+        "label": "综合动量(20/120/250日)",
+        "higher_better": True,
+        "available": True,
+        "note": "",
+    },
+    "mom_20": {"label": "20日动量", "higher_better": True, "available": True, "note": ""},
+    "mom_60": {"label": "60日动量", "higher_better": True, "available": True, "note": ""},
+    "mom_120": {"label": "120日动量", "higher_better": True, "available": True, "note": ""},
+    "mom_250": {"label": "250日动量", "higher_better": True, "available": True, "note": ""},
+    "amount_20": {
+        "label": "20日均成交额",
+        "higher_better": True,
+        "available": True,
+        "note": "",
+    },
+    "scale": {
+        "label": "规模(ETF规模)",
+        "higher_better": True,
+        "available": False,
+        "note": "ETF 日线无份额历史(outstanding_share 缺失), 仅近期才有规模数据",
+    },
+    "max_dd_250": {
+        "label": "近250日回撤(浅者优先)",
+        "higher_better": True,
+        "available": True,
+        "note": "值为负, 越大越接近 0 (回撤越浅)",
+    },
+    "vol_60": {
+        "label": "60日波动率(低者优先)",
+        "higher_better": False,
+        "available": True,
+        "note": "pct 的 60 日滚动标准差, 排序时取负",
+    },
+    "premium": {
+        "label": "溢价率(低者优先)",
+        "higher_better": False,
+        "available": True,
+        "note": "来自 data_store ETF 增强因子, 历史可能稀疏; 覆盖率不足时自动回退",
+    },
+    "pe_ttm": {
+        "label": "市盈率TTM",
+        "higher_better": False,
+        "available": False,
+        "note": "ETF 无 PE/PB 数据",
+    },
+    "pb": {
+        "label": "市净率",
+        "higher_better": False,
+        "available": False,
+        "note": "ETF 无 PE/PB 数据",
+    },
+    "pe_pct": {
+        "label": "PE 历史百分位",
+        "higher_better": False,
+        "available": False,
+        "note": "ETF 无 PE/PB 历史, 无法计算百分位",
+    },
+    "pb_pct": {
+        "label": "PB 历史百分位",
+        "higher_better": False,
+        "available": False,
+        "note": "ETF 无 PE/PB 历史, 无法计算百分位",
+    },
+}
+
+# 直接取列的指标 -> (列名, 方向符号)
+_METRIC_COLS = {
+    "mom_20": ("ret_20", 1.0),
+    "mom_60": ("ret_60", 1.0),
+    "mom_120": ("ret_120", 1.0),
+    "mom_250": ("ret_250", 1.0),
+    "amount_20": ("amount_ma20", 1.0),
+    "scale": ("cap_yi", 1.0),
+    "max_dd_250": ("max_dd_250", 1.0),
+    "vol_60": ("vol_60", -1.0),
+}
+
+# 综合动量权重 (缺失按可得权重归一化)
+_MOM_WEIGHTS = (("ret_20", 0.2), ("ret_120", 0.3), ("ret_250", 0.5))
+
+_RANK_REASON = {
+    "yearly": "年度换股",
+    "quarterly": "季度换股",
+    "monthly": "月度换股",
+}
+
+
+def list_metrics() -> list[tuple[str, str]]:
+    """返回 [(key, 中文标签), ...]，供界面下拉框使用"""
+    return [(k, v["label"]) for k, v in METRIC_SPECS.items()]
+
+
+def default_params() -> dict:
+    """默认参数（全部可选）"""
+    return {
+        "initial_capital": 1_000_000,
+        "start": None,
+        "end": None,
+        "top_n": 3,
+        "weight_fraction": 0.75,
+        "deviation_threshold": 0.04,
+        "rank_metric": DEFAULT_METRIC,
+        "rank_check_freq": "yearly",
+        "rebalance_period": "1y",
+        "min_amount": 0.01,     # 亿元
+        "min_history": 250,     # K 线根数
+        "overseas_only": True,
+        "cost": None,
+    }
+
+
+# ==================== 数据准备 ====================
+
+def _load_premium_map() -> dict:
+    """读取溢价率因子 {date: {symbol: 值}}，兼容不同函数名；无库/无表时返回空"""
+    try:
+        import data_store
+        fn = getattr(data_store, "etf_ext_maps", None) or getattr(
+            data_store, "load_etf_factor_maps", None)
+        if fn is None:
+            return {}
+        return (fn() or {}).get("premium") or {}
+    except Exception:
+        return {}
+
+
+def _empty_result() -> dict:
+    """空结果: 与正常返回同键, 便于 UI 统一处理"""
+    return {
+        "curve": pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"),
+                               "value": pd.Series(dtype=float)}),
+        "trades": [],
+        "performance": {},
+        "selection_dates": [],
+        "trade_dates": [],
+        "lu_dates": [],
+        "holdings_log": [],
+        "all_trade_days": [],
+        "meta": {
+            "rank_metric_effective": DEFAULT_METRIC,
+            "rank_metric_fallback_reason": "",
+            "annual_swaps": 0,
+            "deviation_trades": 0,
+            "initial_position_ratio": 0.0,
+            "years": 0.0,
+            "universe_size": 0,
+        },
+    }
+
+
+def _prepare_symbol(code: str, name: str, df: pd.DataFrame,
+                    calendar: pd.DatetimeIndex) -> dict:
+    """把单只 ETF 的因子表对齐到回测交易日历, 缺失日向前填充"""
+    d = pd.to_datetime(df["date"])
+    raw_idx = pd.DatetimeIndex(d)
+
+    def _ser(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(np.nan, index=calendar, dtype=float)
+        s = pd.to_numeric(df[col], errors="coerce")
+        s.index = raw_idx
+        return s.reindex(calendar).ffill()
+
+    sym = {"code": code, "name": name}
+    for col in ("close", "amount", "amount_ma20", "cap_yi",
+                "ret_20", "ret_60", "ret_120", "ret_250", "max_dd_250"):
+        sym[col] = _ser(col)
+    # pct 缺失时由收盘价推导
+    if "pct" in df.columns:
+        sym["pct"] = _ser("pct")
+    else:
+        sym["pct"] = sym["close"].pct_change() * 100
+    sym["vol_60"] = sym["pct"].rolling(60).std()
+
+    # 截至每个交易日可用的 K 线根数（用于 min_history 过滤）
+    counts = np.searchsorted(raw_idx.values, calendar.values, side="right")
+    sym["nbar"] = pd.Series(counts, index=calendar)
+    return sym
+
+
+def _build_symbols(feat: dict, calendar: pd.DatetimeIndex,
+                   overseas_only: bool, name_map: dict) -> list[dict]:
+    """筛选标的池: 仅场内基金 + (可选)外盘 ETF"""
+    symbols = []
+    for code, df in feat.items():
+        if df is None or len(df) == 0 or "date" not in df.columns:
+            continue
+        if not price_limits.is_etf(code):
+            continue
+        name = str(name_map.get(code) or "")
+        # 名称缺失时无法判断区域, 按规格用 code 兜底放行
+        if overseas_only and name and not is_overseas_etf(name):
+            continue
+        symbols.append(_prepare_symbol(code, name or code, df, calendar))
+    symbols.sort(key=lambda s: s["code"])
+    return symbols
+
+
+def _resolve_metric(requested: str, symbols: list[dict],
+                    calendar: pd.DatetimeIndex, premium_map: dict) -> tuple:
+    """确定实际使用的排序指标，必要时回退 momentum
+
+    返回 (effective_metric, fallback_reason)。reason 为空串表示未回退。
+    """
+    spec = METRIC_SPECS.get(requested)
+    if spec is None:
+        return DEFAULT_METRIC, f"未知排序指标 {requested}，已自动回退到 {DEFAULT_METRIC}"
+    if not spec["available"]:
+        return DEFAULT_METRIC, (
+            f"指标 {requested} 不可用（{spec['note']}），已自动回退到 {DEFAULT_METRIC}")
+
+    # 历史覆盖率: 抽样交易日内有多少比例能取到有效指标值
+    cov = _coverage(requested, symbols, calendar, premium_map)
+    if cov < 0.60:
+        return DEFAULT_METRIC, (
+            f"指标 {requested} 历史覆盖率 {cov:.0%} < 60%，"
+            f"已自动回退到 {DEFAULT_METRIC}")
+    return requested, ""
+
+
+def _score(symbol: dict, d, metric: str, premium_map: dict) -> float:
+    """取某标的在某日的排序分数（越大越优先）"""
+    if metric == "premium":
+        v = (premium_map.get(str(d)[:10]) or {}).get(symbol["code"])
+        if v is None:
+            return np.nan
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return np.nan
+        return -v if np.isfinite(v) else np.nan
+    if metric == "momentum":
+        num = den = 0.0
+        for col, w in _MOM_WEIGHTS:
+            v = symbol[col].get(d, np.nan)
+            if np.isfinite(v):
+                num += float(v) * w
+                den += w
+        return num / den if den > 0 else np.nan
+    col, sign = _METRIC_COLS.get(metric, (_METRIC_COLS["mom_20"][0], 1.0))
+    v = symbol[col].get(d, np.nan)
+    return sign * float(v) if np.isfinite(v) else np.nan
+
+
+def _coverage(metric: str, symbols: list[dict], calendar: pd.DatetimeIndex,
+              premium_map: dict) -> float:
+    """抽样估计指标历史覆盖率"""
+    if len(calendar) == 0 or not symbols:
+        return 0.0
+    step = max(1, len(calendar) // 60)
+    total = ok = 0
+    for d in calendar[::step]:
+        for s in symbols:
+            if s["nbar"].get(d, 0) < 1:
+                continue
+            total += 1
+            if np.isfinite(_score(s, d, metric, premium_map)):
+                ok += 1
+    return ok / total if total else 0.0
+
+
+# ==================== 回测引擎 ====================
+
+class _RebalanceEngine:
+    """ETF 调仓回测核心状态机（逐日循环、收盘价撮合）"""
+
+    def __init__(self, symbols: list[dict], calendar: pd.DatetimeIndex,
+                 params: dict, metric: str, premium_map: dict):
+        self.symbols = symbols
+        self.by_code = {s["code"]: s for s in symbols}
+        self.calendar = calendar
+        self.p = params
+        self.metric = metric
+        self.premium = premium_map
+
+        self.initial = float(params["initial_capital"])
+        self.cash = self.initial
+        self.top_n = max(int(params["top_n"]), 1)
+        self.weight_fraction = float(params["weight_fraction"])
+        self.dev_threshold = float(params["deviation_threshold"])
+        self.min_amount = float(params["min_amount"])
+        self.min_history = int(params["min_history"])
+        self.rank_freq = str(params["rank_check_freq"] or "off").lower()
+        self.reb_years = _parse_years(params["rebalance_period"])
+
+        cost = params.get("cost")
+        if not isinstance(cost, dict):
+            cost = {}   # 兼容把缓存指纹串放在 cost 上的调用方
+        self.cm = CostModel(**(cost or {}))
+
+        self.positions: dict = {}   # code -> {qty, cost, entry_date, entry_fee}
+        self.targets: list = []     # 最近一次选出的目标标的
+        self.entered = False
+        self.entry_date = None
+        self.next_reb = None
+        self._last_period = None
+
+        self.trades: list = []
+        self.holdings_log: list = []
+        self.curve_rows: list = []
+        self.trade_dates: set = set()
+        self.annual_swaps = 0
+        self.deviation_trades = 0
+        self.initial_ratio = 0.0
+
+    # ---------- 行情辅助 ----------
+    def _price(self, code, d):
+        s = self.by_code.get(code)
+        if s is None:
+            return None
+        px = s["close"].get(d, np.nan)
+        if not np.isfinite(px) or px <= 0:
+            return None
+        return float(px)
+
+    def _day_amount(self, code, d):
+        s = self.by_code.get(code)
+        if s is None:
+            return 0.0
+        v = s["amount"].get(d, 0.0)
+        return float(v) if np.isfinite(v) else 0.0
+
+    def _total_value(self, d) -> float:
+        """账户总市值 = 现金 + 各持仓按当日收盘价估值"""
+        tv = self.cash
+        for code, pos in self.positions.items():
+            px = self._price(code, d)
+            if px is None:
+                px = pos["cost"]
+            tv += px * pos["qty"]
+        return tv
+
+    # ---------- 选品 ----------
+    def _candidates(self, d) -> list:
+        """当日候选池, 按指标从优到劣排序"""
+        out = []
+        floor = self.min_amount * 1e8   # 亿元 -> 元
+        for s in self.symbols:
+            if s["nbar"].get(d, 0) < self.min_history:
+                continue
+            amt = s["amount_ma20"].get(d, np.nan)
+            if not np.isfinite(amt) or float(amt) < floor:
+                continue
+            sc = _score(s, d, self.metric, self.premium)
+            if not np.isfinite(sc):
+                continue
+            out.append((float(sc), s["code"]))
+        out.sort(key=lambda x: (-x[0], x[1]))
+        return [code for _, code in out]
+
+    # ---------- 交易执行 ----------
+    def _record(self, d, code, direction, qty, price, amount, fees, reason,
+                pnl=0.0, dev_before=None, entry=None, closing_fee=0.0):
+        s = self.by_code.get(code)
+        name = s["name"] if s else code
+        ts = pd.Timestamp(d)
+        trade = {
+            "date": ts,
+            "code": code,
+            "name": name,
+            "direction": direction,
+            "price": round(price, 4),
+            "quantity": int(qty),
+            "amount": round(amount, 2),
+            "reason": reason,
+            "pnl": round(pnl, 2),
+            # 以下键兼容 calc_performance / 现有报告页
+            "buy_date": entry["entry_date"] if (entry and direction == "sell") else ts,
+            "sell_date": ts if direction == "sell" else None,
+            "buy_price": round(entry["cost"], 4) if (entry and direction == "sell") else round(price, 4),
+            "sell_price": round(price, 4) if direction == "sell" else None,
+            "buy_qty": int(qty),
+            "sell_qty": int(qty) if direction == "sell" else 0,
+            "shares": int(qty),
+            "days": (ts - pd.Timestamp(entry["entry_date"])).days if (entry and direction == "sell") else 0,
+            "cost": round(fees + closing_fee, 2),
+            "dev_before": None if dev_before is None else round(float(dev_before), 4),
+        }
+        self.trades.append(trade)
+        self.trade_dates.add(ts)
+
+    def _buy(self, code, target_mv, d, reason, dev_before=None):
+        """按目标市值买入, 100 股整手, 受可用现金约束"""
+        px = self._price(code, d)
+        if px is None or target_mv <= 0:
+            return
+        qty = int(target_mv / px // 100) * 100
+        if qty < 100:
+            return
+        # 先按含费单价粗约束, 避免大额时逐手递减
+        max_qty = int(self.cash / (px * 1.002) // 100) * 100
+        qty = min(qty, max_qty)
+        day_amt = self._day_amount(code, d)
+        while qty >= 100:
+            fp, comm, stamp, trans, slip, impact = self.cm.calc_fill(
+                code, "buy", qty, px, day_amt)
+            amount = fp * qty
+            fees = comm + stamp + trans + slip + impact
+            if amount + fees <= self.cash + 1e-9:
+                break
+            qty -= 100
+        if qty < 100:
+            return
+
+        self.cash -= amount + fees
+        pos = self.positions.get(code)
+        if pos is None:
+            self.positions[code] = {
+                "qty": qty, "cost": fp, "entry_date": pd.Timestamp(d),
+                "entry_fee": fees,
+            }
+        else:
+            new_qty = pos["qty"] + qty
+            pos["cost"] = (pos["cost"] * pos["qty"] + fp * qty) / new_qty
+            pos["qty"] = new_qty
+            pos["entry_fee"] += fees
+        self._record(d, code, "buy", qty, fp, amount, fees, reason,
+                     pnl=0.0, dev_before=dev_before)
+
+    def _sell(self, code, qty, d, reason, dev_before=None):
+        """卖出指定股数; qty >= 持仓 时视为全清"""
+        pos = self.positions.get(code)
+        px = self._price(code, d)
+        if pos is None or px is None or qty <= 0:
+            return
+        qty = int(min(qty, pos["qty"]))
+        if qty <= 0:
+            return
+        fp, comm, stamp, trans, slip, impact = self.cm.calc_fill(
+            code, "sell", qty, px, self._day_amount(code, d))
+        amount = fp * qty
+        fees = comm + stamp + trans + slip + impact
+        self.cash += amount - fees
+
+        entry = {"entry_date": pos["entry_date"], "cost": pos["cost"]}
+        closing_fee = 0.0
+        pos["qty"] -= qty
+        if pos["qty"] <= 0:
+            # 全清: 把建仓费用计入本笔成本
+            closing_fee = pos["entry_fee"]
+            del self.positions[code]
+        pnl = (fp - entry["cost"]) * qty - fees - closing_fee
+        self._record(d, code, "sell", qty, fp, amount, fees, reason,
+                     pnl=pnl, dev_before=dev_before, entry=entry,
+                     closing_fee=closing_fee)
+
+    # ---------- 事件 ----------
+    def _period(self, d):
+        if self.rank_freq == "monthly":
+            return (d.year, d.month)
+        if self.rank_freq == "quarterly":
+            return (d.year, (d.month - 1) // 3)
+        if self.rank_freq == "yearly":
+            return (d.year,)
+        return None
+
+    def _try_entry(self, d):
+        """初始建仓: 区间内第一个候选池非空的交易日"""
+        cands = self._candidates(d)
+        if not cands:
+            return
+        picks = cands[:self.top_n]
+        tv = self._total_value(d)
+        per = tv * self.weight_fraction / len(picks)
+        for code in picks:
+            self._buy(code, per, d, "建仓")
+        self.entered = True
+        self.entry_date = pd.Timestamp(d)
+        self.targets = list(picks)
+        if self.reb_years:
+            self.next_reb = self.entry_date + pd.DateOffset(years=self.reb_years)
+        tv = self._total_value(d)
+        mv = sum((self._price(c, d) or 0) * p["qty"] for c, p in self.positions.items())
+        self.initial_ratio = mv / tv if tv > 0 else 0.0
+
+    def _rank_swap(self, d):
+        """年度(季度/月度)换股: 重排全池, 只留前 top_n, 卖非目标、买新目标"""
+        picks = self._candidates(d)[:self.top_n]
+        if not picks:
+            return
+        reason = _RANK_REASON.get(self.rank_freq, "排名换股")
+        # 先卖出非目标标的（回笼现金）
+        for code in list(self.positions):
+            if code not in picks:
+                self._sell(code, self.positions[code]["qty"], d, reason)
+        # 再买入新目标标的到目标市值
+        tv = self._total_value(d)
+        per = tv * self.weight_fraction / len(picks)
+        for code in picks:
+            if code not in self.positions:
+                self._buy(code, per, d, reason)
+        self.targets = list(picks)
+        self.annual_swaps += 1
+
+    def _periodic_rebalance(self, d):
+        """定期再平衡: 把总持仓比例强制拉回 weight_fraction"""
+        targets = self.targets or list(self.positions)
+        if not targets:
+            return
+        reason = "定期再平衡"
+        tv = self._total_value(d)
+        per = tv * self.weight_fraction / len(targets)
+        # 卖出超配
+        for code in list(self.positions):
+            if code not in targets:
+                continue
+            px = self._price(code, d)
+            if px is None:
+                continue
+            mv = px * self.positions[code]["qty"]
+            if mv > per:
+                qty = int((mv - per) / px // 100) * 100
+                if qty > 0:
+                    self._sell(code, qty, d, reason)
+        # 买入低配
+        for code in targets:
+            px = self._price(code, d)
+            if px is None:
+                continue
+            pos = self.positions.get(code)
+            mv = px * pos["qty"] if pos else 0.0
+            if mv < per:
+                self._buy(code, per - mv, d, reason)
+
+    def _deviation_check(self, d):
+        """4% 偏差调仓: 单标的权重偏离目标 > 阈值时调回目标权重"""
+        target_w = self.weight_fraction / self.top_n
+        sells, buys = [], []
+        for code, pos in list(self.positions.items()):
+            px = self._price(code, d)
+            if px is None:
+                continue
+            tv = self._total_value(d)
+            if tv <= 0:
+                continue
+            mv = px * pos["qty"]
+            w = mv / tv
+            dev = abs(w - target_w)
+            if dev <= self.dev_threshold:
+                continue
+            target_mv = target_w * tv
+            diff = target_mv - mv
+            if diff < 0:
+                sells.append((code, int(-diff / px // 100) * 100, dev))
+            elif diff > 0:
+                buys.append((code, diff, dev))
+        # 先卖后买, 避免现金不足
+        for code, qty, dev in sells:
+            if qty >= 100 and code in self.positions:
+                self._sell(code, qty, d, "4%偏差调仓", dev_before=dev)
+                self.deviation_trades += 1
+        for code, amount, dev in buys:
+            if code in self.positions:
+                self._buy(code, amount, d, "4%偏差调仓", dev_before=dev)
+                self.deviation_trades += 1
+
+    def _log_holdings(self, d):
+        tv = self._total_value(d)
+        for code, pos in self.positions.items():
+            px = self._price(code, d) or pos["cost"]
+            mv = px * pos["qty"]
+            self.holdings_log.append({
+                "date": pd.Timestamp(d),
+                "code": code,
+                "name": self.by_code[code]["name"] if code in self.by_code else code,
+                "qty": pos["qty"],
+                "cost_price": round(pos["cost"], 3),
+                "close": round(px, 3),
+                "market_value": round(mv, 2),
+                "weight": round(mv / tv, 4) if tv > 0 else 0.0,
+                "total_value": round(tv, 2),
+            })
+
+    def run(self) -> dict:
+        for d in self.calendar:
+            d = pd.Timestamp(d)
+            period = self._period(d)
+            rank_due = (self.entered and self.rank_freq != "off"
+                        and self._last_period is not None
+                        and period != self._last_period)
+            self._last_period = period
+
+            if not self.entered:
+                self._try_entry(d)
+            elif rank_due:
+                self._rank_swap(d)
+            elif self.next_reb is not None and d >= self.next_reb:
+                self._periodic_rebalance(d)
+                while self.next_reb is not None and d >= self.next_reb:
+                    self.next_reb = self.next_reb + pd.DateOffset(years=self.reb_years)
+
+            self._deviation_check(d)
+            self._log_holdings(d)
+            self.curve_rows.append({"date": d, "value": float(self._total_value(d))})
+
+        curve = pd.DataFrame(self.curve_rows, columns=["date", "value"])
+        perf = calc_performance(curve, self.trades, self.initial)
+        years = 0.0
+        if len(curve) >= 2:
+            years = (curve["date"].iloc[-1] - curve["date"].iloc[0]).days / 365.25
+        return {
+            "curve": curve,
+            "trades": self.trades,
+            "performance": perf,
+            "selection_dates": [],
+            "trade_dates": sorted(self.trade_dates),
+            "lu_dates": [],
+            "holdings_log": self.holdings_log,
+            "all_trade_days": [pd.Timestamp(d) for d in self.calendar],
+            "meta": {
+                "rank_metric_effective": self.metric,
+                "rank_metric_fallback_reason": self.p.get("_fallback_reason", ""),
+                "annual_swaps": self.annual_swaps,
+                "deviation_trades": self.deviation_trades,
+                "initial_position_ratio": round(self.initial_ratio, 6),
+                "years": round(years, 4),
+                "universe_size": len(self.symbols),
+            },
+        }
+
+
+def _parse_years(period) -> int:
+    """'1y'/'2y' -> 年数; 'off'/None/0 -> 0 (不启用)"""
+    s = str(period or "").strip().lower()
+    if not s or s in ("off", "none", "0"):
+        return 0
+    try:
+        return max(int(s.rstrip("y")), 0)
+    except ValueError:
+        return 0
+
+
+# ==================== 对外入口 ====================
+
+def run_etf_rebalance(feat: dict, params: dict) -> dict:
+    """ETF 调仓回测主入口
+
+    参数见 `default_params()`；返回 dict 与 `run_backtest` 同构：
+      curve(date,value) / trades / performance / selection_dates / trade_dates /
+      lu_dates / holdings_log / all_trade_days / meta
+
+    `meta` 额外报告: rank_metric_effective、rank_metric_fallback_reason、
+    annual_swaps、deviation_trades、initial_position_ratio、years、universe_size。
+    """
+    p = default_params()
+    p.update({k: v for k, v in (params or {}).items() if v is not None})
+    p["top_n"] = max(int(p["top_n"]), 1)
+
+    if not feat:
+        return _empty_result()
+
+    # 全市场交易日历（取所有 feat 日期并集，保证曲线覆盖每个交易日）
+    all_dates = []
+    for df in feat.values():
+        if df is not None and len(df) and "date" in df.columns:
+            all_dates.append(pd.to_datetime(df["date"]).values)
+    if not all_dates:
+        return _empty_result()
+    calendar = pd.DatetimeIndex(np.unique(np.concatenate(all_dates))).sort_values()
+
+    if p.get("start") is not None:
+        calendar = calendar[calendar >= pd.Timestamp(p["start"])]
+    if p.get("end") is not None:
+        calendar = calendar[calendar <= pd.Timestamp(p["end"])]
+    if len(calendar) < 2:
+        return _empty_result()
+
+    try:
+        name_map = _etf_name_map() or {}
+    except Exception:
+        name_map = {}
+
+    symbols = _build_symbols(feat, calendar, bool(p["overseas_only"]), name_map)
+    if not symbols:
+        return _empty_result()
+
+    requested = str(p["rank_metric"] or DEFAULT_METRIC)
+    premium_map = _load_premium_map() if requested == "premium" else {}
+    metric, reason = _resolve_metric(requested, symbols, calendar, premium_map)
+    p["_fallback_reason"] = reason
+
+    engine = _RebalanceEngine(symbols, calendar, p, metric, premium_map)
+    return engine.run()
+
+
+def validate_result(result: dict, params: dict) -> list[dict]:
+    """回测结果验收清单（不抛异常，失败项 passed=False 供界面标红）
+
+    校验项:
+      1. 回测年限 >= 10 年
+      2. 初始仓位 ≈ weight_fraction（±2%）
+      3. 年度换股次数 ≈ 年数
+      4. 每笔 4% 偏差调仓的实际偏离 >= 3.5%
+      5. 全程无止损类交易
+    """
+    p = default_params()
+    p.update({k: v for k, v in (params or {}).items() if v is not None})
+    meta = result.get("meta") or {}
+    trades = result.get("trades") or []
+    checks = []
+
+    years = float(meta.get("years", 0.0) or 0.0)
+    checks.append({
+        "name": "回测年限≥10年",
+        "passed": bool(years >= 10.0 - 1e-9),
+        "detail": f"回测区间 {years:.2f} 年",
+    })
+
+    weight_fraction = float(p["weight_fraction"])
+    ratio = float(meta.get("initial_position_ratio", 0.0) or 0.0)
+    checks.append({
+        "name": "初始仓位≈weight_fraction",
+        "passed": bool(abs(ratio - weight_fraction) <= 0.02),
+        "detail": f"初始仓位 {ratio:.2%}，目标 {weight_fraction:.2%}（容差±2%）",
+    })
+
+    swaps = int(meta.get("annual_swaps", 0) or 0)
+    checks.append({
+        "name": "年度换股次数≈年数",
+        "passed": bool(abs(swaps - years) <= 2.5),
+        "detail": f"换股 {swaps} 次，区间 {years:.2f} 年",
+    })
+
+    dev_trades = [t for t in trades if "4%" in str(t.get("reason", ""))]
+    bad_dev = [t for t in dev_trades
+               if (t.get("dev_before") is None
+                   or float(t.get("dev_before")) < 0.035 - 1e-9)]
+    checks.append({
+        "name": "4%偏差调仓实际偏离≥3.5%",
+        "passed": len(bad_dev) == 0,
+        "detail": (f"共 {len(dev_trades)} 笔 4% 偏差调仓，"
+                   f"不合格 {len(bad_dev)} 笔"),
+    })
+
+    stop_trades = [t for t in trades if "止损" in str(t.get("reason", ""))]
+    checks.append({
+        "name": "全程无止损类交易",
+        "passed": len(stop_trades) == 0,
+        "detail": f"止损类交易 {len(stop_trades)} 笔",
+    })
+    return checks

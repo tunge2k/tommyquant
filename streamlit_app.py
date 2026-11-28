@@ -81,14 +81,14 @@ _start_feat_watcher()
 
 # 研究阶段: 界面暴露「ETF策略」与「市值策略(股票)」两个入口, 共用 MarketCapStrategy 引擎
 # 顺序即界面顺序, 第一项为默认选中: ETF 在前 (2026-11-24 用户要求)
-VISIBLE_STRATEGIES = ("ETF策略", "市值策略")
+VISIBLE_STRATEGIES = ("ETF策略", "ETF调仓策略", "市值策略")
 # 走 MarketCapStrategy 类的策略: 参数由 _bt_params 组装, 不依赖 STRATEGIES 函数表
 CLASS_STRATEGIES = ("市值策略", "ETF策略")
 STRATEGY_NAMES = ([k for k in STRATEGIES if k in VISIBLE_STRATEGIES]
                   + [k for k in VISIBLE_STRATEGIES if k not in STRATEGIES])
 
-# 首页「策略绩效概览」并排对比的策略 (与 VISIBLE_STRATEGIES 保持一致)
-DASH_STRATEGIES = list(VISIBLE_STRATEGIES)
+# 首页「策略绩效概览」并排对比的策略 (ETF调仓策略回测较慢, 不放进首页对比)
+DASH_STRATEGIES = ["ETF策略", "市值策略"]
 
 # 参数寻优: 每个策略可扫描的数值参数
 SWEEP_TUNABLES = {
@@ -1699,6 +1699,9 @@ DEFAULT_END = _db_last if _db_last not in ("", "-") else datetime.now().strftime
 # 各策略回测起点默认值: ETF 历史数据充足, 给 10 年; 股票/选股策略保持较短区间避免冷启动慢
 DEFAULT_START_MC = "2023-01-01"
 DEFAULT_START_ETF = (datetime.now() - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+# ETF调仓策略要求「回测年限≥10年」: 多留 1 个月, 避免起点落在周末/节假日导致
+# 实际交易日跨度不足 10 年而被内置校验判红
+DEFAULT_START_ERC = (datetime.now() - pd.DateOffset(years=10, days=30)).strftime("%Y-%m-%d")
 
 DEFAULTS = {
     "initial_capital": 1_000_000,   # 100万
@@ -1751,6 +1754,11 @@ BT_PARAM_DEFAULTS = {
     "etf_ret20_min": 0, "etf_ret60_min": 0,
     # 选品范围: 只做跨境(外盘)ETF, 剔除港股系 (恒生/港股通/H股/中概)
     "etf_overseas_only": True,
+    # ETF 调仓策略 (独立策略: 可配置排序指标 + 4%偏差调仓 + 年度换股 + 目标仓位再平衡)
+    # 与「ETF策略」的区别: 无趋势止损(用户 2026-11-28 确认的口径), 纯规则化调仓
+    "erc_metric": "momentum", "erc_top_n": 3, "erc_weight_pct": 75,
+    "erc_dev_pct": 4, "erc_rank_freq": "yearly", "erc_rebal_period": "1y",
+    "erc_min_amount": 0.01, "erc_min_history": 250,
 }
 for _k, _v in BT_PARAM_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -1872,6 +1880,9 @@ _APPLY_KEYS = {
                  "etf_max_dd_th", "etf_ma60_up",
                  "etf_ret20_min", "etf_ret60_min", "etf_overseas_only",
                  "etf_abs_mom_days", "etf_abs_mom_min"),
+    "ETF调仓策略": ("erc_metric", "erc_top_n", "erc_weight_pct", "erc_dev_pct",
+                    "erc_rank_freq", "erc_rebal_period", "erc_min_amount",
+                    "erc_min_history"),
 }
 
 # 函数式策略: 引擎参数名 -> 界面 session_state 键
@@ -2127,6 +2138,21 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "etf_ret60_min": float(ss.get("etf_ret60_min", 0)),
             "etf_overseas_only": bool(ss.get("etf_overseas_only", True)),
         })
+    elif strategy_key == "ETF调仓策略":
+        p.update({
+            "initial_capital": int(float(initial)),
+            "start": str(start_d)[:10],
+            "end": str(end_d)[:10],
+            "top_n": int(ss.get("erc_top_n", 3)),
+            "weight_fraction": float(ss.get("erc_weight_pct", 75)) / 100.0,
+            "deviation_threshold": float(ss.get("erc_dev_pct", 4)) / 100.0,
+            "rank_metric": str(ss.get("erc_metric", "momentum")),
+            "rank_check_freq": str(ss.get("erc_rank_freq", "yearly")),
+            "rebalance_period": str(ss.get("erc_rebal_period", "1y")),
+            "min_amount": float(ss.get("erc_min_amount", 0.01)),
+            "min_history": int(ss.get("erc_min_history", 250)),
+            "overseas_only": True,
+        })
     elif strategy_key in _FN_PARAM_MAP:
         p["params"] = {k: ss.get(v) for k, v in _FN_PARAM_MAP[strategy_key].items()}
     return p
@@ -2141,6 +2167,12 @@ def _bt_sig(params: dict) -> str:
 
 def _run_backtest_params(strategy_key, params, feat_data):
     """按参数跑回测 (市值/ETF 策略走同一个 MarketCapStrategy, 只是 pool_type 不同)"""
+    if strategy_key == "ETF调仓策略":
+        # 独立引擎: 可配置排序指标 + 4%偏差调仓 + 年度换股 + 目标仓位再平衡 (无止损)
+        import etf_rebalance
+        _p = dict(params)
+        _p["cost"] = get_cost_params()   # params["cost"] 只是缓存指纹串, 这里换成真实成本参数
+        return etf_rebalance.run_etf_rebalance(feat_data, _p)
     if strategy_key in CLASS_STRATEGIES:
         mc = MarketCapStrategy(
             top_n=params["top_n"],
@@ -2261,6 +2293,37 @@ _CFG_KEYS = ("sd_cap_max", "sd_ret20", "sd_ma20", "sd_ma60",
              "mc_rebal_th", "mc_listed_yrs", "mc_ma30_lookback",
              "mc_ma30_exit", "mc_entry_weeks",
              "mc_ex_st", "mc_ex_ocf", "mc_ex_nonop", "mc_ex_nodiv", "mc_div_years")
+
+
+def _render_etf_rebalance_validation(result: dict, params: dict):
+    """「ETF调仓策略」内置校验: 回测年限 / 初始仓位 / 调仓规则 逐项判定 + meta 摘要"""
+    try:
+        import etf_rebalance as _erc
+    except Exception:
+        return
+    meta = result.get("meta") or {}
+    if meta:
+        _eff = meta.get("rank_metric_effective", params.get("rank_metric", ""))
+        _fb = meta.get("rank_metric_fallback_reason")
+        st.caption(
+            f"排序指标：{_eff}" + (f"（自动回退：{_fb}）" if _fb else "")
+            + f" · 回测年限 {float(meta.get('years', 0)):.1f} 年"
+            + f" · 年度换股 {meta.get('annual_swaps', 0)} 次"
+            + f" · 4%偏差调仓 {meta.get('deviation_trades', 0)} 笔"
+            + f" · 初始仓位 {float(meta.get('initial_position_ratio', 0)) * 100:.1f}%"
+            + f" · 标的池 {meta.get('universe_size', 0)} 只")
+    try:
+        checks = _erc.validate_result(result, params)
+    except Exception as _e:
+        st.warning(f"校验模块执行失败：{_e}")
+        return
+    if not checks:
+        return
+    with st.expander("✅ 内置校验（回测年限 / 仓位 / 调仓规则）", expanded=True):
+        rows = [{"校验项": c.get("name", ""),
+                 "结果": "✅ 通过" if c.get("passed") else "❌ 未通过",
+                 "详情": c.get("detail", "")} for c in checks]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _render_top_nav(cur_page: str, subtitle: str = None, cfg_toggle=None):
@@ -4071,6 +4134,9 @@ elif page == "backtest":
     _cur_start_str = str(st.session_state.get("backtest_start"))[:10]
 
     def _default_of(name):
+        # ETF 系策略统一默认 10 年区间 (ETF调仓策略额外多留 1 个月保证≥10年)
+        if name == "ETF调仓策略":
+            return DEFAULT_START_ERC
         return _etf_default if name == "ETF策略" else DEFAULT_START_MC
 
     if _last_auto is None:
@@ -4146,6 +4212,17 @@ elif page == "backtest":
             _summary_parts.append(f"绝对动量{_am_days}日{'≥' if _am_min >= 0 else '<'}{_am_min:.1f}%")
         if st.session_state.get("etf_mkt_flow_guard"):
             _summary_parts.append("全市场资金流风控")
+    elif strategy_choice == "ETF调仓策略":
+        import etf_rebalance as _erc
+        _mlabel = dict(_erc.list_metrics()).get(
+            st.session_state.get("erc_metric", "momentum"), "综合动量")
+        _summary_parts.append(f"{st.session_state.get('erc_top_n', 3)}只外盘ETF")
+        _summary_parts.append(f"排序:{_mlabel}")
+        _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 75))}%")
+        _summary_parts.append(f"±{int(st.session_state.get('erc_dev_pct', 4))}%调仓")
+        _summary_parts.append(
+            {"yearly": "年度换股", "quarterly": "季度换股", "monthly": "月度换股",
+             "off": "不换股"}.get(st.session_state.get("erc_rank_freq", "yearly"), "年度换股"))
     elif strategy_choice != "市值策略":
         _summary_parts.append(f"{top_n}只")
         _summary_parts.append(f"持有{hold_days}天·涨停{limit_up_pct:.1f}%")
@@ -4226,7 +4303,10 @@ elif page == "backtest":
             "初始资金(万)", min_value=10, max_value=10000,
             value=int(_cur_initial // 10000), step=10,
             format="%d", key="di_initial") * 10000
-        if strategy_choice == "ETF策略":
+        if strategy_choice == "ETF调仓策略":
+            # 持仓数在下方「① 标的池与排序」里以 erc_top_n 设置, 这里不重复出现
+            top_n = int(st.session_state.get("erc_top_n", 3))
+        elif strategy_choice == "ETF策略":
             top_n = _r[1].number_input(
                 "ETF持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_etf_topn",
@@ -4249,7 +4329,7 @@ elif page == "backtest":
             "回测终点", value=backtest_end,
             min_value=pd.Timestamp("2013-05-15").date(),
             max_value=datetime.now().date(), key="di_end")
-        if strategy_choice not in CLASS_STRATEGIES:
+        if strategy_choice not in CLASS_STRATEGIES and strategy_choice != "ETF调仓策略":
             _r2 = st.columns(4)
             hold_days = _r2[0].number_input(
                 "持有天数", min_value=1, max_value=30, value=int(_cur_hold),
@@ -4363,6 +4443,50 @@ elif page == "backtest":
                      help="近 N 日涨幅低于该值则不买/强制卖出")
                 _num("20日涨幅下限(%)", -10, 20, "etf_ret20_min", col=_f3[2], help="低于该值则剔除，0=仅要求不跌")
                 _num("60日涨幅下限(%)", -10, 20, "etf_ret60_min", col=_f3[3], help="低于该值则剔除，0=仅要求不跌")
+        elif strategy_choice == "ETF调仓策略":
+            import etf_rebalance as _erc
+            _mopts = _erc.list_metrics()
+            _mkeys = [k for k, _ in _mopts]
+            _mlabels = dict(_mopts)
+            _specs = _erc.METRIC_SPECS
+            _v1, _v2 = st.tabs(["① 标的池与排序", "② 调仓与再平衡"])
+            with _v1:
+                _a = st.columns([1.6, 1, 1, 1])
+                _a[0].selectbox(
+                    "排序指标", options=_mkeys,
+                    format_func=lambda k: _mlabels.get(k, k) + (
+                        "" if _specs.get(k, {}).get("available", True)
+                        else "（无历史，自动回退）"),
+                    key=_draft("erc_metric", "momentum"),
+                    help="回测按该指标排序后取前 N 只；无 10 年历史的指标会自动回退到综合动量，"
+                         "并在回测报告里标注实际使用的指标。")
+                _num("持仓数(只)", 1, 10, "erc_top_n", col=_a[1])
+                _num("成交额下限(亿)", 0.01, 5.0, "erc_min_amount", step=0.01, fmt="%.2f",
+                     col=_a[2], help="近20日日均成交额，低于该值不入池")
+                _num("最少K线(根)", 60, 500, "erc_min_history", step=10, col=_a[3],
+                     help="数据不足的次新 ETF 不参与排序")
+                st.caption("标的池固定为「仅外盘 ETF」，自动剔除恒生/港股/港股通/H股/中概等相关标的。")
+                _notef = [f"· {v['label']}：{v.get('note', '')}"
+                          for k, v in _specs.items() if not v.get("available", True)]
+                if _notef:
+                    st.caption("以下指标暂无 10 年历史数据，选中后回测自动回退到综合动量：\n"
+                               + "\n".join(_notef))
+            with _v2:
+                _b = st.columns(4)
+                _num("目标仓位(%)", 10, 100, "erc_weight_pct", step=5, col=_b[0],
+                     help="初始建仓与定期再平衡的目标总仓位，默认 75%")
+                _num("偏差阈值(%)", 1, 30, "erc_dev_pct", step=1, col=_b[1],
+                     help="单标的权重偏离目标超过该值即调回目标，默认 4%")
+                _b[2].radio("换股周期", options=["yearly", "quarterly", "monthly", "off"],
+                            format_func=lambda v: {"yearly": "每年", "quarterly": "每季",
+                                                   "monthly": "每月", "off": "不换股"}[v],
+                            key=_draft("erc_rank_freq", "yearly"), horizontal=True,
+                            help="到期按选定指标重排全池，只保留前 N 只")
+                _b[3].radio("再平衡周期", options=["1y", "2y", "off"],
+                            format_func=lambda v: {"1y": "每年", "2y": "每两年", "off": "不强制"}[v],
+                            key=_draft("erc_rebal_period", "1y"), horizontal=True,
+                            help="到期把总持仓比例强制拉回目标仓位")
+                st.caption("本策略不设趋势止损（用户确认口径），仅靠 4% 偏差调仓 + 定期换股 + 定期再平衡控制风险。")
         elif strategy_choice == "市值策略":
             _u1, _u2, _u3 = st.tabs(["① 选股与剔除", "② 趋势与止损", "③ 换股与调仓"])
             with _u1:
@@ -4413,12 +4537,12 @@ elif page == "backtest":
             if st.button("✅ 确定", type="primary", use_container_width=True,
                          key="bt_dlg_ok"):
                 st.session_state["initial_capital"] = initial_capital
-                if strategy_choice not in CLASS_STRATEGIES:
+                if strategy_choice not in CLASS_STRATEGIES and strategy_choice != "ETF调仓策略":
                     st.session_state["hold_days"] = hold_days
                     st.session_state["limit_up_pct"] = limit_up_pct
                 if strategy_choice == "ETF策略":
                     st.session_state["etf_top_n"] = top_n
-                else:
+                elif strategy_choice != "ETF调仓策略":
                     st.session_state["top_n"] = top_n
                 st.session_state["backtest_start"] = pd.Timestamp(_dr)
                 st.session_state["backtest_end"] = pd.Timestamp(_de)
@@ -4504,6 +4628,10 @@ elif page == "backtest":
         else:
             m, _bm = _benchmark_align(curve)
             e = _bench_extra(m)
+            if strategy_choice == "ETF调仓策略":
+                _render_etf_rebalance_validation(
+                    result, _bt_params(strategy_choice, initial_capital, hold_days,
+                                       top_n, limit_up_pct, backtest_start, backtest_end))
             tab_perf, tab_trade, tab_hold, tab_report = st.tabs(
                 ["📈 策略绩效", "📋 交易明细", "📅 持仓明细", "📑 研究报告"])
             with tab_perf:

@@ -58,6 +58,8 @@ def serialize_result(r) -> dict:
         "lu_dates": [str(d)[:10] for d in r.get("lu_dates", [])],
         "all_trade_days": [str(d)[:10] for d in r.get("all_trade_days", [])],
         "fill_blocks": r.get("fill_blocks") or {},
+        # ETF调仓策略的校验元信息 (排序指标/换股次数/初始仓位等), 其余策略为空
+        "meta": _py_scalar(r.get("meta") or {}),
     }
 
 
@@ -75,6 +77,7 @@ def deserialize_result(d) -> dict:
         "lu_dates": d.get("lu_dates", []),
         "all_trade_days": d.get("all_trade_days", []),
         "fill_blocks": d.get("fill_blocks") or {},
+        "meta": d.get("meta") or {},
     }
 
 
