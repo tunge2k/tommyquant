@@ -765,7 +765,8 @@ K 段稳健性检验（2023-01-01~2026-11-19，K=4，主目标卡玛，稳健分
 1. **回测年限 ≥ 10 年**（不足则提示样本不显著）；
 2. **初始仓位 ≈ 目标仓位**（首笔建仓后总持仓比例误差在容差内）；
 3. **调仓规则正确**（4% 偏差触发、年度换股次数 ≥ 区间年数 − 1）；
-4. **净值曲线完整**（长度与交易日一致、无 NaN、日期升序）。
+4. **净值曲线完整**（长度与交易日一致、无 NaN、日期升序）；
+5. **全程无止损类交易**（校验第 0.3 节「无止损」口径确实生效）。
 
 `run_etf_rebalance` 的 `meta` 输出 `rank_metric_effective / rank_metric_fallback_reason / annual_swaps / deviation_trades / initial_position_ratio / years / universe_size`，已随回测结果持久化（`serialize_result` 增补 `meta` 字段）。
 

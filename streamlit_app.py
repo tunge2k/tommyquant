@@ -4148,6 +4148,14 @@ elif page == "backtest":
             st.session_state["backtest_start"] = _default_of(strategy_choice)
         st.session_state["_auto_start_strategy"] = strategy_choice
 
+    # 「ETF调仓策略」硬性要求: 回测年限不得低于 10 年 → 起点不足时自动前移(多留 30 天)
+    if strategy_choice == "ETF调仓策略":
+        _need_start = pd.Timestamp(backtest_end) - pd.DateOffset(years=10, days=30)
+        if pd.Timestamp(st.session_state["backtest_start"]) > _need_start:
+            st.session_state["backtest_start"] = _need_start.strftime("%Y-%m-%d")
+            backtest_start = _need_start.normalize()
+            st.info(f"ETF调仓策略要求回测年限≥10年，回测起点已自动前移到 {_need_start:%Y-%m-%d}")
+
     # ---------- 实时行情 expander (保留) ----------
     try:
         _pk = data_store.get_recent_picks(limit=200)
@@ -4320,11 +4328,15 @@ elif page == "backtest":
             top_n = _r[1].number_input(
                 "持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
                 step=1, format="%d", key="di_topn")
+        _min_s = pd.Timestamp("2013-05-15")
+        if strategy_choice == "ETF调仓策略":
+            # 新策略硬性要求回测年限 ≥10 年, 起点选择器下限锁定 (终点 - 10 年 - 30 天)
+            _min_s = max(_min_s, pd.Timestamp(backtest_end) - pd.DateOffset(years=10, days=30))
         _dr = _r[2].date_input(
             "回测起点", value=backtest_start,
-            min_value=pd.Timestamp("2013-05-15").date(),
+            min_value=_min_s.date(),
             max_value=datetime.now().date(), key="di_start",
-            help="最早 2013-05-15（境内首批跨境 ETF 上市起点）")
+            help="最早 2013-05-15（境内首批跨境 ETF 上市起点）；ETF调仓策略自动锁定≥10年")
         _de = _r[3].date_input(
             "回测终点", value=backtest_end,
             min_value=pd.Timestamp("2013-05-15").date(),
