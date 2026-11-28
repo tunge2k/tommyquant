@@ -17,6 +17,7 @@
 | [04-strategy-spec.md](./04-strategy-spec.md) | **第 0 章 核心原则（低买高卖）**、三个股票策略 + ETF 策略（第 7 章）的完整规格、成本模型、绩效指标定义、回测口径 | 改选股条件/参数/交易规则/成本模型 |
 | [05-operations.md](./05-operations.md) | 部署、环境变量、Worker 时间线、备份、故障排查、安全 | 改部署拓扑、改环境变量、改定时任务 |
 | [06-open-source-references.md](./06-open-source-references.md) | 开源方案借鉴清单、问题→成熟做法对照、平台技能用法、调研 SOP | 引入新依赖、改变回测口径、新增可复用模块 |
+| [07-cash-risk-playbook.md](./07-cash-risk-playbook.md) | 余额不足风险画像、三类下跌情景方案与应对决策表 | 改仓位比例 / 网格阈值 / 成本模型时 |
 
 ---
 
