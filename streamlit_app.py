@@ -4743,6 +4743,7 @@ elif page == "backtest":
     #   1) 更优或尚无最优 → 自动落库 (唯一入口, 幂等, 不重复不遗漏)
     #   2) 始终展示「当前值 vs 已保存最优」的对应关系
     #   3) 劣于最优且用户未选择 → 弹「放弃本次 / 保留本次」
+    _bs = None
     if result:
         _p_now = _bt_params(strategy_choice, initial_capital, hold_days,
                             top_n, limit_up_pct, backtest_start, backtest_end)
@@ -4813,7 +4814,11 @@ elif page == "backtest":
                            data=json.dumps(_rst_rep, ensure_ascii=False, indent=2),
                            file_name=f"restore_{strategy_choice}.json",
                            mime="application/json", key="bt_restore_dl")
-    if _best_snap:
+    # 恢复入口只在「当前结果低于历史最优」时出现 (平时不占版面);
+    # 恢复后的确认报告不受此限制, 恢复重跑通常变为一致/更优, 报告仍需可见
+    _need_restore = _bs is not None and _bs["relation"] == bbs.WORSE
+    if _best_snap and _need_restore:
+        st.caption("当前结果低于历史最优，可一键恢复最优参数并重跑验证。")
         if st.button("🔧 恢复最优参数并验证复现", key="bt_restore_best",
                      help="把全部回测设置与成本参数还原到最优结果时的状态，并重跑核对指标"):
             with st.spinner("正在恢复参数并重跑验证..."):
