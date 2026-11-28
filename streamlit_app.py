@@ -1851,6 +1851,76 @@ def _persist_bt_settings():
         pass
 
 
+# ===== 最优结果参数快照的恢复 / 核对 =====
+_COST_KEYS = ("commission_rate", "commission_min", "etf_commission_rate",
+              "etf_commission_min", "stamp_tax_rate", "transfer_fee_rate",
+              "slippage_rate")
+
+
+def _restore_bt_settings(snap: dict) -> list[dict]:
+    """把最优结果的完整设置快照逐项写回会话, 返回核对明细 (只读最优记录, 不改动它)"""
+    rows = []
+    for k, v in (snap or {}).items():
+        if k not in _BT_PERSIST_KEYS:
+            continue
+        if k in ("backtest_start", "backtest_end"):
+            try:
+                v = pd.to_datetime(v)
+            except Exception:
+                continue
+        before = st.session_state.get(k)
+        same = (str(before) == str(v))
+        st.session_state[k] = v
+        rows.append({"参数项": k, "最优值": str(v)[:19], "恢复前": str(before)[:19],
+                     "状态": "原本一致" if same else "已恢复"})
+    _persist_bt_settings()
+    return rows
+
+
+def _settings_from_params(strategy_key: str, p: dict) -> dict:
+    """旧最优记录(无 settings 快照)兜底: 由规范化参数反推设置键"""
+    out = {}
+    if p.get("start"):
+        out["backtest_start"] = p["start"]
+    if p.get("end"):
+        out["backtest_end"] = p["end"]
+    if p.get("initial_capital"):
+        out["initial_capital"] = p["initial_capital"]
+    if strategy_key == "ETF调仓策略":
+        if p.get("top_n") is not None:
+            out["erc_top_n"] = int(p["top_n"])
+        if p.get("weight_fraction") is not None:
+            out["erc_weight_pct"] = int(round(float(p["weight_fraction"]) * 100))
+        if p.get("deviation_threshold") is not None:
+            out["erc_dev_pct"] = int(round(float(p["deviation_threshold"]) * 100))
+        if p.get("rank_metric"):
+            out["erc_metric"] = p["rank_metric"]
+        if p.get("rank_check_freq"):
+            out["erc_rank_freq"] = p["rank_check_freq"]
+        if p.get("rebalance_period"):
+            out["erc_rebal_period"] = p["rebalance_period"]
+        if p.get("min_amount") is not None:
+            out["erc_min_amount"] = p["min_amount"]
+        if p.get("min_history") is not None:
+            out["erc_min_history"] = int(p["min_history"])
+    return out
+
+
+def _restore_cost_settings(cost: dict) -> list[dict]:
+    """还原交易成本设置 (佣金/印花税/过户费/滑点), 返回核对明细"""
+    rows = []
+    for k in _COST_KEYS:
+        if k not in (cost or {}):
+            continue
+        v = cost[k]
+        key = f"cost_{k}"
+        before = data_store.get_setting(key)
+        data_store.set_setting(key, str(v))
+        rows.append({"参数项": key, "最优值": str(v), "恢复前": str(before),
+                     "状态": "原本一致" if str(before) == str(v) else "已恢复"})
+    return rows
+
+
 # 只在会话首次运行读库回填; 后续 rerun 若再回填会用旧值覆盖刚改的新值
 if not st.session_state.get("_bt_settings_loaded"):
     _load_bt_settings()
@@ -4642,7 +4712,8 @@ elif page == "backtest":
                 if _best0 is None or _ret0 > float(_best0["metric_value"]) + 1e-9:
                     data_store.save_best_backtest(
                         strategy_choice, "total_return", _ret0, _params_now,
-                        DATA_FINGERPRINT, serialize_result(result))
+                        DATA_FINGERPRINT, serialize_result(result),
+                        settings=_bt_settings_snapshot())
             except Exception:
                 pass
     else:
@@ -4671,13 +4742,95 @@ elif page == "backtest":
             if _bc2.button("✅ 保留本次并更新最优", key="bt_use_new"):
                 data_store.save_best_backtest(
                     strategy_choice, "total_return", _ret_chk, _p_chk,
-                    DATA_FINGERPRINT, serialize_result(result))
+                    DATA_FINGERPRINT, serialize_result(result),
+                    settings=_bt_settings_snapshot())
                 st.session_state["_bt_best_discard"] = _sig_chk
                 st.rerun()
         if _discarded and _best:
             result = _bt_result_from_rec(_best)
             st.info("已放弃本次结果，当前展示历史最优回测（"
                     f"{str(_best['created_at']).replace('T', ' ')}）")
+
+    # ---------- 最优参数快照: 一键恢复 + 复现验证 + 确认记录 ----------
+    # 只读取最优记录, 不修改/删除其数据; 恢复动作仅写当前会话设置与成本参数
+    _best_snap = data_store.get_best_backtest(strategy_choice)
+    _rst_rep = st.session_state.pop("_bt_restore_report", None)
+    if _rst_rep and _rst_rep.get("strategy") == strategy_choice:
+        _ok = _rst_rep.get("matched")
+        st.success(f"✅ 已恢复到最优参数（保存于 {_rst_rep.get('created_at', '')}），"
+                   f"复现验证：{'指标一致' if _ok else '指标不一致'}")
+        if not _rst_rep.get("fingerprint_same", True):
+            st.warning("注意：行情数据指纹与最优结果生成时不同，指标可能有差异。")
+        st.markdown("**逐项参数核对**")
+        st.dataframe(pd.DataFrame(_rst_rep["rows"]),
+                     use_container_width=True, hide_index=True)
+        st.markdown("**指标复现验证**")
+        st.dataframe(pd.DataFrame(_rst_rep["metrics"]),
+                     use_container_width=True, hide_index=True)
+        st.download_button("⬇️ 下载参数恢复确认记录",
+                           data=json.dumps(_rst_rep, ensure_ascii=False, indent=2),
+                           file_name=f"restore_{strategy_choice}.json",
+                           mime="application/json", key="bt_restore_dl")
+    if _best_snap:
+        if st.button("🔧 恢复最优参数并验证复现", key="bt_restore_best",
+                     help="把全部回测设置与成本参数还原到最优结果时的状态，并重跑核对指标"):
+            with st.spinner("正在恢复参数并重跑验证..."):
+                _snap = _best_snap.get("settings") or {}
+                try:
+                    _pp = json.loads(_best_snap.get("params") or "{}")
+                except Exception:
+                    _pp = {}
+                if not _snap:
+                    _snap = _settings_from_params(strategy_choice, _pp)
+                _rows = _restore_bt_settings(_snap)
+                _rows += _restore_cost_settings((_pp or {}).get("cost") or {})
+                # 用恢复后的设置重跑: force=True 仅写入本次结果缓存, 不改动最优记录
+                _res_v = load_or_run_backtest(
+                    strategy_choice, feat_data,
+                    st.session_state.get("initial_capital", 1_000_000),
+                    st.session_state.get("hold_days", 5),
+                    st.session_state.get("top_n", 1),
+                    st.session_state.get("limit_up_pct", 9.8),
+                    st.session_state.get("backtest_start"),
+                    st.session_state.get("backtest_end"), force=True)
+                _pf_new = (_res_v or {}).get("performance", {})
+                _pf_best = (_best_snap.get("payload") or {}).get("performance", {})
+                _metrics = []
+                for _k, _lbl in (("total_return", "总收益(%)"),
+                                 ("max_drawdown", "最大回撤(%)"),
+                                 ("sharpe", "夏普比率"),
+                                 ("final_value", "期末资金"),
+                                 ("trades_count", "成交笔数")):
+                    if _k not in _pf_best and _k not in _pf_new:
+                        continue
+                    _a = float(_pf_best.get(_k, 0) or 0)
+                    _b2 = float(_pf_new.get(_k, 0) or 0)
+                    _eq = abs(_a - _b2) <= max(1e-6, abs(_a) * 1e-6)
+                    _metrics.append({"指标": _lbl, "最优结果": round(_a, 4),
+                                     "恢复后复现": round(_b2, 4),
+                                     "一致": "✅" if _eq else "❌"})
+                _matched = bool(_metrics) and all(m["一致"] == "✅" for m in _metrics)
+                _fp_same = str(_best_snap.get("fingerprint") or "") == DATA_FINGERPRINT
+                _detail = {"参数核对": _rows, "指标对比": _metrics,
+                           "数据指纹一致": _fp_same,
+                           "最优保存时间": _best_snap.get("created_at", ""),
+                           "最优指标": _best_snap.get("metric_name", "total_return"),
+                           "最优指标值": _best_snap.get("metric_value")}
+                try:
+                    data_store.log_param_restore(
+                        strategy_choice, _best_snap.get("metric_name", "total_return"),
+                        float(_best_snap["metric_value"]),
+                        float(_pf_new.get("total_return", 0) or 0), _matched,
+                        _detail, _pp, _snap)
+                except Exception:
+                    pass
+                st.session_state["_bt_restore_report"] = {
+                    "strategy": strategy_choice,
+                    "created_at": str(_best_snap.get("created_at", "")).replace("T", " "),
+                    "matched": _matched, "fingerprint_same": _fp_same,
+                    "rows": _rows, "metrics": _metrics,
+                    "params": _pp, "settings": _snap}
+            st.rerun()
 
     if result:
         _meta = result.get("_meta") or {}

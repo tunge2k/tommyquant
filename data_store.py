@@ -100,9 +100,24 @@ def init_db():
         metric_name  TEXT,            -- 比较指标, 默认 total_return
         metric_value REAL,
         params       TEXT,            -- JSON: 产生最优结果的参数
+        settings     TEXT,            -- JSON: 完整配置快照(全部回测设置项)
         fingerprint  TEXT,
         payload      TEXT,            -- JSON: 最优结果完整数据
         created_at   TEXT
+    );
+
+    -- ===== 最优参数恢复确认记录 (审计用: 还原动作 + 逐项核对 + 复现验证) =====
+    CREATE TABLE IF NOT EXISTS param_restore_log (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        strategy    TEXT,
+        restored_at TEXT,
+        metric_name TEXT,
+        best_metric REAL,
+        new_metric  REAL,
+        matched     INTEGER,          -- 1=复现一致
+        detail      TEXT,             -- JSON: 逐项参数核对 + 指标对比
+        params      TEXT,
+        settings    TEXT
     );
 
     -- ===== 数据覆盖索引: 每个标的已同步到哪个区间 (只补缺口) =====
@@ -211,6 +226,13 @@ def init_db():
     # 升级: 旧库补 link 列
     try:
         conn.execute("ALTER TABLE news ADD COLUMN link TEXT")
+    except Exception:
+        pass
+    # 升级: best_backtest 补 settings 列 (完整配置快照, 老库自动迁移)
+    try:
+        _cols = [r[1] for r in conn.execute("PRAGMA table_info(best_backtest)")]
+        if "settings" not in _cols:
+            conn.execute("ALTER TABLE best_backtest ADD COLUMN settings TEXT")
     except Exception:
         pass
 
@@ -594,16 +616,18 @@ def save_backtest_result(strategy: str, param_sig: str, params: dict,
 
 
 def save_best_backtest(strategy: str, metric_name: str, metric_value: float,
-                       params: dict, fingerprint: str, payload: dict):
-    """保存/更新某策略的历史最优回测结果 (每策略一条)"""
+                       params: dict, fingerprint: str, payload: dict,
+                       settings: dict | None = None):
+    """保存/更新某策略的历史最优回测结果 (每策略一条, 含完整配置快照)"""
     import json as _json
     conn = get_conn()
     conn.execute(
         "INSERT OR REPLACE INTO best_backtest "
-        "(strategy, metric_name, metric_value, params, fingerprint, payload, created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "(strategy, metric_name, metric_value, params, settings, fingerprint, "
+        " payload, created_at) VALUES (?,?,?,?,?,?,?,?)",
         (strategy, metric_name, float(metric_value),
          _json.dumps(params, ensure_ascii=False, default=str),
+         _json.dumps(settings or {}, ensure_ascii=False, default=str),
          fingerprint, _json.dumps(payload, ensure_ascii=False, default=str),
          datetime.now().isoformat(timespec="seconds")))
     conn.commit()
@@ -615,18 +639,60 @@ def get_best_backtest(strategy: str):
     import json as _json
     conn = get_conn()
     row = conn.execute(
-        "SELECT metric_name, metric_value, params, fingerprint, payload, created_at "
+        "SELECT metric_name, metric_value, params, settings, fingerprint, payload, created_at "
         "FROM best_backtest WHERE strategy=?", (strategy,)).fetchone()
     conn.close()
     if not row:
         return None
-    try:
-        payload = _json.loads(row[4]) if row[4] else {}
-    except Exception:
-        payload = {}
+    def _loads(s):
+        try:
+            return _json.loads(s) if s else {}
+        except Exception:
+            return {}
     return {"metric_name": row[0] or "total_return", "metric_value": float(row[1] or 0),
-            "params": row[2] or "{}", "fingerprint": row[3] or "",
-            "payload": payload, "created_at": row[5] or ""}
+            "params": row[2] or "{}", "settings": _loads(row[3]),
+            "fingerprint": row[4] or "", "payload": _loads(row[5]),
+            "created_at": row[6] or ""}
+
+
+def log_param_restore(strategy: str, metric_name: str, best_metric: float,
+                      new_metric: float, matched: bool, detail: dict,
+                      params: dict | None = None, settings: dict | None = None):
+    """写入一条「最优参数恢复」确认记录"""
+    import json as _json
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO param_restore_log (strategy, restored_at, metric_name, "
+        "best_metric, new_metric, matched, detail, params, settings) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (strategy, datetime.now().isoformat(timespec="seconds"), metric_name,
+         float(best_metric), float(new_metric), 1 if matched else 0,
+         _json.dumps(detail, ensure_ascii=False, default=str),
+         _json.dumps(params or {}, ensure_ascii=False, default=str),
+         _json.dumps(settings or {}, ensure_ascii=False, default=str)))
+    conn.commit()
+    conn.close()
+
+
+def get_param_restore_log(strategy: str, limit: int = 3) -> list[dict]:
+    """最近若干条参数恢复确认记录"""
+    import json as _json
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT restored_at, metric_name, best_metric, new_metric, matched, detail "
+        "FROM param_restore_log WHERE strategy=? ORDER BY id DESC LIMIT ?",
+        (strategy, int(limit))).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            detail = _json.loads(r[5]) if r[5] else {}
+        except Exception:
+            detail = {}
+        out.append({"restored_at": r[0], "metric_name": r[1],
+                    "best_metric": r[2], "new_metric": r[3],
+                    "matched": bool(r[4]), "detail": detail})
+    return out
 
 
 # ==================== 下载 (akshare → SQLite) ====================

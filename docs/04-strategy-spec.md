@@ -789,4 +789,30 @@ K 段稳健性检验（2023-01-01~2026-11-19，K=4，主目标卡玛，稳健分
 
 `run_etf_rebalance` 的 `meta` 输出 `rank_metric_effective / rank_metric_fallback_reason / annual_swaps / deviation_trades / initial_position_ratio / years / universe_size`，已随回测结果持久化（`serialize_result` 增补 `meta` 字段）。
 
+### 11.7 最优参数快照与恢复验证（2026-11-28）
+
+调参/优化的核心诉求是「最优结果可完整留存、参数可一键还原、还原后可复现」，实现分三层：
+
+**1) 最优结果完整留存（只读，不改不删）**
+
+- `best_backtest` 表每策略一条，保存 `metric_name / metric_value / params / payload / fingerprint / created_at`，本轮新增 `settings` 列——保存产生最优结果时的**全部回测设置快照**（`_bt_settings_snapshot()`：初始资金、持有天数、选股数量、涨停阈值、回测起止 + 全部策略参数 `BT_PARAM_DEFAULTS`，如 `erc_metric / erc_top_n / erc_weight_pct / erc_dev_pct / erc_rank_freq / erc_rebal_period / erc_min_amount / erc_min_history`）。
+- 老库通过 `init_db()` 的 `PRAGMA table_info` 检测自动 `ALTER TABLE` 补列，历史记录不丢失。
+- 恢复动作只读取该记录；重跑结果写入 `backtest_result` 缓存，绝不覆盖 `best_backtest`。
+
+**2) 参数逐项还原**
+
+页面「🔧 恢复最优参数并验证复现」按钮按以下顺序还原：
+
+- `_restore_bt_settings(settings)`：仅处理 `_BT_PERSIST_KEYS`（回测设置全量），逐项写入 `st.session_state` 并回写 `app_settings.bt_settings`；日期项转 `pd.to_datetime`。
+- `_restore_cost_settings(params["cost"])`：还原 `commission_rate / commission_min / etf_commission_rate / etf_commission_min / stamp_tax_rate / transfer_fee_rate / slippage_rate`（设置键 `cost_*`）。
+- 旧记录无 `settings` 时用 `_settings_from_params()` 由规范化参数反推（`top_n→erc_top_n`、`weight_fraction→erc_weight_pct×100`、`deviation_threshold→erc_dev_pct×100` 等）。
+- 每项输出核对行 `{参数项, 最优值, 恢复前, 状态}`，状态标注「原本一致 / 已恢复」。
+
+**3) 复现验证与确认记录**
+
+- 用恢复后的设置调用 `load_or_run_backtest(..., force=True)` 重跑，对比 `total_return / max_drawdown / sharpe / final_value / trades_count`，容差 `max(1e-6, |最优值|×1e-6)`；全部一致才判定「复现一致」。
+- 行情数据指纹与最优记录不同（期间数据已更新）时给出警告，说明指标可能有差异。
+- 每次恢复写入 `param_restore_log` 表（`strategy / restored_at / metric_name / best_metric / new_metric / matched / detail / params / settings`），`detail` 含逐项参数核对与指标对比；页面可下载 `restore_<策略>.json` 存档。
+- 审计查询：`data_store.get_param_restore_log(strategy, limit=3)` 按时间倒序返回最近若干次恢复的一致性状态。
+
 

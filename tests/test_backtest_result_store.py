@@ -109,5 +109,100 @@ class BacktestResultStoreTest(unittest.TestCase):
         self.assertEqual(n, 1)
 
 
+class BestBacktestSnapshotTest(unittest.TestCase):
+    """最优结果快照: 完整配置留存 + 参数恢复确认记录 (2026-11-28)"""
+
+    def setUp(self):
+        self._old_path = data_store.DB_PATH
+        self._tmp = tempfile.mkdtemp()
+        data_store.DB_PATH = os.path.join(self._tmp, "t.db")
+        data_store.invalidate_stats()
+        data_store.init_db()
+
+    def tearDown(self):
+        data_store.DB_PATH = self._old_path
+        data_store.invalidate_stats()
+
+    def test_best_backtest_keeps_settings_snapshot(self):
+        payload = be.serialize_result(sample_result())
+        settings = {"erc_top_n": 1, "erc_weight_pct": 75,
+                    "erc_dev_pct": 4, "backtest_start": "2016-10-19"}
+        data_store.save_best_backtest(
+            "ETF调仓策略", "total_return", 223.1, {"top_n": 1}, "fp1",
+            payload, settings=settings)
+
+        rec = data_store.get_best_backtest("ETF调仓策略")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["metric_name"], "total_return")
+        self.assertAlmostEqual(rec["metric_value"], 223.1)
+        # settings 完整留存, 回读为 dict
+        self.assertEqual(rec["settings"], settings)
+        # payload 回读为 dict, 成交明细不被破坏 (最优记录只读)
+        self.assertEqual(rec["payload"]["fills"], be.serialize_result(sample_result())["fills"])
+        self.assertTrue(rec["created_at"])
+
+    def test_best_backtest_overwrites_single_row(self):
+        data_store.save_best_backtest(
+            "ETF调仓策略", "total_return", 100.0, {}, "fp1", {"performance": {}},
+            settings={"erc_top_n": 3})
+        data_store.save_best_backtest(
+            "ETF调仓策略", "total_return", 223.1, {}, "fp2", {"performance": {}},
+            settings={"erc_top_n": 1})
+        conn = data_store.get_conn()
+        n = conn.execute("SELECT COUNT(*) FROM best_backtest").fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 1)
+        rec = data_store.get_best_backtest("ETF调仓策略")
+        self.assertEqual(rec["settings"]["erc_top_n"], 1)
+        self.assertEqual(rec["fingerprint"], "fp2")
+
+    def test_legacy_table_gets_settings_column(self):
+        # 老库: best_backtest 无 settings 列, init_db() 应自动补列
+        legacy = os.path.join(self._tmp, "legacy.db")
+        conn = data_store.sqlite3.connect(legacy)
+        conn.execute(
+            "CREATE TABLE best_backtest (strategy TEXT PRIMARY KEY, metric_name TEXT,"
+            " metric_value REAL, params TEXT, fingerprint TEXT, payload TEXT,"
+            " created_at TEXT)")
+        conn.commit()
+        conn.close()
+
+        old_path = data_store.DB_PATH
+        data_store.DB_PATH = legacy
+        try:
+            data_store.init_db()
+            conn = data_store.get_conn()
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(best_backtest)")]
+            conn.close()
+            self.assertIn("settings", cols)
+        finally:
+            data_store.DB_PATH = old_path
+
+    def test_restore_log_write_and_read(self):
+        detail = {"参数核对": [{"参数项": "erc_top_n", "最优值": "1",
+                               "恢复前": "3", "状态": "已恢复"}],
+                  "指标对比": [{"指标": "总收益(%)", "最优结果": 223.1,
+                                "恢复后复现": 223.1, "一致": "✅"}],
+                  "数据指纹一致": True}
+        data_store.log_param_restore(
+            "ETF调仓策略", "total_return", 223.1, 223.1, True, detail,
+            params={"top_n": 1}, settings={"erc_top_n": 1})
+        data_store.log_param_restore(
+            "ETF调仓策略", "total_return", 223.1, 180.0, False, {"数据指纹一致": False})
+
+        logs = data_store.get_param_restore_log("ETF调仓策略", limit=5)
+        self.assertEqual(len(logs), 2)
+        newest = logs[0]          # 按 id 倒序, 最新在前
+        self.assertFalse(newest["matched"])
+        self.assertAlmostEqual(newest["new_metric"], 180.0)
+        oldest = logs[1]
+        self.assertTrue(oldest["matched"])
+        self.assertAlmostEqual(oldest["best_metric"], 223.1)
+        self.assertEqual(oldest["detail"]["参数核对"][0]["状态"], "已恢复")
+        self.assertTrue(oldest["restored_at"])
+        # 只取最近 1 条
+        self.assertEqual(len(data_store.get_param_restore_log("ETF调仓策略", limit=1)), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
