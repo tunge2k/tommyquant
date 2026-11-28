@@ -4743,7 +4743,10 @@ elif page == "backtest":
                     holds_df["date"] = pd.to_datetime(holds_df["date"]).dt.normalize()
                     # 总资产 = 当日现金 (curve) + 当日全部持仓市值
                     if curve is not None and len(curve) > 0:
-                        _cur = curve[["date", "cash"]].copy()
+                        # 兼容历史缓存: 旧 payload 可能没有 cash/market_value 列
+                        _cur = curve[["date"]].copy()
+                        _cur["cash"] = (pd.to_numeric(curve["cash"], errors="coerce").fillna(0.0)
+                                        if "cash" in curve.columns else 0.0)
                         _cur["date"] = pd.to_datetime(_cur["date"]).dt.normalize()
                         holds_df = holds_df.merge(_cur, on="date", how="left")
                         holds_df["cash"] = holds_df["cash"].fillna(0.0)
@@ -4758,6 +4761,8 @@ elif page == "backtest":
                         "date": "日期", "code": "代码", "qty": "持股量",
                         "cost_price": "成本价", "close": "收盘价",
                         "market_value": "市值", "pnl": "浮盈"})
+                    if "浮盈" not in holds_df.columns:
+                        holds_df["浮盈"] = 0.0   # 兼容历史缓存缺失 pnl 列
                     holds_df["浮盈"] = holds_df["浮盈"].apply(lambda v: f"{v:+,.2f}")
                     holds_df["总资产"] = holds_df["总资产"].apply(lambda v: f"{v:,.2f}")
                     holds_df["日期"] = pd.to_datetime(holds_df["日期"]).dt.strftime("%Y-%m-%d")
