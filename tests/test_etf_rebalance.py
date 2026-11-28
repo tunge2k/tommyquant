@@ -169,6 +169,13 @@ class EtfRebalanceTest(unittest.TestCase):
         mv = sum(h["market_value"] for h in rows)
         self.assertLess(abs(mv / tv - 0.75), 0.03)
 
+    def test_default_target_position_is_90pct(self):
+        """默认目标仓位 90%（2026-11-28：85/90/95% 对照后取 90%）"""
+        self.assertAlmostEqual(er.default_params()["weight_fraction"], 0.90, places=4)
+        r = er.run_etf_rebalance(make_trend_feat(),
+                                 dict(start="2016-01-04", end="2026-11-27"))
+        self.assertLess(abs(float(r["meta"]["initial_position_ratio"]) - 0.90), 0.03)
+
     # ---------- 4: amount_20 排序 ----------
     def test_amount_metric_selects_largest(self):
         feat = make_trend_feat()

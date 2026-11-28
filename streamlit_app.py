@@ -1769,8 +1769,9 @@ BT_PARAM_DEFAULTS = {
     # ETF 调仓策略 (独立策略: 可配置排序指标 + 偏差网格调仓 + 可配换股 + 目标仓位再平衡)
     # 与「ETF策略」的区别: 无趋势止损(用户 2026-11-28 确认的口径), 纯规则化调仓
     # 2026-11-28 参数包: 对比「513100 买入持有」后收紧默认值——
-    # 仓位 75%→95% 减少现金拖累, 偏差 4%→15% 减少噪声交易, 关闭年度换股避免追高
-    "erc_metric": "momentum", "erc_top_n": 2, "erc_weight_pct": 95,
+    # 仓位 75%→95% 减少现金拖累, 偏差 4%→15% 减少噪声交易, 关闭年度换股避免追高;
+    # 后续 95%→90%: 对照回测 85/90/95% 补仓放弃 0/1/76 次, 90% 为收益与现金垫折中
+    "erc_metric": "momentum", "erc_top_n": 2, "erc_weight_pct": 90,
     "erc_dev_pct": 15, "erc_rank_freq": "off", "erc_rebal_period": "1y",
     "erc_min_amount": 0.01, "erc_min_history": 250,
     # 现金安全垫保护: 余额低于「倍数 × 单次偏差调仓所需资金」时, 卖出调仓额外加卖
@@ -1798,7 +1799,7 @@ def _bt_settings_snapshot() -> dict:
 # 迁移版本号: 一次性迁移守卫。
 # 旧实现每次会话都按「值 == 旧默认值」改写, 用户手动选成旧默认值(如 MA30回看=8、
 # 持仓数=2)会被静默改回, 表现为「改了设置没用」——必须只迁移一次。
-_BT_MIG_VER = "v18"
+_BT_MIG_VER = "v19"
 
 
 def _load_bt_settings():
@@ -1823,7 +1824,7 @@ def _load_bt_settings():
         _mig_done = ""
     if _mig_done != _BT_MIG_VER:
         # v17 及以前的历史迁移只在跨版本升级时执行, 避免每次升版把用户手改值再改回去
-        if _mig_done not in ("v17", _BT_MIG_VER):
+        if _mig_done not in ("v17", "v18", _BT_MIG_VER):
             # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
             _mdd = saved.get("etf_max_dd_th")
             if isinstance(_mdd, (int, float)) and _mdd < 1:
@@ -1857,6 +1858,9 @@ def _load_bt_settings():
             saved["erc_dev_pct"] = 15
         if saved.get("erc_rank_freq") in ("1y", "yearly"):
             saved["erc_rank_freq"] = "off"
+        # 2026-11-28 目标仓位迁移: 95%→90% (85/90/95% 对照: 补仓放弃 0/1/76 次)
+        if saved.get("erc_weight_pct") == 95:
+            saved["erc_weight_pct"] = 90
         try:
             data_store.set_setting("bt_settings_mig", _BT_MIG_VER)
         except Exception:
@@ -2262,7 +2266,7 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "start": str(start_d)[:10],
             "end": str(end_d)[:10],
             "top_n": int(ss.get("erc_top_n", 2)),
-            "weight_fraction": float(ss.get("erc_weight_pct", 95)) / 100.0,
+            "weight_fraction": float(ss.get("erc_weight_pct", 90)) / 100.0,
             "deviation_threshold": float(ss.get("erc_dev_pct", 15)) / 100.0,
             "rank_metric": str(ss.get("erc_metric", "momentum")),
             "rank_check_freq": str(ss.get("erc_rank_freq", "off")),
@@ -4391,7 +4395,7 @@ elif page == "backtest":
             st.session_state.get("erc_metric", "momentum"), "综合动量")
         _summary_parts.append(f"{st.session_state.get('erc_top_n', 2)}只外盘ETF")
         _summary_parts.append(f"排序:{_mlabel}")
-        _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 95))}%")
+        _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 90))}%")
         _summary_parts.append(f"±{int(st.session_state.get('erc_dev_pct', 15))}%调仓")
         _rk_lbl = {"1y": "每年换股", "6m": "每半年换股", "3m": "每季换股",
                    "1m": "每月换股", "off": "不换股",
@@ -4656,7 +4660,8 @@ elif page == "backtest":
             with _v2:
                 _b = st.columns(4)
                 _num("目标仓位(%)", 10, 100, "erc_weight_pct", step=5, col=_b[0],
-                     help="初始建仓与定期再平衡的目标总仓位，默认 95%；仓位越高现金垫越薄")
+                     help="初始建仓与定期再平衡的目标总仓位，默认 90%；仓位越高现金垫越薄，"
+                          "95% 时深跌补仓失败率显著上升")
                 _num("偏差阈值(%)", 1, 30, "erc_dev_pct", step=1, col=_b[1],
                      help="持仓市值相对市值中枢的偏离超过该值即调回中枢，默认 15%；"
                           "阈值越小交易越频繁、摩擦成本越高")
