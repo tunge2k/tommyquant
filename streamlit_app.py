@@ -32,6 +32,7 @@ import data_store
 import news_fetcher
 import perf_report
 import robust_backtest as rb
+import bt_best_state as bbs
 from world_map_countries import COUNTRY_PATHS, TRACKED_COUNTRIES   # 国家轮廓 (equirectangular)
 
 try:
@@ -2330,6 +2331,10 @@ def _bt_result_from_rec(rec, stale_params=False):
         "created_at": str(rec["created_at"]).replace("T", " "),
         "stale": rec["fingerprint"] != DATA_FINGERPRINT,
         "stale_params": stale_params,
+        "origin": "cache",
+        # 记录自身的参数/指纹: 参数已变时自动保存为最优也要用它, 不能用当前值
+        "params": rec.get("params") or None,
+        "fingerprint": rec.get("fingerprint"),
     }
     return result
 
@@ -2358,7 +2363,8 @@ def load_or_run_backtest(strategy_key, feat_data, initial, hold, top, lu_pct,
         except Exception:
             pass
         result["_meta"] = {"created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                           "stale": False, "stale_params": False}
+                           "stale": False, "stale_params": False,
+                           "origin": "fresh"}
     return result
 
 
@@ -4703,6 +4709,8 @@ elif page == "backtest":
         sp = {"top_n": top_n}
 
     if run_btn:
+        # 主动重跑: 清掉上一次的「放弃本次」标记, 让新结果重新参与最优比较
+        st.session_state.pop("_bt_best_discard", None)
         # 参数 + 行情指纹都未变 → 直接调出最近一次结果, 不重算 (避免无谓转圈)
         _params_now = _bt_params(strategy_choice, initial_capital, hold_days,
                                  top_n, limit_up_pct, backtest_start, backtest_end)
@@ -4710,7 +4718,6 @@ elif page == "backtest":
         _rec_now = data_store.get_backtest_result(strategy_choice, _sig_now)
         if _rec_now is not None and str(_rec_now["fingerprint"]) == DATA_FINGERPRINT:
             result = _bt_result_from_rec(_rec_now)
-            st.caption("⚡ 参数与行情均未变化，已直接载入最近一次回测结果")
         else:
             with st.spinner("🔄 运行回测..."):
                 _t_bt = time.perf_counter()
@@ -4723,56 +4730,68 @@ elif page == "backtest":
                 _t_str = f"{int(_elapsed // 60)} 分 {_elapsed % 60:.0f} 秒"
             else:
                 _t_str = f"{_elapsed:.1f} 秒"
-            st.success(f"✅ 回测完成! {_n_tr} 笔交易 · 回测计算耗时 {_t_str}")
+            st.success(f"✅ 本次回测完成！{_n_tr} 笔交易 · 耗时 {_t_str}")
             try:
                 data_store.save_run("backtest", strategy_choice, sp, result["performance"])
-            except Exception:
-                pass
-            # 历史最优自动留存: 尚无最优、或本次更优 → 直接更新(更优无需确认)
-            try:
-                _best0 = data_store.get_best_backtest(strategy_choice)
-                _ret0 = float(result["performance"].get("total_return", 0) or 0)
-                if _best0 is None or _ret0 > float(_best0["metric_value"]) + 1e-9:
-                    data_store.save_best_backtest(
-                        strategy_choice, "total_return", _ret0, _params_now,
-                        DATA_FINGERPRINT, serialize_result(result),
-                        settings=_bt_settings_snapshot())
             except Exception:
                 pass
     else:
         result = _cached.get(strategy_choice)
 
-    # ---------- 历史最优结果保护 ----------
-    # 新结果劣于已保存的最优时, 明确提示并让用户确认是否放弃本次, 避免误覆盖最优
+    # ---------- 当前结果 vs 历史最优: 统一状态机 ----------
+    # 所有结果 (本次计算 / 库内载入 / 上次结果) 都经过这里:
+    #   1) 更优或尚无最优 → 自动落库 (唯一入口, 幂等, 不重复不遗漏)
+    #   2) 始终展示「当前值 vs 已保存最优」的对应关系
+    #   3) 劣于最优且用户未选择 → 弹「放弃本次 / 保留本次」
     if result:
-        _p_chk = _bt_params(strategy_choice, initial_capital, hold_days,
+        _p_now = _bt_params(strategy_choice, initial_capital, hold_days,
                             top_n, limit_up_pct, backtest_start, backtest_end)
-        _sig_chk = _bt_sig(_p_chk)
-        _best = data_store.get_best_backtest(strategy_choice)
-        _ret_chk = float(result["performance"].get("total_return", 0) or 0)
-        _discarded = st.session_state.get("_bt_best_discard") == _sig_chk
-        if (_best and not _discarded
-                and _ret_chk < float(_best["metric_value"]) - 1e-9):
-            st.warning(
-                f"⚠️ 本次回测总收益 {_ret_chk:+.2f}%，低于历史最优 "
-                f"{float(_best['metric_value']):+.2f}%（保存于 "
-                f"{str(_best['created_at']).replace('T', ' ')}）。"
-                "是否放弃本次结果、保留最优？")
+        _sig_now = _bt_sig(_p_now)
+        _meta_now = result.get("_meta") or {}
+        _discarded = st.session_state.get("_bt_best_discard") == _sig_now
+        # 自动保存要落「结果自身」的参数/指纹/配置: 参数已变时展示的是上次结果,
+        # 不能拿当前参数冒充, 否则最优记录无法复现 (settings 缺失时恢复流程会按参数反推)
+        _origin_now = bbs.origin_of(_meta_now)
+        _is_history = _origin_now == bbs.ORIGIN_HISTORY
+        _params_best = (_meta_now.get("params") or _p_now) if _is_history else _p_now
+        _fp_best = (_meta_now.get("fingerprint") or DATA_FINGERPRINT) if _is_history else DATA_FINGERPRINT
+        _settings_best = {} if _is_history else _bt_settings_snapshot()
+        _bs = bbs.build_state(result.get("performance"),
+                              data_store.get_best_backtest(strategy_choice),
+                              _meta_now, _discarded)
+        if _bs["autosave"]:
+            _saved, _prev_best = bbs.ensure_best_saved(
+                data_store, strategy_choice, result.get("performance"), _params_best,
+                _fp_best, _settings_best, serialize_result(result),
+                _bs["metric_name"])
+            if _saved:
+                # 用保存前的记录重建文案, 说明「优于原最优」
+                _bs = bbs.build_state(result.get("performance"), _prev_best,
+                                      _meta_now, _discarded, _bs["metric_name"])
+                _bs["saved"] = True
+        _bs_summary = "🏁 " + _bs["summary"] + (" · 已自动保存" if _bs.get("saved") else "")
+        st.caption(_bs_summary)
+        if _bs["relation"] == bbs.WORSE:
+            st.warning(_bs["message"])
+        elif _bs["relation"] == bbs.DISCARDED:
+            st.info(_bs["message"])
+        elif _bs["relation"] == bbs.NEW_BEST and _bs["origin"] != bbs.ORIGIN_FRESH:
+            st.success(_bs["message"])
+        if _bs["prompt"]:
             _bc1, _bc2 = st.columns(2)
             if _bc1.button("↩️ 放弃本次，查看最优结果", key="bt_keep_best"):
-                st.session_state["_bt_best_discard"] = _sig_chk
+                st.session_state["_bt_best_discard"] = _sig_now
                 st.rerun()
             if _bc2.button("✅ 保留本次并更新最优", key="bt_use_new"):
                 data_store.save_best_backtest(
-                    strategy_choice, "total_return", _ret_chk, _p_chk,
-                    DATA_FINGERPRINT, serialize_result(result),
-                    settings=_bt_settings_snapshot())
-                st.session_state["_bt_best_discard"] = _sig_chk
+                    strategy_choice, _bs["metric_name"],
+                    float(result["performance"].get(_bs["metric_name"], 0) or 0),
+                    _params_best, _fp_best, serialize_result(result),
+                    settings=_settings_best)
+                st.session_state.pop("_bt_best_discard", None)
                 st.rerun()
-        if _discarded and _best:
-            result = _bt_result_from_rec(_best)
-            st.info("已放弃本次结果，当前展示历史最优回测（"
-                    f"{str(_best['created_at']).replace('T', ' ')}）")
+        if _bs["display"] == "best":
+            result = _bt_result_from_rec(data_store.get_best_backtest(strategy_choice))
 
     # ---------- 最优参数快照: 一键恢复 + 复现验证 + 确认记录 ----------
     # 只读取最优记录, 不修改/删除其数据; 恢复动作仅写当前会话设置与成本参数
@@ -4857,14 +4876,10 @@ elif page == "backtest":
 
     if result:
         _meta = result.get("_meta") or {}
-        if _meta.get("created_at"):
-            if _meta.get("stale_params"):
-                _hint = "展示的是上次回测结果，参数/区间已变更，点「🚀 开始回测」生成新结果"
-            elif _meta.get("stale"):
-                _hint = "行情数据已更新，点「🚀 开始回测」可按最新数据刷新"
-            else:
-                _hint = "参数未变更，直接展示已保存结果"
-            st.caption(f"📌 最近回测：{_meta['created_at']} · {_hint}")
+        # 仅对「载入的历史结果」提示来源; 本次刚算完的不再重复说明 (上方已有状态行)
+        _origin_cap = bbs.origin_caption(_meta)
+        if _meta.get("created_at") and _origin_cap:
+            st.caption(f"📌 {_meta['created_at']} · {_origin_cap}")
         p = result["performance"]
         _fb = result.get("fill_blocks") or {}
         if any(_fb.values()):
