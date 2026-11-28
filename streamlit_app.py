@@ -53,22 +53,32 @@ def run_backtest_auto(feat, select_fn, strategy_params=None, **kwargs):
 data_store.init_db()   # 幂等建表, 防止首次启动时表不存在
 
 
-# feat 后台预热 + 指纹变更监听: feat_cache.pkl 冷读约 157s (NAS, 1.1GB / 6476 标的),
+# feat 后台预热 + 指纹变更监听: feat_cache.pkl 约 1.2GB / 6476 标的, 冷读约 6~9s,
+# 重算 (load_all_bars 38s + compute_factors 97s) 约 2 分钟。
 # 放常驻守护线程在开机阶段就加载进 data_store._feat_memo; 每日盘后数据更新→指纹变化时
-# 也自动后台重载, 用户点进计算页始终命中进程 memo, 不再被冷读阻塞 2~3 分钟。
-# GIL 在 pickle 反序列化期间会周期性让渡, 首页渲染 (~0.2s) 不受明显影响。
+# 也自动后台重载, 用户点进计算页始终命中进程 memo。
+# 盘后补全会把当日 K 线一条条写进来, 指纹每隔几十秒就变; 此时重算因子纯属浪费
+# (算一次约 2 分钟, 没算完数据又变了), 因此等指纹稳定 FEAT_SETTLE_SEC 秒后再加载。
 # 用 @st.cache_resource 包裹: Streamlit 每次 rerun 都会重跑本模块, 须保证线程只启动一次。
 def _feat_watch_loop():
     last_fp = None
+    changed_at = time.time()
+    first_run = True
     while True:
         try:
             fp = data_store.data_fingerprint()
             if fp != last_fp:
-                data_store.load_feat_cached(fp)   # 指纹已在 memo 则瞬时返回, 否则后台加载
                 last_fp = fp
+                changed_at = time.time()
+                # 开机第一次无条件预热: 磁盘缓存命中约 6~9s; 未命中才重算一次 (~2 分钟)
+                if first_run or data_store.feat_cache_matches(fp):
+                    data_store.load_feat_cached(fp)
+                first_run = False
+            elif time.time() - changed_at >= data_store.FEAT_SETTLE_SEC:
+                data_store.load_feat_cached(fp)   # 数据已稳定, 后台重算一次
         except Exception:
             pass
-        time.sleep(60)
+        time.sleep(30)
 
 
 @st.cache_resource(show_spinner=False)
@@ -2028,20 +2038,33 @@ backtest_end = pd.Timestamp(st.session_state["backtest_end"])
 DATA_FINGERPRINT = data_store.data_fingerprint()
 
 
-@st.cache_resource(show_spinner=False, max_entries=1)
-def get_feat_data(fingerprint: str = ""):
-    """行情 + 因子。磁盘缓存命中直接读 (数秒), 未命中才重算 (~80s)。"""
-    return data_store.load_feat_cached(fingerprint)
+def get_feat_data(fingerprint: str = "", allow_stale: bool = False):
+    """行情 + 因子。磁盘缓存命中直接读 (数秒), 未命中才重算 (~2 分钟)。
+
+    不加 @st.cache_resource: data_store._feat_memo 已是进程级 memo, 而 cache_resource
+    会把「数据更新期间返回的旧因子」按新指纹缓存住, 数据稳定后也一直吐旧数据。
+    """
+    return data_store.load_feat_cached(fingerprint, allow_stale=allow_stale)
 
 
 def require_data() -> dict:
     """需要计算的页面调用: 首次加载时提示, 无数据则中止"""
-    # 同一会话内已加载过 → 直接走 cache, 不再闪 spinner
+    # 同一会话内已加载过 → 直接走 memo, 不再闪 spinner
     if st.session_state.get("_feat_ready"):
-        feat = get_feat_data(DATA_FINGERPRINT)
+        feat = get_feat_data(DATA_FINGERPRINT, allow_stale=True)
     else:
         with st.spinner("📚 加载行情与因子..." if lang() == "zh" else "📚 Loading bars & factors..."):
-            feat = get_feat_data(DATA_FINGERPRINT)
+            feat = get_feat_data(DATA_FINGERPRINT, allow_stale=True)
+        if feat:
+            st.session_state["_feat_ready"] = True
+    # 盘后补全正在写数据时先复用上一次的因子, 明确告知, 避免用户以为回测用了当天数据
+    _memo_fp = data_store.memo_fingerprint()
+    if feat and _memo_fp and _memo_fp != DATA_FINGERPRINT:
+        st.info("⏳ 行情数据正在更新（盘后补全/因子重算中），当前复用最近一次已算好的因子。"
+                "回测结果只含更新前的数据，更新完成后刷新页面即可用最新行情。"
+                if lang() == "zh" else
+                "⏳ Market data is updating; showing factors from the last completed build. "
+                "Refresh after the update finishes to backtest on the newest data.")
         if feat:
             st.session_state["_feat_ready"] = True
     if not feat:

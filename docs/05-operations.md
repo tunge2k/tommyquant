@@ -161,8 +161,29 @@ DNS：容器 DNS + `doh_patch` 兜底；若 NAS 劫持 UDP 53，DoH 会接管解
 |---|---|---|
 | `data/stock.db` | 全部业务数据 | 可重建，但耗时长（全量下载 + 财务） |
 | `data/feat_cache.pkl` | 因子缓存 | 可删除，自动重算 |
+| `data/feat_cache.pkl.meta` | 因子缓存旁车（指纹/版本，几十字节） | 可删除，随下次写缓存重建 |
+| `data/feat_cache.pkl.lock` | 跨进程重算锁（flock） | 可删除 |
 | `cache/factor_matrix/` | 选股矩阵缓存 | 可删除，自动重算 |
 | `cache/*.csv` | 旧版 CSV 兼容 | 可删除 |
+
+### 6.1.1 因子缓存加载与重算（2026-11-28）
+
+`feat_cache.pkl` 约 1.2GB / 6476 标的。冷读磁盘约 6~9 秒；指纹不一致时重算
+（`load_all_bars` 约 38s + `compute_factors` 约 97s）约 2 分钟。为避免页面长时间卡在
+「加载行情与因子」，加载链路做了四件事：
+
+1. **进程 memo**：同指纹只加载一次；后台 watcher 在开机阶段预热。
+2. **指纹稳定期**（`FEAT_SETTLE_SEC`，默认 90s）：盘后补全会持续写入当日 K 线，指纹每隔
+   几十秒就变。watcher 只在指纹稳定 90s 后才重算，避免「算一次还没算完数据又变了」的无效重算。
+3. **跨进程单飞**（`feat_cache.pkl.lock` + `flock`）：worker 与 streamlit 是两个进程，
+   同一时刻只允许一个进程重算，另一个等锁后直接读对方写好的缓存，不重复烧 CPU/内存。
+4. **旁车 meta** + **数据更新期复用旧因子**：`feat_cache.pkl.meta` 只存指纹/版本，判断缓存
+   是否最新无需读 1.2GB；数据正在更新或后台正在重算时，页面复用最近一次已算好的因子并提示
+   「行情数据正在更新」，不再阻塞 2 分钟。
+
+排查：页面提示「行情数据正在更新」属正常状态，更新完成后刷新即可；若长时间不消失，看
+`docker logs tommyquant | grep 因子缓存预热` 与 `data/feat_cache.pkl.meta` 的 `fingerprint`
+是否等于当前数据指纹。
 
 ### 6.2 备份
 

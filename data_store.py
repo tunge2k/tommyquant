@@ -489,6 +489,17 @@ def log_download(symbol, status, rows, first_date, last_date):
 # ==================== 数据指纹 (缓存失效依据) ====================
 
 _FP_CACHE = {"value": None, "ts": 0.0}
+# 本进程内首次观测到当前指纹的时刻: 盘后补全期间 K 线连续写入, 指纹每隔几十秒就变,
+# 用「指纹已稳定多久」判断此刻是否值得重算因子 (否则重算一次还没算完数据又变了)。
+_FP_CHANGE = {"value": None, "ts": 0.0}
+
+
+def fingerprint_age() -> float:
+    """当前数据指纹在本进程内已保持不变的秒数 (数据持续写入时接近 0)"""
+    import time
+    if _FP_CHANGE["value"] is None:
+        return 1e9
+    return time.time() - _FP_CHANGE["ts"]
 
 
 def data_fingerprint() -> str:
@@ -517,6 +528,9 @@ def data_fingerprint() -> str:
           f"_d{n_div}_n{n_name}")
     _FP_CACHE["value"] = fp
     _FP_CACHE["ts"] = now
+    if _FP_CHANGE["value"] != fp:
+        _FP_CHANGE["value"] = fp
+        _FP_CHANGE["ts"] = now
     return fp
 
 
@@ -1394,40 +1408,153 @@ FEAT_CACHE_PATH = os.path.join(DATA_DIR, "feat_cache.pkl")
 FEAT_CACHE_VERSION = 6      # 因子口径变更时 +1 (v3: ETF 份额折算复权; v4: max_dd_250 改单层rolling,
                             # v5: ETF 改后复权 (叠加分红除息事件); v6: 新增 ret_120/ret_250)
 
-# 进程级 feat 常驻 memo: feat_cache.pkl 在 NAS 上 1.1GB / 6476 标的, 冷读约 157s。
-# 若每次都重读磁盘, 用户首次点进计算页会卡 2~3 分钟。memo 让同进程内同指纹只加载一次,
-# 配合 streamlit_app 启动时的后台预热线程, 把 157s 挪到开机阶段而非用户点击时。
-# 锁 + Event: 并发调用只触发一次磁盘读, 其余线程 wait, 避免惊群 (thundering herd)。
+# 进程级 feat 常驻 memo: feat_cache.pkl 在 NAS 上约 1.2GB / 6476 标的, 冷读约 6~9s,
+# 重算 (load_all_bars 38s + compute_factors 97s) 约 2 分钟。
+# memo 让同进程内同指纹只加载一次, 配合 streamlit_app 启动时的后台预热线程,
+# 把加载挪到开机阶段而非用户点击时。
+# 锁 + Event: 并发调用只触发一次加载, 其余线程 wait, 避免惊群 (thundering herd)。
 # loading_fp 放在 dict 里: 函数内若直接给模块级变量赋值会触发 Python 局部变量绑定,
 # 导致同函数内更早的读取抛 UnboundLocalError。dict 内的键赋值只是变更, 不触发该问题。
-_feat_memo = {"fingerprint": None, "feat": None, "loading_fp": None}
+_feat_memo = {"fingerprint": None, "feat": None, "loading_fp": None, "built_at": 0.0}
 _feat_memo_lock = threading.Lock()
 _feat_memo_event = threading.Event()
 _feat_memo_event.set()          # set = 当前无加载进行中 (memo 可用或为空)
 
+FEAT_LOCK_PATH = FEAT_CACHE_PATH + ".lock"
+# 盘后补全期间指纹会连续变化, 稳定这么久才认为数据写完、值得重算一次因子
+FEAT_SETTLE_SEC = float(os.environ.get("FEAT_SETTLE_SEC", "90"))
 
-def load_feat_cached(fingerprint: str = None) -> dict:
-    """行情 + 因子。优先级: 进程 memo → 磁盘缓存 (指纹一致) → 重算并写回。
 
-    全市场 350 万行: load_all_bars 约 30s + compute_factors 约 55s, 不能每次都算。
-    feat_cache.pkl 在 NAS 上 1.1GB, 冷读约 157s, 所以进程内常驻 memo 是关键。
+def feat_cache_matches(fingerprint: str) -> bool:
+    """只看旁车 meta (几十字节) 判断磁盘因子缓存是否对应当前数据指纹, 避免白读 1.2GB"""
+    import json as _json
+    try:
+        with open(FEAT_CACHE_PATH + ".meta", "r", encoding="utf-8") as f:
+            d = _json.load(f)
+        return (d.get("fingerprint") == fingerprint
+                and d.get("version") == FEAT_CACHE_VERSION)
+    except Exception:
+        return False
+
+
+def _load_feat_disk(fingerprint: str):
+    """读磁盘因子缓存; 指纹与版本都一致才返回, 否则 None"""
+    import pickle
+    p = FEAT_CACHE_PATH
+    if not os.path.exists(p):
+        return None
+    meta = os.path.exists(p + ".meta")
+    if meta and not feat_cache_matches(fingerprint):
+        return None                     # 旁车已判不符, 不再白读 1.2GB
+    try:
+        with open(p, "rb") as f:
+            d = pickle.load(f)
+        actual = d.get("fingerprint")
+        if not meta:
+            # 老缓存没有旁车: 记录真实指纹, 下次判断是否最新无需再读 1.2GB
+            _write_feat_meta(actual, d.get("version"))
+        if (actual == fingerprint and d.get("feat")
+                and d.get("version") == FEAT_CACHE_VERSION):
+            return d["feat"]
+    except Exception:
+        pass
+    return None
+
+
+def _write_feat_meta(fingerprint: str, version: int = None):
+    """写旁车 meta (指纹/版本), 供其他进程低成本判断缓存是否最新"""
+    import json as _json
+    try:
+        mt = FEAT_CACHE_PATH + ".meta"
+        with open(mt + ".tmp", "w", encoding="utf-8") as f:
+            _json.dump({"fingerprint": fingerprint,
+                        "version": FEAT_CACHE_VERSION if version is None else version,
+                        "updated_at": datetime.now().isoformat(timespec="seconds")}, f)
+        os.replace(mt + ".tmp", mt)
+    except Exception:
+        pass
+
+
+def _rebuild_feat(fingerprint: str):
+    """跨进程单飞重算: flock 保证同一时刻只有一个进程算因子, 其他进程等它写好缓存后直接读
+
+    盘后补全的 worker 与 streamlit 是两个进程, 各自重算会白烧两遍 CPU (约 2 分钟/遍),
+    并互相抢内存。等锁期间若对方已写好指纹匹配的缓存, 这里直接读盘命中。
     """
     import pickle
+    lock_fd = None
+    fcntl = None
+    try:
+        import fcntl as _fcntl
+        fcntl = _fcntl
+        lock_fd = os.open(FEAT_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)       # 阻塞等待其他进程算完
+    except Exception:
+        lock_fd = None                            # Windows 开发环境 / 不支持 flock
+    try:
+        feat = _load_feat_disk(fingerprint)       # 等锁期间对方可能已写好
+        if feat is not None:
+            return feat
+        from backtest_engine import compute_factors   # 延迟导入, 避免循环依赖
+        raw = load_all_bars()
+        # ETF 后复权: 分红除息事件一并交给因子层 (缺失时只做份额折算复权)
+        feat = compute_factors(raw, div_map=etf_dividend_map()) if raw else {}
+        try:
+            tmp = FEAT_CACHE_PATH + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump({"fingerprint": fingerprint, "version": FEAT_CACHE_VERSION,
+                             "feat": feat}, f, protocol=5)
+            os.replace(tmp, FEAT_CACHE_PATH)
+            # 旁车 meta: 让其他进程/线程不用读 1.2GB 就能判断缓存是否对应当前指纹
+            _write_feat_meta(fingerprint)
+        except Exception:
+            pass
+        return feat
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+
+
+def memo_fingerprint() -> str:
+    """当前进程内存中的因子对应的数据指纹 (可能落后于 data_fingerprint())"""
+    return _feat_memo["fingerprint"] or ""
+
+
+def load_feat_cached(fingerprint: str = None, allow_stale: bool = False) -> dict:
+    """行情 + 因子。优先级: 进程 memo → 磁盘缓存 (指纹一致) → 重算并写回。
+
+    allow_stale=True 时, 若盘后补全正在写数据 (指纹刚变、尚未稳定) 且 memo 已有旧因子,
+    直接返回旧因子, 避免用户点开页面就卡 2 分钟重算一份马上又要作废的因子。
+    """
     fingerprint = fingerprint or data_fingerprint()
 
     # 快路径: memo 已命中
     with _feat_memo_lock:
         if _feat_memo["fingerprint"] == fingerprint and _feat_memo["feat"] is not None:
             return _feat_memo["feat"]
-        # 已有其他线程正在加载同一指纹 → 等它完成, 直接复用结果
-        wait_for_other = (_feat_memo["loading_fp"] == fingerprint)
+        # 盘后补全正在写数据 (指纹刚变) 或后台正在重算 → 先用旧因子, 不让页面卡 2 分钟
+        busy = _feat_memo["loading_fp"] is not None
+        stale_ok = (allow_stale and _feat_memo["feat"] is not None
+                    and (busy or fingerprint_age() < FEAT_SETTLE_SEC))
 
-    if wait_for_other:
+    if stale_ok:
+        return _feat_memo["feat"]
+
+    if busy:
         _feat_memo_event.wait()          # 阻塞到加载完成 set()
         with _feat_memo_lock:
             if _feat_memo["fingerprint"] == fingerprint and _feat_memo["feat"] is not None:
                 return _feat_memo["feat"]
-        # 极端情况 (加载抛错 / 指纹又变): 落到下面自己加载
+            if (allow_stale and _feat_memo["feat"] is not None
+                    and fingerprint_age() < FEAT_SETTLE_SEC):
+                return _feat_memo["feat"]
 
     # 抢到加载权
     with _feat_memo_lock:
@@ -1438,34 +1565,15 @@ def load_feat_cached(fingerprint: str = None) -> dict:
 
     feat = None
     try:
-        p = FEAT_CACHE_PATH
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as f:
-                    d = pickle.load(f)
-                if (d.get("fingerprint") == fingerprint and d.get("feat")
-                        and d.get("version") == FEAT_CACHE_VERSION):
-                    feat = d["feat"]
-            except Exception:
-                pass
+        feat = _load_feat_disk(fingerprint)
         if feat is None:
-            from backtest_engine import compute_factors   # 延迟导入, 避免循环依赖
-            raw = load_all_bars()
-            # ETF 后复权: 分红除息事件一并交给因子层 (缺失时只做份额折算复权)
-            feat = compute_factors(raw, div_map=etf_dividend_map()) if raw else {}
-            try:
-                tmp = p + ".tmp"
-                with open(tmp, "wb") as f:
-                    pickle.dump({"fingerprint": fingerprint, "version": FEAT_CACHE_VERSION,
-                                 "feat": feat}, f, protocol=5)
-                os.replace(tmp, p)
-            except Exception:
-                pass
+            feat = _rebuild_feat(fingerprint)   # 跨进程 flock + 重算并写回
     finally:
         with _feat_memo_lock:
             _feat_memo["fingerprint"] = fingerprint
             _feat_memo["feat"] = feat
             _feat_memo["loading_fp"] = None
+            _feat_memo["built_at"] = time.time()
             _feat_memo_event.set()
     return feat
 
