@@ -202,17 +202,42 @@ def run_task(t: dict):
         pass
     tid = t["id"]
     data_store.task_update(tid, "running", "0%", "开始")
+
+    # 进度回写: 下载/回填是长任务, 不回调的话页面会一直显示 0%
+    # (只在内存节流, 每 3 秒最多写一次库, 避免 SQLite 高频写)
+    import time as _time
+    _last = [0.0]
+
+    def _cb(done=None, total=None, sym="", rows=0):
+        now = _time.time()
+        if now - _last[0] < 3:
+            return
+        _last[0] = now
+        try:
+            if total:
+                pct = f"{min(100, int(float(done) / max(float(total), 1) * 100))}%"
+                msg = f"{done}/{total} · {sym}"
+            else:
+                pct = "…"
+                msg = f"{sym or done}"[:80]
+            data_store.task_update(tid, "running", pct, msg)
+        except Exception:
+            pass
+
     try:
         ds = t["dataset"]
         if ds == "fundamental":
-            r = data_manager.ensure_fundamentals(quarters=params.get("quarters", 4))
+            r = data_manager.ensure_fundamentals(quarters=params.get("quarters", 4),
+                                                 progress_cb=_cb)
         elif ds == "etf":
-            r = data_manager.ensure_etf_universe(params.get("start", "20200101"))
+            r = data_manager.ensure_etf_universe(params.get("start", "20200101"),
+                                                 progress_cb=_cb)
         elif ds == "etf_extra":
             r = data_manager.ensure_etf_extras(
                 top_n=params.get("top_n", 60), days=params.get("days", 5),
                 with_margin=params.get("with_margin", True),
-                with_valuation=params.get("with_valuation", True))
+                with_valuation=params.get("with_valuation", True),
+                progress_cb=_cb)
         elif ds == "etf_backfill":
             r = data_manager.backfill_etf_factors(
                 start_year=params.get("start_year", 2022),
@@ -238,7 +263,8 @@ def run_task(t: dict):
             r = data_manager.ensure_bars(
                 params.get("symbols") or data_store.list_symbols(),
                 params.get("start", "20200101"),
-                params.get("end", _end_date()))
+                params.get("end", _end_date()),
+                progress_cb=_cb)
         data_store.task_update(tid, "done", "100%", str(r)[:300])
         logger.info(f"任务 #{tid} 完成: {r}")
     except Exception as e:
@@ -254,7 +280,14 @@ def main():
 
     data_store.init_db()
 
-    # 升级兼容: 老库已有K线但无覆盖索引 → 回填, 避免被判定为"全部缺失"而重复全量下载
+    # 遗留的 running 任务: 进程被杀/容器重建后不会自动续跑, 先标记中断
+    try:
+        n_stale = data_store.task_recover_stale()
+        if n_stale:
+            logger.info(f"清理 {n_stale} 个中断的下载任务 (running → failed)")
+    except Exception as e:
+        logger.error(f"清理中断任务失败: {e}")
+
     try:
         n_cov = data_manager.backfill_coverage()
         if n_cov:

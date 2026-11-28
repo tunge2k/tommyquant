@@ -204,5 +204,41 @@ class BestBacktestSnapshotTest(unittest.TestCase):
         self.assertEqual(len(data_store.get_param_restore_log("ETF调仓策略", limit=1)), 1)
 
 
+class TaskQueueRecoveryTest(unittest.TestCase):
+    """下载任务队列: 进程重启后遗留的 running 任务必须被标记中断 (2026-11-28)"""
+
+    def setUp(self):
+        self._old_path = data_store.DB_PATH
+        self._tmp = tempfile.mkdtemp()
+        data_store.DB_PATH = os.path.join(self._tmp, "t.db")
+        data_store.invalidate_stats()
+        data_store.init_db()
+
+    def tearDown(self):
+        data_store.DB_PATH = self._old_path
+        data_store.invalidate_stats()
+
+    def test_stale_running_marked_failed(self):
+        tid = data_store.task_create("daily_bar", {"symbols": ["sh600000"]}, "测试")
+        data_store.task_update(tid, "running", "0%", "开始")
+        self.assertEqual(data_store.task_next_pending(), None)
+
+        n = data_store.task_recover_stale()
+        self.assertEqual(n, 1)
+        row = data_store.task_list(limit=5)[0]
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("中断", row["message"])
+        self.assertTrue(row["finished_at"])
+        # 已清理, 不会重复处理
+        self.assertEqual(data_store.task_recover_stale(), 0)
+
+    def test_pending_task_untouched(self):
+        tid = data_store.task_create("etf", {"start": "20200101"}, "排队")
+        self.assertEqual(data_store.task_recover_stale(), 0)
+        nxt = data_store.task_next_pending()
+        self.assertIsNotNone(nxt)
+        self.assertEqual(nxt["id"], tid)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1996,6 +1996,24 @@ def task_list(limit: int = 20, status: str = None) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
+def task_recover_stale(message: str = "服务重启，任务中断（未自动续跑）") -> int:
+    """把遗留的 running 任务标记为 failed。
+
+    Worker 是单进程串行消费: 进程被容器重建/崩溃杀掉后, 该行会永远停在
+    running 0%, 而 task_next_pending() 只取 pending, 因此永远不会续跑。
+    启动时先清理, 避免页面上出现「卡住的下载任务」。
+    """
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE data_task SET status='failed', message=?, finished_at=? "
+        "WHERE status='running'",
+        (message, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
 def task_next_pending() -> dict | None:
     conn = get_conn()
     row = conn.execute(

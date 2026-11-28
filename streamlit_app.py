@@ -5748,8 +5748,10 @@ elif page == "data":
         if st.button("⚡ 立即补全缺失数据", use_container_width=True, type="primary"):
             n = 0
             try:
-                pending = data_store.task_list(limit=50, status="pending")
-                if not any(t["dataset"] == "daily_bar" for t in pending):
+                # 去重: pending 与 running 都算「已有任务在做」, 避免重复入队
+                active = [t for t in data_store.task_list(limit=50)
+                          if t["status"] in ("pending", "running")]
+                if not any(t["dataset"] == "daily_bar" for t in active):
                     p = data_manager.plan_bars(data_store.list_symbols(),
                                                "20200101", datetime.now().strftime("%Y%m%d"))
                     need = sorted({s for syms in p["plan"].values() for s in syms})
@@ -5761,21 +5763,21 @@ elif page == "data":
                         n += 1
                     # ETF 清单差集: 让新上市 ETF 也进入补数计划
                     etf_syms = {s for s, _ in data_store.get_etf_codes()}
-                    if etf_syms and not any(t["dataset"] == "etf" for t in pending):
+                    if etf_syms and not any(t["dataset"] == "etf" for t in active):
                         data_store.task_create("etf", {"start": "20200101"}, "ETF 清单同步")
                         n += 1
                 # ETF 增强数据 (华泰柏瑞): 已有数据源与凭据时按需补一次
                 try:
                     import htbr_source
                     if htbr_source.available()[0] and not any(
-                            t["dataset"] == "etf_extra" for t in pending):
+                            t["dataset"] == "etf_extra" for t in active):
                         data_store.task_create("etf_extra", {"top_n": 60, "days": 5},
                                                "ETF 增强数据同步")
                         n += 1
                 except Exception:
                     pass
                 if fst["symbols"] < max(1, stats["symbols"]) * 0.5 \
-                        and not any(t["dataset"] == "fundamental" for t in pending):
+                        and not any(t["dataset"] == "fundamental" for t in active):
                     data_store.task_create("fundamental", {"quarters": 4}, "财务季报回填")
                     n += 1
                 st.success(f"已提交 {n} 个任务，Worker 会自动执行" if n else "没有检测到数据缺口")
