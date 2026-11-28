@@ -198,7 +198,8 @@ class EtfRebalanceTest(unittest.TestCase):
         feat = build_feat(dates, closes,
                           amounts={"sh513100": 5e8, "sh513500": 5e8})
         params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
-                      top_n=2, weight_fraction=0.75, min_history=40,
+                      top_n=2, weight_fraction=0.75, deviation_threshold=0.04,
+                      min_history=40,
                       rank_check_freq="off", rebalance_period="off")
         r = er.run_etf_rebalance(feat, params)
 
@@ -240,7 +241,8 @@ class EtfRebalanceTest(unittest.TestCase):
         feat = build_feat(dates, {"sh513100": px},
                           amounts={"sh513100": 5e8})
         params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
-                      top_n=1, weight_fraction=0.75, min_history=40,
+                      top_n=1, weight_fraction=0.75, deviation_threshold=0.04,
+                      min_history=40,
                       rank_check_freq="off", rebalance_period="off")
         r = er.run_etf_rebalance(feat, params)
         dev = [t for t in r["trades"] if "4%" in t["reason"]]
@@ -256,7 +258,8 @@ class EtfRebalanceTest(unittest.TestCase):
         dates = pd.bdate_range("2019-01-01", periods=n_days)
         feat = build_feat(dates, closes, amounts={c: 5e8 for c in closes})
         params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
-                      top_n=1, weight_fraction=0.75, min_history=40,
+                      top_n=1, weight_fraction=0.75, deviation_threshold=0.04,
+                      min_history=40, cash_guard_enabled=False,
                       rank_check_freq="off", rebalance_period="1y")
         return er.run_etf_rebalance(feat, params)
 

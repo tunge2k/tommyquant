@@ -1766,10 +1766,12 @@ BT_PARAM_DEFAULTS = {
     "etf_ret20_min": 0, "etf_ret60_min": 0,
     # 选品范围: 只做跨境(外盘)ETF, 剔除港股系 (恒生/港股通/H股/中概)
     "etf_overseas_only": True,
-    # ETF 调仓策略 (独立策略: 可配置排序指标 + 4%偏差调仓 + 年度换股 + 目标仓位再平衡)
+    # ETF 调仓策略 (独立策略: 可配置排序指标 + 偏差网格调仓 + 可配换股 + 目标仓位再平衡)
     # 与「ETF策略」的区别: 无趋势止损(用户 2026-11-28 确认的口径), 纯规则化调仓
-    "erc_metric": "momentum", "erc_top_n": 3, "erc_weight_pct": 75,
-    "erc_dev_pct": 4, "erc_rank_freq": "1y", "erc_rebal_period": "1y",
+    # 2026-11-28 参数包: 对比「513100 买入持有」后收紧默认值——
+    # 仓位 75%→95% 减少现金拖累, 偏差 4%→15% 减少噪声交易, 关闭年度换股避免追高
+    "erc_metric": "momentum", "erc_top_n": 2, "erc_weight_pct": 95,
+    "erc_dev_pct": 15, "erc_rank_freq": "off", "erc_rebal_period": "1y",
     "erc_min_amount": 0.01, "erc_min_history": 250,
     # 现金安全垫保护: 余额低于「倍数 × 单次偏差调仓所需资金」时, 卖出调仓额外加卖
     "erc_cash_guard": True, "erc_guard_mult": 4.0, "erc_guard_max_extra": 50,
@@ -1796,7 +1798,7 @@ def _bt_settings_snapshot() -> dict:
 # 迁移版本号: 一次性迁移守卫。
 # 旧实现每次会话都按「值 == 旧默认值」改写, 用户手动选成旧默认值(如 MA30回看=8、
 # 持仓数=2)会被静默改回, 表现为「改了设置没用」——必须只迁移一次。
-_BT_MIG_VER = "v17"
+_BT_MIG_VER = "v18"
 
 
 def _load_bt_settings():
@@ -1820,29 +1822,41 @@ def _load_bt_settings():
     except Exception:
         _mig_done = ""
     if _mig_done != _BT_MIG_VER:
-        # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
-        _mdd = saved.get("etf_max_dd_th")
-        if isinstance(_mdd, (int, float)) and _mdd < 1:
-            saved["etf_max_dd_th"] = int(round(_mdd * 100))
-        # 2026-11-26 均衡方案默认值迁移
-        if "etf_top_n" not in saved:
-            saved["etf_top_n"] = 2
-            if saved.get("etf_abs_mom_min", 3.0) == 3.0:
-                saved["etf_abs_mom_min"] = 0.0
-            if saved.get("etf_weight_frac", 0.75) == 0.75:
-                saved["etf_weight_frac"] = 0.95
-        # v16 迁移: 把上一版默认值 (2只/95%/回看5或8周/确认1或2周) 升到新默认
-        if saved.get("etf_top_n") == 2:
-            saved["etf_top_n"] = 1
-        if saved.get("etf_weight_frac") == 0.95:
-            saved["etf_weight_frac"] = 1.0
-        if saved.get("etf_ma30_lookback") in (5, 8):
-            saved["etf_ma30_lookback"] = 10
-        if saved.get("etf_ma30_exit_confirm") in (1, 2):
-            saved["etf_ma30_exit_confirm"] = 3
-        # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
-        if saved.get("etf_min_amount", 0.01) == 0.5:
-            saved["etf_min_amount"] = 0.01
+        # v17 及以前的历史迁移只在跨版本升级时执行, 避免每次升版把用户手改值再改回去
+        if _mig_done not in ("v17", _BT_MIG_VER):
+            # 2026-11-20 迁移: etf_max_dd_th 上一版误存为小数(0.30), 现统一为百分比整数(30)
+            _mdd = saved.get("etf_max_dd_th")
+            if isinstance(_mdd, (int, float)) and _mdd < 1:
+                saved["etf_max_dd_th"] = int(round(_mdd * 100))
+            # 2026-11-26 均衡方案默认值迁移
+            if "etf_top_n" not in saved:
+                saved["etf_top_n"] = 2
+                if saved.get("etf_abs_mom_min", 3.0) == 3.0:
+                    saved["etf_abs_mom_min"] = 0.0
+                if saved.get("etf_weight_frac", 0.75) == 0.75:
+                    saved["etf_weight_frac"] = 0.95
+            # v16 迁移: 把上一版默认值 (2只/95%/回看5或8周/确认1或2周) 升到新默认
+            if saved.get("etf_top_n") == 2:
+                saved["etf_top_n"] = 1
+            if saved.get("etf_weight_frac") == 0.95:
+                saved["etf_weight_frac"] = 1.0
+            if saved.get("etf_ma30_lookback") in (5, 8):
+                saved["etf_ma30_lookback"] = 10
+            if saved.get("etf_ma30_exit_confirm") in (1, 2):
+                saved["etf_ma30_exit_confirm"] = 3
+            # v14: 仅迁移旧默认流动性门槛; 早期跨境 ETF 成交额远低于 0.5 亿
+            if saved.get("etf_min_amount", 0.01) == 0.5:
+                saved["etf_min_amount"] = 0.01
+        # 2026-11-28 参数包迁移: 「ETF调仓策略」旧默认 (3只/75%/4%/每年换股)
+        # 升级为 (2只/95%/15%/不换股); 只迁移仍等于旧默认的值, 用户自定义值不动
+        if saved.get("erc_top_n") == 3:
+            saved["erc_top_n"] = 2
+        if saved.get("erc_weight_pct") == 75:
+            saved["erc_weight_pct"] = 95
+        if saved.get("erc_dev_pct") == 4:
+            saved["erc_dev_pct"] = 15
+        if saved.get("erc_rank_freq") in ("1y", "yearly"):
+            saved["erc_rank_freq"] = "off"
         try:
             data_store.set_setting("bt_settings_mig", _BT_MIG_VER)
         except Exception:
@@ -2247,11 +2261,11 @@ def _bt_params(strategy_key, initial, hold, top, lu_pct, start_d, end_d) -> dict
             "initial_capital": int(float(initial)),
             "start": str(start_d)[:10],
             "end": str(end_d)[:10],
-            "top_n": int(ss.get("erc_top_n", 3)),
-            "weight_fraction": float(ss.get("erc_weight_pct", 75)) / 100.0,
-            "deviation_threshold": float(ss.get("erc_dev_pct", 4)) / 100.0,
+            "top_n": int(ss.get("erc_top_n", 2)),
+            "weight_fraction": float(ss.get("erc_weight_pct", 95)) / 100.0,
+            "deviation_threshold": float(ss.get("erc_dev_pct", 15)) / 100.0,
             "rank_metric": str(ss.get("erc_metric", "momentum")),
-            "rank_check_freq": str(ss.get("erc_rank_freq", "1y")),
+            "rank_check_freq": str(ss.get("erc_rank_freq", "off")),
             "rebalance_period": str(ss.get("erc_rebal_period", "1y")),
             "min_amount": float(ss.get("erc_min_amount", 0.01)),
             "min_history": int(ss.get("erc_min_history", 250)),
@@ -2275,7 +2289,7 @@ def _bt_sig(params: dict) -> str:
 def _run_backtest_params(strategy_key, params, feat_data):
     """按参数跑回测 (市值/ETF 策略走同一个 MarketCapStrategy, 只是 pool_type 不同)"""
     if strategy_key == "ETF调仓策略":
-        # 独立引擎: 可配置排序指标 + 4%偏差调仓 + 定期换股 + 目标仓位再平衡 (无止损)
+        # 独立引擎: 可配置排序指标 + 偏差网格调仓 + 定期换股 + 目标仓位再平衡 (无止损)
         import etf_rebalance
         _p = dict(params)
         _p["cost"] = get_cost_params()   # params["cost"] 只是缓存指纹串, 这里换成真实成本参数
@@ -2421,7 +2435,7 @@ def _render_etf_rebalance_validation(result: dict, params: dict):
             f"排序指标：{_eff}" + (f"（自动回退：{_fb}）" if _fb else "")
             + f" · 回测年限 {float(meta.get('years', 0)):.1f} 年"
             + f" · 定期换股 {meta.get('annual_swaps', 0)} 次"
-            + f" · 4%偏差调仓 {meta.get('deviation_trades', 0)} 笔"
+            + f" · 偏差调仓 {meta.get('deviation_trades', 0)} 笔"
             + (f" · 资金不足跳过 {meta['cash_short_skips']} 次"
                if meta.get("cash_short_skips") else "")
             + f" · 初始仓位 {float(meta.get('initial_position_ratio', 0)) * 100:.1f}%"
@@ -4375,15 +4389,15 @@ elif page == "backtest":
         import etf_rebalance as _erc
         _mlabel = dict(_erc.list_metrics()).get(
             st.session_state.get("erc_metric", "momentum"), "综合动量")
-        _summary_parts.append(f"{st.session_state.get('erc_top_n', 3)}只外盘ETF")
+        _summary_parts.append(f"{st.session_state.get('erc_top_n', 2)}只外盘ETF")
         _summary_parts.append(f"排序:{_mlabel}")
-        _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 75))}%")
-        _summary_parts.append(f"±{int(st.session_state.get('erc_dev_pct', 4))}%调仓")
+        _summary_parts.append(f"仓位{int(st.session_state.get('erc_weight_pct', 95))}%")
+        _summary_parts.append(f"±{int(st.session_state.get('erc_dev_pct', 15))}%调仓")
         _rk_lbl = {"1y": "每年换股", "6m": "每半年换股", "3m": "每季换股",
                    "1m": "每月换股", "off": "不换股",
                    "yearly": "每年换股", "quarterly": "每季换股",
                    "monthly": "每月换股"}.get(
-                       st.session_state.get("erc_rank_freq", "1y"), "每年换股")
+                       st.session_state.get("erc_rank_freq", "off"), "不换股")
         _summary_parts.append(_rk_lbl)
     elif strategy_choice != "市值策略":
         _summary_parts.append(f"{top_n}只")
@@ -4467,7 +4481,7 @@ elif page == "backtest":
             format="%d", key="di_initial") * 10000
         if strategy_choice == "ETF调仓策略":
             # 持仓数在下方「① 标的池与排序」里以 erc_top_n 设置, 这里不重复出现
-            top_n = int(st.session_state.get("erc_top_n", 3))
+            top_n = int(st.session_state.get("erc_top_n", 2))
         elif strategy_choice == "ETF策略":
             top_n = _r[1].number_input(
                 "ETF持仓数", min_value=1, max_value=30, value=int(_cur_top_n),
@@ -4642,16 +4656,17 @@ elif page == "backtest":
             with _v2:
                 _b = st.columns(4)
                 _num("目标仓位(%)", 10, 100, "erc_weight_pct", step=5, col=_b[0],
-                     help="初始建仓与定期再平衡的目标总仓位，默认 75%；仓位越高现金垫越薄")
+                     help="初始建仓与定期再平衡的目标总仓位，默认 95%；仓位越高现金垫越薄")
                 _num("偏差阈值(%)", 1, 30, "erc_dev_pct", step=1, col=_b[1],
-                     help="持仓市值相对市值中枢的偏离超过该值即调回中枢，默认 4%")
+                     help="持仓市值相对市值中枢的偏离超过该值即调回中枢，默认 15%；"
+                          "阈值越小交易越频繁、摩擦成本越高")
                 # 换股周期 / 再平衡周期: 下拉单选（周期按实际持有时间计算）
                 _rk = {"yearly": "1y", "quarterly": "3m", "monthly": "1m"}.get(
-                    st.session_state.get("erc_rank_freq", "1y"),
-                    st.session_state.get("erc_rank_freq", "1y"))
-                _rd = _draft("erc_rank_freq", "1y")
+                    st.session_state.get("erc_rank_freq", "off"),
+                    st.session_state.get("erc_rank_freq", "off"))
+                _rd = _draft("erc_rank_freq", "off")
                 if st.session_state.get(_rd) not in ("1y", "6m", "3m", "1m", "off"):
-                    st.session_state[_rd] = _rk if _rk in ("1y", "6m", "3m", "1m", "off") else "1y"
+                    st.session_state[_rd] = _rk if _rk in ("1y", "6m", "3m", "1m", "off") else "off"
                 _b[2].selectbox("换股周期", options=["1y", "6m", "3m", "1m", "off"],
                                 format_func=lambda v: {"1y": "每年", "6m": "每半年",
                                                        "3m": "每季度", "1m": "每月",
@@ -4670,7 +4685,7 @@ elif page == "backtest":
                                                        "2y": "每两年", "off": "不强制"}[v],
                                 key=_rbd, help="距上次再平衡满一个周期后把持仓占比拉回目标仓位，"
                                                "周期按实际持有时间计算")
-                st.caption("本策略不设趋势止损（用户确认口径），仅靠 4% 偏差调仓 + 定期换股 + 定期再平衡控制风险。")
+                st.caption("本策略不设趋势止损（用户确认口径），仅靠偏差调仓 + 定期换股 + 定期再平衡控制风险。")
                 _g = st.columns([1.2, 1, 1, 1.6])
                 _g[0].checkbox("现金安全垫保护", key=_draft("erc_cash_guard", True),
                                help="可用余额低于预警值时，卖出调仓会自动多卖一部分补足现金垫；"

@@ -3,20 +3,20 @@
 策略口径（用户已确认，不含任何止损）:
   1. 标的池: 仅「外盘 ETF」——`price_limits.is_etf(code)` 且 `is_overseas_etf(名称)` 为真；
      名称缺失时用 code 兜底放行。港股/中概由 `is_overseas_etf` 内部剔除。
-  2. 仓位: 初始建仓买入总资产的 `weight_fraction`(默认 75%)，等权分给 `top_n` 只。
-  3. 4% 偏差调仓: 非周期、逐日检查。单标的持仓市值相对「市值中枢」的偏离
-     > `deviation_threshold`(默认 0.04) 时，调回中枢市值。
+  2. 仓位: 初始建仓买入总资产的 `weight_fraction`(默认 95%)，等权分给 `top_n` 只。
+  3. 偏差调仓: 非周期、逐日检查。单标的持仓市值相对「市值中枢」的偏离
+     > `deviation_threshold`(默认 0.15) 时，调回中枢市值。
      中枢 = 最近一次建仓/换股/定期再平衡确定的目标市值（建仓时默认
-     100 万 × 75% / 1 = 75 万）；只在定期再平衡时重置，不会每日变动。
-     注意: 偏离按「市值/中枢-1」计算，不是权重百分点——75% 仓位下价格涨 23.9%
-     权重只变动约 3.8 个百分点，若按权重偏离 4% 判定会长期空转。
-     这是「低买高卖」触发: 涨过 +4% 卖出超出部分、跌破 -4% 用现金补足。
+     100 万 × 95% / 2 = 47.5 万）；只在定期再平衡时重置，不会每日变动。
+     注意: 偏离按「市值/中枢-1」计算，不是权重百分点——95% 仓位下价格涨 15%
+     权重只变动约 1.1 个百分点，若按权重偏离判定会长期空转。
+     这是「低买高卖」触发: 涨过阈值卖出超出部分、跌破阈值用现金补足。
   4. 定期换股: 距上次换股满 `rank_check_freq`（1m/3m/6m/1y/off，按实际持有
      时间计算，不按自然年月）时按排名指标重排全池，只保留前 `top_n`：
      卖出非目标标的，买入新目标标的（沿用当前市值中枢）。
   5. 定期再平衡: 周期触发（距上次满 `rebalance_period`），按「占总资产比例」
      判定: 目标市值 = 当前总资产 × `weight_fraction` / 持仓数。总资产增长而持仓
-     占比不足 → 买入补足；超配 → 卖出。完成后重置 4% 网格的市值中枢。
+     占比不足 → 买入补足；超配 → 卖出。完成后重置偏差网格的市值中枢。
      与第 3 条严格区分: 本规则是周期+占比口径，第 3 条是每日+固定中枢口径。
   6. 无止损: 不实现任何 MA30/回撤/动量止损清仓逻辑，全部卖出只来源于换股或再平衡。
   7. 现金安全垫保护（余额不足主动风控）: 可用现金低于
@@ -159,11 +159,11 @@ def default_params() -> dict:
         "initial_capital": 1_000_000,
         "start": None,
         "end": None,
-        "top_n": 3,
-        "weight_fraction": 0.75,
-        "deviation_threshold": 0.04,
+        "top_n": 2,
+        "weight_fraction": 0.95,
+        "deviation_threshold": 0.15,
         "rank_metric": DEFAULT_METRIC,
-        "rank_check_freq": "1y",
+        "rank_check_freq": "off",
         "rebalance_period": "1y",
         "min_amount": 0.01,     # 亿元
         "min_history": 250,     # K 线根数
@@ -652,7 +652,7 @@ class _RebalanceEngine:
                      pnl=pnl, dev_before=dev_before, entry=entry,
                      closing_fee=closing_fee)
         # 记录当日「计划内」的卖出调仓, 供收盘后现金安全垫保护判断是否加卖
-        if reason in ("4%偏差调仓", "定期再平衡"):
+        if reason == "定期再平衡" or "偏差调仓" in reason:
             self._day_sells.append((code, int(qty), float(fp)))
 
     # ---------- 现金安全垫保护 ----------
@@ -736,7 +736,7 @@ class _RebalanceEngine:
         picks = cands[:self.top_n]
         tv = self._total_value(d)
         per = tv * self.weight_fraction / len(picks)
-        self.center_mv = per          # 目标市值中枢 (默认 75% × 100万 / 1 = 75万)
+        self.center_mv = per          # 目标市值中枢 (默认 95% × 100万 / 2 = 47.5万)
         for code in picks:
             self._buy(code, per, d, "建仓")
         self.entered = True
@@ -809,19 +809,19 @@ class _RebalanceEngine:
             mv = px * pos["qty"] if pos else 0.0
             if mv < per:
                 self._buy(code, per - mv, d, reason)
-        # 4% 网格中枢重置: 下一周期内以新的 75% 目标市值为基准做高抛低吸
+        # 4% 网格中枢重置: 下一周期内以新的目标市值为基准做高抛低吸
         self.center_mv = per
 
     def _deviation_check(self, d):
-        """4% 网格调仓（非周期，逐日触发）: 持仓市值相对「市值中枢」偏离 > 阈值时调回中枢。
+        """偏差网格调仓（非周期，逐日触发）: 持仓市值相对「市值中枢」偏离 > 阈值时调回中枢。
 
         与 _periodic_rebalance 的边界:
           - 本函数: 每日检查、按「固定市值中枢」判定，用于高抛低吸; 与总资产规模无关。
-          - 定期再平衡: 周期触发、按「占总资产比例」判定，用于把仓位拉回 75%。
+          - 定期再平衡: 周期触发、按「占总资产比例」判定，用于把仓位拉回目标比例。
         关键口径: 偏离 = 当前持仓市值 / 市值中枢 - 1 (相对市值, 非权重百分点)。
-        例: 中枢 75 万, 标的上涨后市值 78.1 万 → 偏离 +4.1% → 卖出 3.1 万回到 75 万。
-        这样单边上涨/下跌行情也能持续触发, 不会像「权重偏离」那样因 75% 仓位下
-        价格涨 4% 权重只变动约 0.8 个百分点而长期空转。
+        例: 中枢 47.5 万, 标的上涨后市值 55 万 → 偏离 +15.8% → 卖出 7.5 万回到 47.5 万。
+        这样单边上涨/下跌行情也能持续触发, 不会像「权重偏离」那样因 95% 仓位下
+        价格涨 15% 权重只变动约 1 个百分点而长期空转。
         """
         base = self.center_mv
         if base <= 0:
@@ -840,10 +840,11 @@ class _RebalanceEngine:
             elif dev < -self.dev_threshold:
                 buys.append((code, base - mv, dev))
         # 先卖后买: 卖出回笼的现金可立即用于同日低配补仓
+        dev_reason = f"{int(round(self.dev_threshold * 100))}%偏差调仓"
         n0 = len(self.trades)
         for code, qty, dev in sells:
             if code in self.positions:
-                self._sell(code, qty, d, "4%偏差调仓", dev_before=dev)
+                self._sell(code, qty, d, dev_reason, dev_before=dev)
         # 买入前做可用资金充足性校验:
         # 目标仓位 85%/95% 时现金垫很薄, 最大回撤期连续下跌会让可用现金耗尽。
         # 这里按可用现金缩减买入额(优先保证能成交), 不足 1 手则跳过并计数,
@@ -860,7 +861,7 @@ class _RebalanceEngine:
                 self.cash_short_skips += 1
                 continue
             cash0 = self.cash
-            self._buy(code, need, d, "4%偏差调仓", dev_before=dev)
+            self._buy(code, need, d, dev_reason, dev_before=dev)
             avail = max(avail - (cash0 - float(self.cash)), 0.0)
         # 只统计真实成交
         self.deviation_trades += len(self.trades) - n0
