@@ -175,6 +175,12 @@ def after_close(fundamentals: bool = False):
         logger.info(f"ETF 官方份额: {r}")
     except Exception as e:
         logger.error(f"ETF 官方份额异常: {e}")
+    # ETF 跟踪指数估值 (蛋卷 PE/PB): 周频数据, 6 天内同步过会自动跳过
+    try:
+        r = data_manager.ensure_etf_index_valuation()
+        logger.info(f"ETF 指数估值: {r}")
+    except Exception as e:
+        logger.error(f"ETF 指数估值异常: {e}")
     try:
         symbols = data_store.list_symbols()[:10]
         logger.info(f"新闻: {news_fetcher.fetch_all_news(symbols=symbols)}")
@@ -238,6 +244,9 @@ def run_task(t: dict):
                 with_margin=params.get("with_margin", True),
                 with_valuation=params.get("with_valuation", True),
                 progress_cb=_cb)
+        elif ds == "etf_index_val":
+            r = data_manager.ensure_etf_index_valuation(
+                progress_cb=_cb, force=params.get("force", False))
         elif ds == "etf_backfill":
             r = data_manager.backfill_etf_factors(
                 start_year=params.get("start_year", 2022),

@@ -4624,18 +4624,20 @@ elif page == "backtest":
                         "" if _specs.get(k, {}).get("available", True)
                         else "（无历史，自动回退）"),
                     key=_draft("erc_metric", "momentum"),
-                    help="回测按该指标排序后取前 N 只；无 10 年历史的指标会自动回退到综合动量，"
-                         "并在回测报告里标注实际使用的指标。")
+                    help="回测按该指标排序后取前 N 只；历史覆盖率不足会自动回退到综合动量，"
+                         "并在回测报告里标注实际使用的指标。PE/PB 为「跟踪指数」估值口径。")
                 _num("持仓数(只)", 1, 10, "erc_top_n", col=_a[1])
                 _num("成交额下限(亿)", 0.01, 5.0, "erc_min_amount", step=0.01, fmt="%.2f",
                      col=_a[2], help="近20日日均成交额，低于该值不入池")
                 _num("最少K线(根)", 60, 500, "erc_min_history", step=10, col=_a[3],
                      help="数据不足的次新 ETF 不参与排序")
                 st.caption("标的池固定为「仅外盘 ETF」，自动剔除恒生/港股/港股通/H股/中概等相关标的。")
+                st.caption("PE/PB/百分位来自蛋卷指数估值，是「跟踪指数」口径而非 ETF 净值；"
+                           "未匹配到指数的 ETF 不参与该指标排序，估值类覆盖率 < 40% 时自动回退动量。")
                 _notef = [f"· {v['label']}：{v.get('note', '')}"
                           for k, v in _specs.items() if not v.get("available", True)]
                 if _notef:
-                    st.caption("以下指标暂无 10 年历史数据，选中后回测自动回退到综合动量：\n"
+                    st.caption("以下指标暂无历史数据，选中后回测自动回退到综合动量：\n"
                                + "\n".join(_notef))
             with _v2:
                 _b = st.columns(4)
@@ -5728,6 +5730,14 @@ elif page == "data":
     g5.metric("沪市官方份额", f"{ex['share_symbols']:,} 只",
               delta=f"{ex['share_bars']:,} 条 / {ex['share_last']}")
 
+    # ETF 跟踪指数估值 (蛋卷 PE/PB, 周频)
+    iv = data_store.etf_index_val_stats()
+    h1, h2 = st.columns(2)
+    h1.metric("ETF 指数估值标的", f"{iv['symbols']:,}",
+              delta=f"已映射 {iv['mapped_symbols']} 只")
+    h2.metric("指数估值记录", f"{iv['rows']:,}",
+              delta=f"最新 {iv['last_date']}（跟踪指数口径）")
+
     import data_manager
     req_lines = "\n".join(
         f"| {k} | {' + '.join(v['datasets'])} | {v.get('lookback_days', 250)} |"
@@ -5774,6 +5784,23 @@ elif page == "data":
                         data_store.task_create("etf_extra", {"top_n": 60, "days": 5},
                                                "ETF 增强数据同步")
                         n += 1
+                except Exception:
+                    pass
+                # ETF 跟踪指数估值 (蛋卷 PE/PB): 缺失或超过 7 天未同步时补一次
+                try:
+                    if not any(t["dataset"] == "etf_index_val" for t in active):
+                        iv = data_store.etf_index_val_stats()
+                        stale = True
+                        if iv["last_date"] not in ("-", None):
+                            try:
+                                age = (datetime.now() - datetime.strptime(
+                                    iv["last_date"][:10], "%Y-%m-%d")).days
+                                stale = age >= 7
+                            except ValueError:
+                                stale = True
+                        if iv["symbols"] == 0 or stale:
+                            data_store.task_create("etf_index_val", {}, "ETF 指数估值同步")
+                            n += 1
                 except Exception:
                     pass
                 if fst["symbols"] < max(1, stats["symbols"]) * 0.5 \
@@ -5928,6 +5955,7 @@ elif page == "data":
 | **资讯面** | `news` | 新闻/公告 + 多源去重 |
 | **缓存** | `backtest_cache` | 回测中间缓存, 数据指纹变化自动失效 |
 | **回测结果** | `backtest_result` | 按「策略+参数」保存最近一次结果(含成交/持仓), 参数不变时页面直接回显 |
+| **ETF 估值** | `etf_index_map` / `etf_index_val` | ETF→跟踪指数映射 + 蛋卷 PE/PB 周频历史(跟踪指数口径) |
 
 > 数据流: 策略声明需求 → `data_task` 入队 → Worker 按覆盖索引补缺口 → 落库 → 回测/选股读取。
     """)

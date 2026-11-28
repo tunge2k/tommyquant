@@ -27,6 +27,7 @@ COPY robust_backtest.py .
 COPY data_store.py .
 COPY bt_best_state.py .
 COPY data_manager.py .
+COPY danjuan_source.py .
 COPY news_fetcher.py .
 COPY update_worker.py .
 COPY perf_report.py .

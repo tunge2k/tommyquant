@@ -357,6 +357,27 @@ def init_db():
         name        TEXT,
         updated_at  TEXT
     );
+
+    -- ETF -> 跟踪指数映射 (蛋卷估值口径; 可人工覆盖)
+    CREATE TABLE IF NOT EXISTS etf_index_map (
+        symbol      TEXT PRIMARY KEY,
+        index_code  TEXT NOT NULL,      -- SH000300 / NDX / HKHSI ...
+        index_name  TEXT,               -- 沪深300 / 纳指100 / 恒生指数
+        source      TEXT,               -- danjuan / manual
+        updated_at  TEXT
+    );
+
+    -- 跟踪指数 PE/PB 历史 (周频; 供 ETF 估值类排序指标 as-of 查询)
+    CREATE TABLE IF NOT EXISTS etf_index_val (
+        symbol      TEXT NOT NULL,
+        date        TEXT NOT NULL,      -- YYYY-MM-DD (蛋卷周频日期)
+        pe          REAL,
+        pb          REAL,
+        index_code  TEXT,
+        updated_at  TEXT,
+        PRIMARY KEY (symbol, date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_index_val_date ON etf_index_val(date);
     """)
     conn.commit()
     conn.close()
@@ -839,6 +860,88 @@ def etf_name_map() -> dict[str, str]:
         rows = []
     conn.close()
     return {r[0]: r[1] for r in rows}
+
+
+# ==================== ETF 跟踪指数估值 (蛋卷数据源) ====================
+
+def upsert_etf_index_map(rows: list[dict]) -> int:
+    """写入 ETF→跟踪指数映射 (symbol/index_code/index_name/source)"""
+    return _upsert_rows("etf_index_map",
+                        ["symbol", "index_code", "index_name", "source", "updated_at"],
+                        rows)
+
+
+def etf_index_map_all() -> dict[str, dict]:
+    """{symbol: {index_code, index_name, source, updated_at}}"""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT symbol, index_code, index_name, source, updated_at "
+            "FROM etf_index_map").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return {r[0]: {"index_code": r[1], "index_name": r[2],
+                   "source": r[3], "updated_at": r[4]} for r in rows}
+
+
+def upsert_etf_index_val(symbol: str, rows: list[dict]) -> int:
+    """整段覆盖某 ETF 的指数估值序列
+
+    先删后写: 指数口径若被人工调整, 旧口径的日期不能残留。
+    """
+    if not rows:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    payload = [(symbol, r.get("date"), r.get("pe"), r.get("pb"), r.get("index_code"), now)
+               for r in rows if r.get("date")]
+    if not payload:
+        return 0
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM etf_index_val WHERE symbol = ?", (symbol,))
+        conn.executemany(
+            "INSERT OR REPLACE INTO etf_index_val "
+            "(symbol, date, pe, pb, index_code, updated_at) VALUES (?,?,?,?,?,?)",
+            payload)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(payload)
+
+
+def etf_index_val_maps() -> dict:
+    """{pe: {date: {symbol: 值}}, pb: {date: {symbol: 值}}}，供回测 as-of 查询"""
+    pe, pb = {}, {}
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT symbol, date, pe, pb FROM etf_index_val").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    for sym, d, v_pe, v_pb in rows:
+        if v_pe is not None and v_pe > 0:
+            pe.setdefault(d, {})[sym] = float(v_pe)
+        if v_pb is not None and v_pb > 0:
+            pb.setdefault(d, {})[sym] = float(v_pb)
+    return {"pe": pe, "pb": pb}
+
+
+def etf_index_val_stats() -> dict:
+    """指数估值覆盖概览 (数据管理页展示 / 判断是否需补数)"""
+    conn = get_conn()
+    try:
+        syms, rows_n, last = conn.execute(
+            "SELECT COUNT(DISTINCT symbol), COUNT(*), MAX(date) FROM etf_index_val").fetchone()
+        mapped = conn.execute("SELECT COUNT(*) FROM etf_index_map").fetchone()[0]
+    except sqlite3.OperationalError:
+        syms, rows_n, last, mapped = 0, 0, None, 0
+    finally:
+        conn.close()
+    return {"mapped_symbols": mapped or 0, "symbols": syms or 0,
+            "rows": rows_n or 0, "last_date": last or "-"}
 
 
 def sync_etf_dividends(symbols: list[str] | None = None, max_age_days: int = 30,

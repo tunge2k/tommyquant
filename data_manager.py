@@ -82,6 +82,8 @@ STRATEGY_REQUIREMENTS = {
     "随机对照": {"datasets": ["daily_bar"], "lookback_days": 120},
     "ETF策略": {"datasets": ["daily_bar"], "lookback_days": 250,
                "note": "ETF 池按动量排名, 无财务/分红依赖"},
+    "ETF调仓策略": {"datasets": ["daily_bar", "etf_index_val"], "lookback_days": 250,
+                 "note": "PE/PB/百分位取自蛋卷「跟踪指数」估值, 无映射的 ETF 不参与该指标排序"},
 }
 
 
@@ -466,6 +468,159 @@ def ensure_etf_extras(top_n: int = 60, days: int = 5, with_margin: bool = True,
             stats["calls_used"] = hs.quota_used()
         _log(f"[{i}/{len(pool)}] {sym} 累计 {stats['rows']} 行")
     return stats
+
+
+# ==================== ETF 跟踪指数估值 (蛋卷 PE/PB) ====================
+
+# ETF 名称 -> 蛋卷指数 code 的别名规则 (关键词长度降序匹配)
+# 仅用于「核心段完全相等」的匹配, 例如 券商ETF -> 证券公司; 不匹配 创业板软件ETF。
+_INDEX_ALIASES = [
+    ("恒生中国企业", "HKHSCEI"), ("恒生国企", "HKHSCEI"), ("国企指数", "HKHSCEI"),
+    ("恒生科技", "HKHSTECH"), ("恒生", "HKHSI"),
+    ("纳斯达克100", "NDX"), ("纳斯达克", "NDX"), ("纳指100", "NDX"), ("纳指", "NDX"),
+    ("德国DAX", "GDAXI"), ("德国", "GDAXI"),
+    ("中概互联网", "CSIH30533"), ("中概互联", "CSIH30533"), ("中国互联", "CSIH11136"),
+    ("证券公司", "SZ399975"), ("券商", "SZ399975"), ("证券", "SZ399975"),
+    ("中证银行", "SZ399986"), ("银行", "SZ399986"),
+    ("中证医疗", "SZ399989"), ("医疗", "SZ399989"),
+    ("中证白酒", "SZ399997"), ("白酒", "SZ399997"),
+    ("食品饮料", "SZ399396"), ("国证食品", "SZ399396"),
+    ("中证传媒", "SZ399971"), ("传媒", "SZ399971"),
+    ("煤炭", "SZ399998"), ("房地产", "SZ399393"), ("地产", "SZ399393"),
+    ("军工", "SZ399967"), ("国防", "SZ399967"),
+    ("环保", "SH000827"), ("主要消费", "SH000932"),
+    ("全指信息", "SH000993"), ("信息技术", "SH000993"),
+    ("全指可选", "SH000989"), ("可选消费", "SH000989"),
+    ("全指医药", "SH000991"), ("医药100", "SH000978"),
+    ("创业板", "SZ399006"), ("科创50", "SH000688"), ("科创板50", "SH000688"),
+    ("红利低波", "CSIH30269"), ("红利", "SH000922"),
+    ("中证1000", "SH000852"), ("中证500", "SH000905"),
+    ("沪深300", "SH000300"), ("上证50", "SH000016"),
+    ("上证180", "SH000010"), ("中证100", "SH000903"),
+    ("深证100", "SZ399330"), ("深证成指", "SZ399001"),
+    ("新能源车", "SZ399417"), ("5G通讯", "CSI931079"), ("5G通信", "CSI931079"),
+    ("科技龙头", "CSI931087"), ("央视50", "SZ399550"),
+    ("MSCI中国", "CSI716567"), ("300价值", "SH000919"),
+    ("养老产业", "SZ399812"), ("国证A指", "SZ399317"),
+    ("基本面50", "SH000925"), ("基本面60", "SZ399701"), ("基本面120", "SZ399702"),
+]
+
+
+def _etf_core_name(name: str) -> str:
+    """ETF 名称截到最后一个 ETF 为止: '红利低波ETF华泰柏瑞' -> '红利低波ETF'"""
+    s = str(name or "")
+    i = s.rfind("ETF")
+    return s[:i + 3] if i >= 0 else s
+
+
+def match_track_index(name: str, index_names: dict[str, str]):
+    """按 ETF 名称匹配蛋卷跟踪指数, 返回 (index_code, index_name) 或 None
+
+    要求「核心段完全相等」(如 沪深300ETF), 避免 创业板软件ETF 被误判为 创业板。
+    """
+    core = _etf_core_name(name)
+    if not core:
+        return None
+    for code, nm in index_names.items():
+        if core == f"{nm}ETF":
+            return code, nm
+    for kw, code in _INDEX_ALIASES:
+        if core == f"{kw}ETF":
+            return code, index_names.get(code, kw)
+    return None
+
+
+def ensure_etf_index_valuation(pool: list[str] | None = None,
+                               progress_cb=None, force: bool = False,
+                               max_age_days: int = 6) -> dict:
+    """同步 ETF 跟踪指数估值 (蛋卷 PE/PB 周频全历史)
+
+    1. 拉蛋卷指数清单, 按 ETF 名称生成/刷新映射 (etf_index_map);
+    2. 每个映射到的指数拉一次 PE 与 PB 全历史;
+    3. 按 symbol 展开写入 etf_index_val。
+
+    没有指数映射的 ETF 直接跳过 (不写假数据), 估值类排序指标里它不参与排序。
+    覆盖率不足时策略会自动回退动量, 见 etf_rebalance._resolve_metric。
+    """
+    import danjuan_source as dj
+    names = data_store.etf_name_map()
+    if pool:
+        symbols = [s for s in dict.fromkeys(pool) if s in names]
+    else:
+        symbols = sorted(names)
+    if not symbols:
+        return {"skipped": "无 ETF 名称数据", "symbols": 0, "mapped": 0, "rows": 0}
+
+    iv = data_store.etf_index_val_stats()
+    if not force and iv["symbols"] > 0 and iv["last_date"] != "-":
+        try:
+            age = (datetime.now() - datetime.strptime(iv["last_date"][:10], "%Y-%m-%d")).days
+        except ValueError:
+            age = max_age_days + 1
+        if age < max_age_days:
+            return {"skipped": f"指数估值 {age} 天前同步过", **iv}
+
+    def _log(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    try:
+        idx_list = dj.fetch_index_list()
+    except Exception as e:
+        return {"error": f"指数清单获取失败: {type(e).__name__}: {e}"}
+    index_names = {it["index_code"]: it["name"] for it in idx_list}
+
+    existing = data_store.etf_index_map_all()
+    map_rows = []
+    for sym in symbols:
+        hit = match_track_index(names.get(sym, ""), index_names)
+        if not hit:
+            continue
+        code, nm = hit
+        old = existing.get(sym) or {}
+        if old.get("index_code") == code and not force:
+            continue
+        map_rows.append({"symbol": sym, "index_code": code,
+                         "index_name": nm, "source": "danjuan"})
+    if map_rows:
+        data_store.upsert_etf_index_map(map_rows)
+        _log(f"指数映射更新 {len(map_rows)} 只")
+
+    mapping = data_store.etf_index_map_all()
+    mapped = {s: mapping[s] for s in symbols if s in mapping}
+    if not mapped:
+        return {"symbols": len(symbols), "mapped": 0, "indices": 0, "rows": 0,
+                "failed": [], "note": "没有任何 ETF 匹配到蛋卷指数"}
+
+    codes = sorted({m["index_code"] for m in mapped.values()})
+    hist, failed = {}, []
+    for i, code in enumerate(codes, 1):
+        try:
+            pe = dj.fetch_history(code, "pe")
+            pb = dj.fetch_history(code, "pb")
+            hist[code] = {"pe": dict(pe), "pb": dict(pb)}
+            _log(f"[{i}/{len(codes)}] 指数 {code}: PE {len(pe)} 点 / PB {len(pb)} 点")
+        except Exception as e:
+            failed.append(f"{code}: {type(e).__name__}")
+            _log(f"[{i}/{len(codes)}] 指数 {code} 失败: {type(e).__name__}")
+        time.sleep(0.15)
+
+    rows_total, done = 0, 0
+    for sym, m in mapped.items():
+        code = m["index_code"]
+        h = hist.get(code)
+        if not h:
+            continue
+        dates = sorted(set(h["pe"]) | set(h["pb"]))
+        rows = [{"date": d, "pe": h["pe"].get(d), "pb": h["pb"].get(d), "index_code": code}
+                for d in dates]
+        if rows:
+            rows_total += data_store.upsert_etf_index_val(sym, rows)
+        done += 1
+        _log(f"[{done}/{len(mapped)}] {sym} {m.get('index_name') or code} +{len(rows)} 行")
+
+    return {"symbols": len(symbols), "mapped": len(mapped), "indices": len(hist),
+            "rows": rows_total, "failed": failed[:20]}
 
 
 def backfill_etf_market_flow(start: str = "2020-01-01", end: str | None = None) -> dict:

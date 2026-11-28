@@ -114,6 +114,7 @@ py -3.13 deploy_update.py --check
 | 境外新闻 | 公开 RSS | 代理可配 |
 | ETF 资金流/规模份额/两融/溢价 | 华泰柏瑞 ESA（`htbr_source.py` + `vendor/htbr`） | 不使用（内网可达） |
 | 沪市 ETF 份额 + 单位净值 | 上交所/东财公开接口（`exchange_source.py`） | 不使用 |
+| ETF 跟踪指数 PE/PB 历史 | 蛋卷基金公开接口（`danjuan_source.py`） | 不使用 |
 
 **华泰柏瑞 ETF 数据源**（2026-11 接入，作为增强数据源，不替换行情主链路）：
 
@@ -140,6 +141,15 @@ py -3.13 deploy_update.py --check
   - `dataset="etf_nav_backfill"`：按标的回补净值，`max_symbols` 默认 60（每只约 8 页）。
 - 开关：环境变量 `ETF_OFFICIAL_ENABLED=0` 可整体关闭；接口失败只记日志，不影响行情与策略。
 - 因子优先级：资金流以官方份额为准（覆盖华泰柏瑞），溢价率以华泰柏瑞实测值为准（官方口径仅兜底）。
+
+**蛋卷指数估值（2026-11 接入，`danjuan_source.py`，免 Key、免配额）**：
+
+- 用途：给 ETF 调仓策略的 `pe_ttm / pb / pe_pct / pb_pct` 排序指标提供数据（**跟踪指数口径**，非 ETF 净值）。
+- 接口：`index_eva/dj`（63 个可估值指数清单）、`detail/{code}`、`pe_history|pb_history/{code}?day=all`（周频，2016-11 起）。
+- 任务：盘后 `ensure_etf_index_valuation()`；**6 天内同步过会自动跳过**（周频数据，避免每日重复 74 次请求）。
+- 落库：`etf_index_map`（ETF→指数，按名称精确匹配 + 别名，可人工覆盖）、`etf_index_val`（按 ETF 展开的 PE/PB 周频序列）。
+- 实测：1680 只 ETF 中 252 只可映射（37 个指数），外盘池覆盖 51%、全池 23%；无映射的 ETF 不参与估值类指标排序。
+- 数据管理页「⚡ 立即补全缺失数据」在估值表为空或 ≥7 天未更新时会顺带创建 `dataset="etf_index_val"` 任务。
 
 代理模式（设置页）：
 

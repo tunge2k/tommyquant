@@ -61,6 +61,7 @@
 | 采集层 | `news_fetcher.py` | 多源抓取、去重、翻译、代理分流 | 不做情绪分析（字段预留） |
 | 采集层 | `htbr_source.py` | 华泰柏瑞 ESA 数据源封装：限流（3 秒）、配额硬闸（450/日）、统一错误语义 | 不做业务编排（由 `data_manager` 负责） |
 | 采集层 | `exchange_source.py` | 交易所官方 ETF 份额（沪市，可回溯历史）+ 东财单位净值，无 Key 无配额 | 只覆盖沪市份额；深市仍走华泰柏瑞 |
+| 采集层 | `danjuan_source.py` | 蛋卷指数估值：指数清单 / 详情 / PE-PB 周频历史，免费无 Key | 只提供「跟踪指数」口径，非 ETF 净值 |
 | 采集层 | `vendor/htbr/` | 技能运行时（`api_client.py`/`config.py`/`guardrails.py`），凭据经 `/root/.htbr` 只读挂载 | 不含凭据 |
 | 调度层 | `update_worker.py` | 定时任务、自举、任务消费、缓存预热 | 不提供 HTTP |
 | 基础设施 | `doh_patch.py` | DoH 兜底 | — |
@@ -198,6 +199,8 @@ SQLite 单库 `data/stock.db`，WAL 模式。共 22 张业务表 + SQLite 内部
 | `etf_dividend` | `(symbol, date)` | ETF 分红记录，供后复权使用 | cum_div（累计分红，元/份） |
 | `etf_dividend_sync` | `symbol` | 分红同步进度（无分红标的也留痕） | events/updated_at |
 | `etf_name` | `symbol` | ETF 名称，用于「跨境/港股/境内」分类 | name |
+| `etf_index_map` | `symbol` | ETF→蛋卷跟踪指数映射（可人工覆盖） | index_code/index_name/source/updated_at |
+| `etf_index_val` | `(symbol, date)` | 跟踪指数 PE/PB 周频历史（蛋卷） | pe/pb/index_code |
 | `sqlite_sequence` | — | SQLite 自增序列 | — |
 
 ### 5.1 一致性约束

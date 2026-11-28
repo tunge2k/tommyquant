@@ -24,10 +24,11 @@
      则在原计划卖出量之外**额外卖出**把现金补回预警线；单次额外卖出量不超过
      原计划卖出量的 `cash_guard_max_extra`(默认 50%)；每次触发写入
      `meta.cash_guard_log`（时间/触发余额/原计划量/实际执行量/仓位）。
-  8. 指标回退: 所选指标 `available=False` 或历史覆盖率 < 60% 时，自动回退到 momentum，
+  8. 指标回退: 所选指标 `available=False` 或历史覆盖率不足时，自动回退到 momentum，
      并在结果的 meta 里如实写明 `rank_metric_effective` / `rank_metric_fallback_reason`。
      能由 bars 推导的指标（规模=cap_yi、成交额、波动率、回撤）自动计算；
-     拿不到的（PE/PB/百分位/稀疏的溢价率历史）自动回退，绝不外推假数据。
+     PE/PB/百分位取自蛋卷「跟踪指数」估值（周频, 2016-11 起），无指数映射的 ETF
+     不参与该指标排序；估值类覆盖率门槛放宽到 40%，其余指标仍为 60%，绝不外推假数据。
 
 撮合口径: 逐日循环、**当日收盘价**撮合（低频调仓策略可接受，比 T+1 更简单）。
 买入按 100 股整手取整，卖出可全部卖出；现金不足时按可用现金等比缩减。
@@ -94,28 +95,38 @@ METRIC_SPECS: dict = {
     "pe_ttm": {
         "label": "市盈率TTM",
         "higher_better": False,
-        "available": False,
-        "note": "ETF 无 PE/PB 数据",
+        "available": True,
+        "min_coverage": 0.40,
+        "note": "跟踪指数口径(蛋卷), 非 ETF 净值; 无指数映射的 ETF 不参与排序",
     },
     "pb": {
         "label": "市净率",
         "higher_better": False,
-        "available": False,
-        "note": "ETF 无 PE/PB 数据",
+        "available": True,
+        "min_coverage": 0.40,
+        "note": "跟踪指数口径(蛋卷), 非 ETF 净值; 无指数映射的 ETF 不参与排序",
     },
     "pe_pct": {
         "label": "PE 历史百分位",
         "higher_better": False,
-        "available": False,
-        "note": "ETF 无 PE/PB 历史, 无法计算百分位",
+        "available": True,
+        "min_coverage": 0.40,
+        "note": "跟踪指数 PE 近 5 年滚动分位(蛋卷周频), 越低越便宜",
     },
     "pb_pct": {
         "label": "PB 历史百分位",
         "higher_better": False,
-        "available": False,
-        "note": "ETF 无 PE/PB 历史, 无法计算百分位",
+        "available": True,
+        "min_coverage": 0.40,
+        "note": "跟踪指数 PB 近 5 年滚动分位(蛋卷周频), 越低越便宜",
     },
 }
+
+# 需要 etf_index_val(跟踪指数估值) 的指标: 选中时才加载并预计算
+_VALUATION_METRICS = {"pe_ttm", "pb", "pe_pct", "pb_pct"}
+# 百分位窗口: 近 5 年(自然日) 滚动, 至少 250 个有效点
+_PCT_WINDOW_DAYS = 365 * 5
+_PCT_MIN_PERIODS = 250
 
 # 直接取列的指标 -> (列名, 方向符号)
 _METRIC_COLS = {
@@ -127,6 +138,11 @@ _METRIC_COLS = {
     "scale": ("cap_yi", 1.0),
     "max_dd_250": ("max_dd_250", 1.0),
     "vol_60": ("vol_60", -1.0),
+    # 估值类: 越低越优先
+    "pe_ttm": ("pe", -1.0),
+    "pb": ("pb", -1.0),
+    "pe_pct": ("pe_pct", -1.0),
+    "pb_pct": ("pb_pct", -1.0),
 }
 
 # 综合动量权重 (缺失按可得权重归一化)
@@ -174,6 +190,50 @@ def _load_premium_map() -> dict:
         return (fn() or {}).get("premium") or {}
     except Exception:
         return {}
+
+
+def _load_valuation_maps() -> dict:
+    """读取跟踪指数估值 {pe: {date:{sym}}, pb: {date:{sym}}}；无库/无表时返回空"""
+    try:
+        import data_store
+        fn = getattr(data_store, "etf_index_val_maps", None)
+        return fn() if fn else {}
+    except Exception:
+        return {}
+
+
+def _attach_valuation(sym: dict, val_maps: dict, calendar: pd.DatetimeIndex) -> None:
+    """把跟踪指数 PE/PB 对齐到交易日历, 并预计算 5 年滚动百分位
+
+    - 蛋卷是周频, 先 reindex 到交易日再 ffill (只向前, 无未来函数);
+    - 百分位用 rolling.rank(pct=True): 每个点只与窗口内(过去 5 年)的值比较;
+    - PE/PB <= 0 (亏损/缺失) 视为 NaN, 该标的当日不参与排序。
+    """
+    code = sym["code"]
+    series = {}
+    for field in ("pe", "pb"):
+        vals = {}
+        for d, day_map in (val_maps.get(field) or {}).items():
+            v = day_map.get(code)
+            if v is None:
+                continue
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(v) and v > 0:
+                vals[pd.Timestamp(d)] = v
+        if vals:
+            s = pd.Series(vals).sort_index()
+            s = s[~s.index.duplicated(keep="last")].reindex(calendar).ffill()
+        else:
+            s = pd.Series(np.nan, index=calendar, dtype=float)
+        series[field] = s
+    sym["pe"] = series["pe"]
+    sym["pb"] = series["pb"]
+    for field in ("pe", "pb"):
+        sym[f"{field}_pct"] = series[field].rolling(
+            _PCT_WINDOW_DAYS, min_periods=_PCT_MIN_PERIODS).rank(pct=True)
 
 
 def _empty_result() -> dict:
@@ -277,8 +337,13 @@ def _prepare_symbol(code: str, name: str, df: pd.DataFrame,
 
 
 def _build_symbols(feat: dict, calendar: pd.DatetimeIndex,
-                   overseas_only: bool, name_map: dict) -> list[dict]:
-    """筛选标的池: 仅场内基金 + (可选)外盘 ETF"""
+                   overseas_only: bool, name_map: dict,
+                   val_maps: dict | None = None) -> list[dict]:
+    """筛选标的池: 仅场内基金 + (可选)外盘 ETF
+
+    val_maps 非空时, 给每只标的附上跟踪指数 PE/PB 与滚动百分位
+    (无映射的标的对应列全为 NaN, 估值类指标排序时会自动跳过)。
+    """
     symbols = []
     for code, df in feat.items():
         if df is None or len(df) == 0 or "date" not in df.columns:
@@ -289,7 +354,10 @@ def _build_symbols(feat: dict, calendar: pd.DatetimeIndex,
         # 名称缺失时无法判断区域, 按规格用 code 兜底放行
         if overseas_only and name and not is_overseas_etf(name):
             continue
-        symbols.append(_prepare_symbol(code, name or code, df, calendar))
+        sym = _prepare_symbol(code, name or code, df, calendar)
+        if val_maps is not None:
+            _attach_valuation(sym, val_maps, calendar)
+        symbols.append(sym)
     symbols.sort(key=lambda s: s["code"])
     return symbols
 
@@ -308,10 +376,13 @@ def _resolve_metric(requested: str, symbols: list[dict],
             f"指标 {requested} 不可用（{spec['note']}），已自动回退到 {DEFAULT_METRIC}")
 
     # 历史覆盖率: 抽样交易日内有多少比例能取到有效指标值
+    # 估值类指标(蛋卷指数口径)历史仅 2016-11 起且部分 ETF 无指数映射,
+    # 单独放宽到 40%; 其余指标仍要求 60%。
+    thr = float(spec.get("min_coverage", 0.60))
     cov = _coverage(requested, symbols, calendar, premium_map)
-    if cov < 0.60:
+    if cov < thr:
         return DEFAULT_METRIC, (
-            f"指标 {requested} 历史覆盖率 {cov:.0%} < 60%，"
+            f"指标 {requested} 历史覆盖率 {cov:.0%} < {thr:.0%}，"
             f"已自动回退到 {DEFAULT_METRIC}")
     return requested, ""
 
@@ -947,12 +1018,14 @@ def run_etf_rebalance(feat: dict, params: dict) -> dict:
     except Exception:
         name_map = {}
 
-    symbols = _build_symbols(feat, calendar, bool(p["overseas_only"]), name_map)
+    requested = str(p["rank_metric"] or DEFAULT_METRIC)
+    premium_map = _load_premium_map() if requested == "premium" else {}
+    val_maps = _load_valuation_maps() if requested in _VALUATION_METRICS else None
+
+    symbols = _build_symbols(feat, calendar, bool(p["overseas_only"]), name_map, val_maps)
     if not symbols:
         return _empty_result()
 
-    requested = str(p["rank_metric"] or DEFAULT_METRIC)
-    premium_map = _load_premium_map() if requested == "premium" else {}
     metric, reason = _resolve_metric(requested, symbols, calendar, premium_map)
     p["_fallback_reason"] = reason
 

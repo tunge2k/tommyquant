@@ -5,7 +5,7 @@
   2. 不足 10 年时年限校验失败
   3. 初始仓位 ≈ weight_fraction
   4. amount_20 排序选中成交额最大的 top_n
-  5. pe_ttm 不可用 → 自动回退 momentum 且报告原因
+  5. 无估值数据时 pe_ttm 覆盖率不足 → 自动回退 momentum 且报告原因
   6. 暴涨后触发 4% 偏差调仓, 卖出后持仓市值回到目标中枢附近
   7. 全程无止损类交易
   8. 年度换股次数 ≈ 年数
@@ -110,12 +110,16 @@ class EtfRebalanceTest(unittest.TestCase):
     def setUp(self):
         self._p_name = mock.patch.object(er, "_etf_name_map", return_value=NAMES)
         self._p_prem = mock.patch.object(er, "_load_premium_map", return_value={})
+        # 估值因子必须 mock: 否则会读本地库, 结果随数据同步情况变化
+        self._p_val = mock.patch.object(er, "_load_valuation_maps", return_value={})
         self._p_name.start()
         self._p_prem.start()
+        self._p_val.start()
 
     def tearDown(self):
         self._p_name.stop()
         self._p_prem.stop()
+        self._p_val.stop()
 
     # ---------- 1 & 9: 10 年完整回测 ----------
     def test_ten_years_validate_all_pass(self):
@@ -378,12 +382,16 @@ class CashGuardTest(unittest.TestCase):
     def setUp(self):
         self._p_name = mock.patch.object(er, "_etf_name_map", return_value=NAMES)
         self._p_prem = mock.patch.object(er, "_load_premium_map", return_value={})
+        # 估值因子必须 mock: 否则会读本地库, 结果随数据同步情况变化
+        self._p_val = mock.patch.object(er, "_load_valuation_maps", return_value={})
         self._p_name.start()
         self._p_prem.start()
+        self._p_val.start()
 
     def tearDown(self):
         self._p_name.stop()
         self._p_prem.stop()
+        self._p_val.stop()
 
     def _run(self, rising=True, **over):
         n = 400
