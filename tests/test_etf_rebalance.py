@@ -6,7 +6,7 @@
   3. 初始仓位 ≈ weight_fraction
   4. amount_20 排序选中成交额最大的 top_n
   5. pe_ttm 不可用 → 自动回退 momentum 且报告原因
-  6. 暴涨后触发 4% 偏差调仓, 卖出后权重回到目标附近
+  6. 暴涨后触发 4% 偏差调仓, 卖出后持仓市值回到目标中枢附近
   7. 全程无止损类交易
   8. 年度换股次数 ≈ 年数
   9. 收益率曲线完整、升序、无 NaN
@@ -206,8 +206,10 @@ class EtfRebalanceTest(unittest.TestCase):
         rows = [h for h in r["holdings_log"]
                 if h["date"] == t["date"] and h["code"] == "sh513100"]
         self.assertTrue(rows)
-        # top_n=2, weight_fraction=0.75 → 目标权重 0.375
-        self.assertLess(abs(rows[-1]["weight"] - 0.375), 0.02)
+        # top_n=2, weight_fraction=0.75, 初始 100 万 → 每只市值中枢 37.5 万
+        # 调仓后持仓市值应回到中枢附近(±2%)
+        center = 1_000_000 * 0.75 / 2
+        self.assertLess(abs(rows[-1]["market_value"] - center) / center, 0.02)
 
     # ---------- 7: 无止损 ----------
     def test_no_stop_loss_trades(self):
@@ -224,6 +226,26 @@ class EtfRebalanceTest(unittest.TestCase):
                       rank_check_freq="yearly")
         r = er.run_etf_rebalance(feat, params)
         self.assertGreaterEqual(r["meta"]["annual_swaps"], 2)
+
+    # ---------- 11: 份额拆分复权 ----------
+    def test_split_adjusted_no_fake_deviation(self):
+        """4:1 拆分的单日 -75% 不应被当成暴跌"""
+        dates = pd.bdate_range("2019-01-01", periods=400)
+        px = np.full(400, 2.0)
+        px[300:] = 0.5               # 4:1 拆分, 原始序列单日 -75%
+        feat = build_feat(dates, {"sh513100": px},
+                          amounts={"sh513100": 5e8})
+        params = dict(start=str(dates[0].date()), end=str(dates[-1].date()),
+                      top_n=1, weight_fraction=0.75, min_history=40,
+                      rank_check_freq="off", rebalance_period="off")
+        r = er.run_etf_rebalance(feat, params)
+        dev = [t for t in r["trades"] if "4%" in t["reason"]]
+        self.assertTrue(all(abs(t["dev_before"]) < 0.15 for t in dev),
+                        f"拆分产生了极端偏差调仓: {dev}")
+        curve = r["curve"]
+        peak = curve["value"].cummax()
+        self.assertGreater((curve["value"] / peak).min(), 0.9,
+                           "拆分造成了假净值崩溃")
 
     # ---------- 10: 指标注册表 ----------
     def test_list_metrics(self):

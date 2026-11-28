@@ -4,9 +4,13 @@
   1. 标的池: 仅「外盘 ETF」——`price_limits.is_etf(code)` 且 `is_overseas_etf(名称)` 为真；
      名称缺失时用 code 兜底放行。港股/中概由 `is_overseas_etf` 内部剔除。
   2. 仓位: 初始建仓买入总资产的 `weight_fraction`(默认 75%)，等权分给 `top_n` 只。
-  3. 4% 偏差调仓: 单标的当前权重与目标权重(=weight_fraction/top_n)偏离
-     > `deviation_threshold`(默认 0.04) 时，调回目标权重。这是「低买高卖」的
-     权重补充触发: 涨多了卖出超配、跌多了用现金补足。
+  3. 4% 偏差调仓: 单标的持仓市值相对「目标市值中枢」的偏离
+     > `deviation_threshold`(默认 0.04) 时，调回中枢市值。
+     中枢 = 初始总资产 × weight_fraction / top_n（默认 100 万 × 75% / 1 = 75 万），
+     建仓时确定后保持不变；换股与定期再平衡也都拉回该中枢。
+     注意: 偏离按「市值/中枢-1」计算，不是权重百分点——75% 仓位下价格涨 23.9%
+     权重只变动约 3.8 个百分点，若按权重偏离 4% 判定会长期空转。
+     这是「低买高卖」触发: 涨过 +4% 卖出超出部分、跌破 -4% 用现金补足。
   4. 年度换股: `rank_check_freq` 到期日（默认每年首个交易日）按排名指标重排全池，
      只保留前 `top_n`：卖出非目标标的，买入新目标标的。
   5. 定期再平衡: 每 `rebalance_period`(默认 "1y") 把总持仓比例强制拉回 `weight_fraction`。
@@ -192,28 +196,66 @@ def _empty_result() -> dict:
     }
 
 
+def _adjust_splits(df: pd.DataFrame) -> tuple[pd.Series, bool]:
+    """识别并复权「份额拆分」造成的单日价格跳变。
+
+    ETF 拆分日会出现一次非经济性跳变(如 4:1 拆分 → 单日 -75%)，库内 close
+    若未做拆分复权，会被引擎误判为暴跌: 触发 -75% 的假"4%偏差调仓"、
+    在净值曲线上留下假回撤，并使拆分后 250 天的动量因子被虚增。
+    这里对单日跌幅 >60% 或涨幅 >150% 的跳变按比例前向复权(只调整跳变日之前
+    的价格)，保证序列连续。ETF 是篮子指数，单日这种幅度只可能是拆分。
+    返回 (复权后收盘价, 是否发生过调整)。
+    """
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    ratio = close / close.shift(1)
+    split = (ratio < 0.4) | (ratio > 2.5)
+    if not split.any():
+        return close, False
+    factor = np.ones(len(close), dtype=float)
+    adj = 1.0
+    for i in range(len(close) - 1, -1, -1):
+        factor[i] = adj
+        r = ratio.iloc[i]
+        if split.iloc[i] and np.isfinite(r) and r > 0:
+            adj *= float(r)
+    return close * pd.Series(factor, index=close.index), True
+
+
 def _prepare_symbol(code: str, name: str, df: pd.DataFrame,
                     calendar: pd.DatetimeIndex) -> dict:
     """把单只 ETF 的因子表对齐到回测交易日历, 缺失日向前填充"""
     d = pd.to_datetime(df["date"])
     raw_idx = pd.DatetimeIndex(d)
 
-    def _ser(col: str) -> pd.Series:
-        if col not in df.columns:
-            return pd.Series(np.nan, index=calendar, dtype=float)
-        s = pd.to_numeric(df[col], errors="coerce")
+    def _align(s: pd.Series) -> pd.Series:
+        s = s.copy()
         s.index = raw_idx
         return s.reindex(calendar).ffill()
 
+    def _ser(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(np.nan, index=calendar, dtype=float)
+        return _align(pd.to_numeric(df[col], errors="coerce"))
+
+    close_adj, adjusted = _adjust_splits(df)
     sym = {"code": code, "name": name}
-    for col in ("close", "amount", "amount_ma20", "cap_yi",
-                "ret_20", "ret_60", "ret_120", "ret_250", "max_dd_250"):
+    sym["close"] = _align(close_adj)
+    for col in ("amount", "amount_ma20", "cap_yi"):
         sym[col] = _ser(col)
-    # pct 缺失时由收盘价推导
-    if "pct" in df.columns:
-        sym["pct"] = _ser("pct")
+
+    if adjusted:
+        # 库内 pct/动量/回撤已被拆分污染, 用复权价重算全部价格类因子
+        sym["pct"] = _align(close_adj.pct_change() * 100)
+        for k in (20, 60, 120, 250):
+            sym[f"ret_{k}"] = _align(close_adj.pct_change(k) * 100)
+        roll_max = close_adj.rolling(250).max()
+        sym["max_dd_250"] = _align((close_adj - roll_max) / roll_max)
     else:
-        sym["pct"] = sym["close"].pct_change() * 100
+        for k in (20, 60, 120, 250):
+            sym[f"ret_{k}"] = _ser(f"ret_{k}")
+        sym["max_dd_250"] = _ser("max_dd_250")
+        sym["pct"] = (_ser("pct") if "pct" in df.columns
+                      else _align(close_adj.pct_change() * 100))
     sym["vol_60"] = sym["pct"].rolling(60).std()
 
     # 截至每个交易日可用的 K 线根数（用于 min_history 过滤）
@@ -347,6 +389,9 @@ class _RebalanceEngine:
         self.annual_swaps = 0
         self.deviation_trades = 0
         self.initial_ratio = 0.0
+        # 目标持仓市值中枢 (每只标的): 初始建仓时 = 初始总资产 × 仓位比例 / 持仓数。
+        # 4% 网格围绕该「市值中枢」而非「权重」触发, 见 _deviation_check。
+        self.center_mv = 0.0
 
     # ---------- 行情辅助 ----------
     def _price(self, code, d):
@@ -522,6 +567,7 @@ class _RebalanceEngine:
         picks = cands[:self.top_n]
         tv = self._total_value(d)
         per = tv * self.weight_fraction / len(picks)
+        self.center_mv = per          # 目标市值中枢 (默认 75% × 100万 / 1 = 75万)
         for code in picks:
             self._buy(code, per, d, "建仓")
         self.entered = True
@@ -543,9 +589,9 @@ class _RebalanceEngine:
         for code in list(self.positions):
             if code not in picks:
                 self._sell(code, self.positions[code]["qty"], d, reason)
-        # 再买入新目标标的到目标市值
+        # 再买入新目标标的到目标市值中枢 (换股不改变 4% 网格的市值中枢)
         tv = self._total_value(d)
-        per = tv * self.weight_fraction / len(picks)
+        per = self.center_mv if self.center_mv > 0 else tv * self.weight_fraction / len(picks)
         for code in picks:
             if code not in self.positions:
                 self._buy(code, per, d, reason)
@@ -553,13 +599,13 @@ class _RebalanceEngine:
         self.annual_swaps += 1
 
     def _periodic_rebalance(self, d):
-        """定期再平衡: 把总持仓比例强制拉回 weight_fraction"""
+        """定期再平衡: 把各标的持仓市值强制拉回「目标市值中枢」"""
         targets = self.targets or list(self.positions)
         if not targets:
             return
         reason = "定期再平衡"
         tv = self._total_value(d)
-        per = tv * self.weight_fraction / len(targets)
+        per = self.center_mv if self.center_mv > 0 else tv * self.weight_fraction / len(targets)
         # 卖出超配
         for code in list(self.positions):
             if code not in targets:
@@ -583,36 +629,39 @@ class _RebalanceEngine:
                 self._buy(code, per - mv, d, reason)
 
     def _deviation_check(self, d):
-        """4% 偏差调仓: 单标的权重偏离目标 > 阈值时调回目标权重"""
-        target_w = self.weight_fraction / self.top_n
+        """4% 网格调仓: 持仓市值相对「目标市值中枢」偏离 > 阈值时调回中枢。
+
+        关键口径: 偏离 = 当前持仓市值 / 目标市值中枢 - 1 (相对市值, 非权重百分点)。
+        例: 中枢 75 万, 标的上涨后市值 78.1 万 → 偏离 +4.1% → 卖出 3.1 万回到 75 万。
+        这样单边上涨/下跌行情也能持续触发, 不会像「权重偏离」那样因 75% 仓位下
+        价格涨 4% 权重只变动约 0.8 个百分点而长期空转。
+        """
+        base = self.center_mv
+        if base <= 0:
+            return
         sells, buys = [], []
         for code, pos in list(self.positions.items()):
             px = self._price(code, d)
             if px is None:
                 continue
-            tv = self._total_value(d)
-            if tv <= 0:
-                continue
             mv = px * pos["qty"]
-            w = mv / tv
-            dev = abs(w - target_w)
-            if dev <= self.dev_threshold:
-                continue
-            target_mv = target_w * tv
-            diff = target_mv - mv
-            if diff < 0:
-                sells.append((code, int(-diff / px // 100) * 100, dev))
-            elif diff > 0:
-                buys.append((code, diff, dev))
+            dev = mv / base - 1.0
+            if dev > self.dev_threshold:
+                qty = int((mv - base) / px // 100) * 100
+                if qty >= 100:
+                    sells.append((code, qty, dev))
+            elif dev < -self.dev_threshold:
+                buys.append((code, base - mv, dev))
         # 先卖后买, 避免现金不足
+        n0 = len(self.trades)
         for code, qty, dev in sells:
-            if qty >= 100 and code in self.positions:
+            if code in self.positions:
                 self._sell(code, qty, d, "4%偏差调仓", dev_before=dev)
-                self.deviation_trades += 1
         for code, amount, dev in buys:
             if code in self.positions:
                 self._buy(code, amount, d, "4%偏差调仓", dev_before=dev)
-                self.deviation_trades += 1
+        # 只统计真实成交 (现金不足时 _buy 可能不下单)
+        self.deviation_trades += len(self.trades) - n0
 
     def _log_holdings(self, d):
         tv = self._total_value(d)
@@ -787,9 +836,10 @@ def validate_result(result: dict, params: dict) -> list[dict]:
     })
 
     dev_trades = [t for t in trades if "4%" in str(t.get("reason", ""))]
+    # 偏离取绝对值: 卖出为 +偏离, 买入为 -偏离, 两者都应在阈值附近
     bad_dev = [t for t in dev_trades
                if (t.get("dev_before") is None
-                   or float(t.get("dev_before")) < 0.035 - 1e-9)]
+                   or abs(float(t.get("dev_before"))) < 0.035 - 1e-9)]
     checks.append({
         "name": "4%偏差调仓实际偏离≥3.5%",
         "passed": len(bad_dev) == 0,
